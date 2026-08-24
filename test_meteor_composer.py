@@ -1,8 +1,9 @@
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
-from meteor_composer import normalize_lsd_lines, point_in_padded_bbox
+from meteor_composer import MeteorComposer, normalize_lsd_lines, point_in_padded_bbox
 
 
 class NormalizeLsdLinesTests(unittest.TestCase):
@@ -35,6 +36,32 @@ class CandidateButtonGeometryTests(unittest.TestCase):
         bbox = (100, 50, 200, 80)
         self.assertTrue(point_in_padded_bbox(90, 65, bbox, padding=16))
         self.assertFalse(point_in_padded_bbox(80, 65, bbox, padding=16))
+
+    def test_candidate_button_press_does_not_start_brush(self):
+        picked = []
+        fake = SimpleNamespace(
+            current_path="image.tif",
+            candidate_click_active=False,
+            hover_candidate_items=[1, 2],
+            canvas=SimpleNamespace(bbox=lambda _tag: (100, 50, 200, 80)),
+            _pick_hover_candidate=lambda event: picked.append(event),
+        )
+        event = SimpleNamespace(x=150, y=65)
+        result = MeteorComposer._stroke_start(fake, event)
+        self.assertEqual(result, "break")
+        self.assertEqual(picked, [event])
+
+    def test_candidate_release_clears_click_without_creating_stroke(self):
+        fake = SimpleNamespace(
+            candidate_click_active=True,
+            active_points=[(0.5, 0.5)],
+            active_canvas_line=123,
+        )
+        result = MeteorComposer._stroke_end(fake, SimpleNamespace())
+        self.assertEqual(result, "break")
+        self.assertFalse(fake.candidate_click_active)
+        self.assertEqual(fake.active_points, [])
+        self.assertIsNone(fake.active_canvas_line)
 
 
 if __name__ == "__main__":

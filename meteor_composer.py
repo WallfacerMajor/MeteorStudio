@@ -766,6 +766,7 @@ class MeteorComposer(tk.Tk):
         self.context_highlight: int | None = None
         self.hover_candidate_index: int | None = None
         self.hover_candidate_items: list[int] = []
+        self.candidate_click_active = False
         self.work_queue: queue.Queue = queue.Queue()
         self.ranker_model = load_meteor_ranker()
         if self.ranker_model:
@@ -892,7 +893,7 @@ class MeteorComposer(tk.Tk):
         ttk.Label(tools, textvariable=self.candidate_threshold, width=4).grid(row=3, column=4, pady=(7, 0))
         ttk.Label(tools, textvariable=self.candidate_summary).grid(row=3, column=5, columnspan=4, sticky="w", padx=(15, 0), pady=(7, 0))
         ttk.Label(tools, textvariable=self.ai_model_status).grid(row=3, column=9, sticky="e", pady=(7, 0))
-        ttk.Label(tools, text="悬停候选点＋可选中并锁定").grid(row=3, column=10, columnspan=3, sticky="e", pady=(7, 0))
+        ttk.Label(tools, text="点绿色按钮选候选；画布其余位置拖动画蒙版").grid(row=3, column=10, columnspan=3, sticky="e", pady=(7, 0))
         tools.columnconfigure(3, weight=1)
         tools.columnconfigure(6, weight=1)
 
@@ -1458,7 +1459,7 @@ F1：显示本快捷键表""")
             shown = composed
         else:
             shown = self.preview_source.copy()
-        if self.show_mask.get() and mode != "blend" and np.any(mask > 0.001):
+        if self.show_mask.get() and np.any(mask > 0.001):
             opacity = (mask * 0.55)[..., None]
             red = np.empty_like(shown)
             red[:] = (255, 35, 25)
@@ -1478,11 +1479,11 @@ F1：显示本快捷键表""")
         self.hover_candidate_items = []
         self.hover_candidate_index = None
         self.canvas.create_image(x0, y0, anchor="nw", image=self.preview_photo)
-        if self.show_mask.get() and mode != "blend":
+        if self.show_mask.get():
             self._draw_mask_annotations()
         self.cursor_items = []
         self._update_brush_cursor()
-        if self.cursor_position is not None:
+        if self.cursor_position is not None and not self.active_points and not self.candidate_click_active:
             self._update_candidate_hover(*self.cursor_position)
 
     def _draw_mask_annotations(self) -> None:
@@ -1510,6 +1511,9 @@ F1：显示本快捷键表""")
     def _cursor_motion(self, event) -> None:
         self.cursor_position = (float(event.x), float(event.y))
         self._update_brush_cursor()
+        if self.active_points or self.candidate_click_active:
+            self._clear_candidate_hover()
+            return
         self._update_candidate_hover(event.x, event.y)
 
     def _cursor_leave(self, _event=None) -> None:
@@ -1593,6 +1597,7 @@ F1：显示本快捷键表""")
         if not (0 <= index < len(pool)):
             return "break"
         candidate = pool[index]
+        self.candidate_click_active = True
         candidate.locked = True
         matching = next(
             (stroke for stroke in self.strokes.get(key, [])
@@ -1609,6 +1614,7 @@ F1：显示本快捷键表""")
         self.edit_history.pop(key, None)
         self.edit_redo.pop(key, None)
         self._clear_candidate_hover()
+        self.show_mask.set(True)
         self._update_candidate_summary(key)
         self._update_tree_status()
         self._render_preview()
@@ -1875,6 +1881,8 @@ F1：显示本快捷键表""")
     def _stroke_start(self, event) -> None:
         if not self.current_path:
             return
+        if self.candidate_click_active:
+            return "break"
         # Canvas widget bindings can also receive a click after an item binding.
         # Handle the floating candidate button here as a reliable fallback and
         # never start a paint stroke underneath it.
@@ -1886,6 +1894,7 @@ F1：显示本快捷键表""")
         point = self._event_normalized(event)
         if point is None:
             return
+        self._clear_candidate_hover()
         anchor = self.shift_anchors.get(str(self.current_path))
         self.active_shift_line = bool(event.state & 0x0001) and anchor is not None
         self.active_points = [anchor, point] if self.active_shift_line else [point]
@@ -1948,6 +1957,11 @@ F1：显示本快捷键表""")
             self._draw_active_stroke()
 
     def _stroke_end(self, event) -> None:
+        if self.candidate_click_active:
+            self.candidate_click_active = False
+            self.active_points = []
+            self.active_canvas_line = None
+            return "break"
         if not self.active_points or not self.current_path:
             return
         point = self._event_normalized(event)
@@ -1978,7 +1992,9 @@ F1：显示本快捷键表""")
         self.live_erase_stroke = None
         self.active_action_index = -1
         self._update_tree_status()
+        self.show_mask.set(True)
         self._render_preview()
+        self.status.set("已添加手工蒙版；红色区域为当前保留范围，按住 H 可临时隐藏")
         self._schedule_autosave()
 
     def undo_stroke(self) -> None:
