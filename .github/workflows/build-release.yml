@@ -1,0 +1,71 @@
+name: Build MeteorStudio
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: DMG version label
+        required: false
+        default: dev
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install FFmpeg
+        run: choco install ffmpeg --no-progress -y
+      - name: Build Windows application
+        shell: cmd
+        run: build_windows.bat < nul
+      - name: Archive Windows application
+        shell: pwsh
+        run: Compress-Archive -Path dist/MeteorStudio -DestinationPath MeteorStudio-Windows-x64.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeteorStudio-Windows-x64
+          path: MeteorStudio-Windows-x64.zip
+
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-14
+            architecture: arm64
+          - runner: macos-13
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FFmpeg
+        run: brew install ffmpeg
+      - name: Build APP and DMG
+        run: |
+          chmod +x build_macos.command create_macos_dmg.command build_macos_dmg.command
+          ./build_macos_dmg.command "${{ inputs.version || github.ref_name }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeteorStudio-macOS-${{ matrix.architecture }}
+          path: dist/*.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/**/*
+          generate_release_notes: true

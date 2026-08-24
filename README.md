@@ -137,4 +137,3 @@ pyinstaller --noconfirm --windowed --name MeteorStudio --hidden-import meteor_le
 在 Windows 执行会生成 `MeteorStudio.exe`，在 macOS 执行会生成 `MeteorStudio.app`；PyInstaller 不能在 Windows 上直接生成 macOS 应用。
 
 也可以直接使用随附的 `build_windows.bat` 或 `build_macos.command`。在 Mac 上执行 `./build_macos_dmg.command 0.1.0` 可一次生成 APP 和 DMG，详见 [macOS 构建文档](docs/MACOS_BUILD.md)。
-

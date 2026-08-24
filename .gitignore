@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# PyInstaller and packaged applications
+build/
+build_*/
+dist/
+dist_*/
+*.spec.bak
+
+# Local projects, outputs, and source media
+outputs/
+MeteorStudio_PTGui*/
+*.tif
+*.tiff
+*.fits
+*.fit
+*.ser
+*.mp4
+*.mov
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local environment and credentials
+.env
+.env.*
+*.pem
+*.p12
+*.key
+.venv*/
