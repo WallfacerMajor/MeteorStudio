@@ -351,6 +351,15 @@ def normalize_lsd_lines(lines: np.ndarray | None) -> np.ndarray:
     return values.reshape(-1, 4)
 
 
+def point_in_padded_bbox(
+    x: float, y: float, bbox: tuple[float, float, float, float] | None, padding: float = 0.0
+) -> bool:
+    if bbox is None:
+        return False
+    x0, y0, x1, y1 = bbox
+    return x0 - padding <= x <= x1 + padding and y0 - padding <= y <= y1 + padding
+
+
 def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     src = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY).astype(np.float32)
     dst = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY).astype(np.float32)
@@ -1543,6 +1552,13 @@ F1：显示本快捷键表""")
         return best_index
 
     def _update_candidate_hover(self, canvas_x: float, canvas_y: float) -> None:
+        # Keep the button alive while the pointer crosses the small gap from the
+        # candidate line to the button. Previously Motion cleared it before the
+        # subsequent click could reach the canvas item binding.
+        if self.hover_candidate_items:
+            button_bbox = self.canvas.bbox("candidate_pick")
+            if point_in_padded_bbox(canvas_x, canvas_y, button_bbox, padding=16.0):
+                return
         index = self._find_candidate_near(canvas_x, canvas_y)
         if index is None:
             self._clear_candidate_hover()
@@ -1859,6 +1875,14 @@ F1：显示本快捷键表""")
     def _stroke_start(self, event) -> None:
         if not self.current_path:
             return
+        # Canvas widget bindings can also receive a click after an item binding.
+        # Handle the floating candidate button here as a reliable fallback and
+        # never start a paint stroke underneath it.
+        if self.hover_candidate_items and point_in_padded_bbox(
+            float(event.x), float(event.y), self.canvas.bbox("candidate_pick"), padding=2.0
+        ):
+            self._pick_hover_candidate(event)
+            return "break"
         point = self._event_normalized(event)
         if point is None:
             return
