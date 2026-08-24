@@ -17,8 +17,8 @@
 无需安装 Python，可直接从 [GitHub Releases](https://github.com/WallfacerMajor/MeteorStudio/releases/latest) 下载：
 
 - `MeteorStudio-Windows-x64.zip`：Windows 64 位。
-- `MeteorStudio-macOS-arm64.dmg`：Apple Silicon Mac（M1/M2/M3/M4 等）。
-- `MeteorStudio-macOS-x86_64.dmg`：Intel Mac。
+- `MeteorStudio-0.1.1-arm64.dmg`：Apple Silicon Mac（M1/M2/M3/M4 等）。
+- `MeteorStudio-0.1.1-x86_64.dmg`：Intel Mac。
 
 Release 中的三个安装包由 GitHub Actions 在对应操作系统上从当前源码自动构建。macOS 安装包尚未使用 Apple Developer ID 公证，首次运行方法见 macOS 构建文档。
 

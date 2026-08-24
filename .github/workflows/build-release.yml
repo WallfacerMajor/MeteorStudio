@@ -6,7 +6,7 @@ on:
       version:
         description: DMG version label
         required: false
-        default: dev
+        default: 0.1.1
   push:
     branches:
       - main
@@ -53,7 +53,15 @@ jobs:
       - name: Build APP and DMG
         run: |
           chmod +x build_macos.command create_macos_dmg.command build_macos_dmg.command
-          ./build_macos_dmg.command "${{ inputs.version || github.ref_name }}"
+          version="${{ inputs.version }}"
+          if [[ -z "$version" ]]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              version="${GITHUB_REF_NAME#v}"
+            else
+              version="0.1.1"
+            fi
+          fi
+          ./build_macos_dmg.command "$version"
       - uses: actions/upload-artifact@v4
         with:
           name: MeteorStudio-macOS-${{ matrix.architecture }}
@@ -69,8 +77,8 @@ jobs:
           path: release-assets
       - uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.1.0' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v0.1.1' }}
           target_commitish: ${{ github.sha }}
-          name: MeteorStudio v0.1.0
+          name: MeteorStudio v0.1.1
           files: release-assets/**/*
           generate_release_notes: true

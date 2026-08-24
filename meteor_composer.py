@@ -341,6 +341,16 @@ def load_meteor_ranker() -> dict | None:
     return None
 
 
+def normalize_lsd_lines(lines: np.ndarray | None) -> np.ndarray:
+    """Normalize OpenCV LSD output across versions to an (N, 4) array."""
+    if lines is None:
+        return np.empty((0, 4), dtype=np.float32)
+    values = np.asarray(lines, dtype=np.float32)
+    if values.size == 0 or values.size % 4:
+        return np.empty((0, 4), dtype=np.float32)
+    return values.reshape(-1, 4)
+
+
 def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     src = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY).astype(np.float32)
     dst = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY).astype(np.float32)
@@ -359,8 +369,8 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
         low, high = np.percentile(magnitude, (low_percentile, high_percentile))
         enhanced = np.clip((magnitude - low) * 255.0 / max(1.0, high - low), 0, 255).astype(np.uint8)
         enhanced[int(height * 0.82):] = 0
-        lines = detector.detect(enhanced)[0]
-        if lines is not None:
+        lines = normalize_lsd_lines(detector.detect(enhanced)[0])
+        if len(lines):
             detected_parts.append(lines)
     if not detected_parts:
         return [], 0
@@ -372,7 +382,7 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     structural_edges = cv2.dilate(structural_edges, np.ones((5, 5), np.uint8)) > 0
     bright_limit = float(np.percentile(dst, 97))
     raw_candidates = []
-    for raw in detected[:, 0]:
+    for raw in detected:
         x1, y1, x2, y2 = (float(v) for v in raw)
         length = float(np.hypot(x2 - x1, y2 - y1))
         if length < min_length:
