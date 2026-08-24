@@ -8,6 +8,8 @@ on:
         required: false
         default: dev
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -39,9 +41,9 @@ jobs:
     strategy:
       matrix:
         include:
-          - runner: macos-14
+          - runner: macos-15
             architecture: arm64
-          - runner: macos-13
+          - runner: macos-15-intel
             architecture: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -69,3 +71,4 @@ jobs:
         with:
           files: release-assets/**/*
           generate_release_notes: true
+
