@@ -23,8 +23,8 @@ from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.12-local-source-labels"
-PROJECT_VERSION = 21
+APP_VERSION = "0.1.13-local-labeled-preview"
+PROJECT_VERSION = 22
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
@@ -833,6 +833,7 @@ class MeteorComposer(tk.Tk):
         self.edit_mode = tk.StringVar(value="paint")
         self.view_mode = tk.StringVar(value="source")
         self.blend_preview_label = tk.StringVar(value="3 融合预览")
+        self.source_preview_label = tk.StringVar(value="4 来源标注")
         self.show_mask = tk.BooleanVar(value=True)
         self.h_mask_held = False
         self.status = tk.StringVar(value="请选择输入和输出位置。")
@@ -861,6 +862,7 @@ class MeteorComposer(tk.Tk):
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.global_preview_rgb: np.ndarray | None = None
+        self.global_labeled_preview_rgb: np.ndarray | None = None
         self.global_preview_signature: str | None = None
         self.global_preview_loading_signature: str | None = None
         self.current_dims = (1, 1)
@@ -965,6 +967,7 @@ class MeteorComposer(tk.Tk):
         ttk.Radiobutton(view_bar, text="1 原图 TIFF", variable=self.view_mode, value="source", command=self._render_preview).pack(side="left")
         ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._render_preview).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._render_preview).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._render_preview).pack(side="left", padx=(8, 0))
         ttk.Label(view_bar, text="编辑视图显示红色蒙版；按住 H 临时隐藏").pack(side="left", padx=(16, 0))
         ttk.Label(view_bar, text="普通拖动绘制；单击后 Shift+单击可画直线").pack(side="right")
         self.canvas = tk.Canvas(center, background="#181818", cursor="none", highlightthickness=0)
@@ -1139,6 +1142,7 @@ class MeteorComposer(tk.Tk):
             "<KeyPress-1>": lambda: self._set_view_mode("source"),
             "<KeyPress-2>": lambda: self._set_view_mode("base"),
             "<KeyPress-3>": lambda: self._set_view_mode("blend"),
+            "<KeyPress-4>": lambda: self._set_view_mode("labeled"),
             "<KeyPress-Left>": lambda: self._select_relative(-1),
             "<KeyPress-Right>": lambda: self._select_relative(1),
         }
@@ -1269,8 +1273,8 @@ Esc：取消当前尚未完成的一笔
 红色蒙版及候选分数默认显示；按住 H 可临时隐藏
 
 查看与文件
-1：原图 TIFF    2：干净 JPG    3：融合预览
-拼合到同一张底图：第 3 模式汇总全部流星；分别输出：只预览当前图片对
+1：原图 TIFF    2：干净 JPG    3：最终融合    4：来源标注
+拼合到同一张底图：第 3/4 模式汇总全部流星；分别输出：只预览当前图片对
 红色蒙版默认显示；按住 H：临时隐藏，松开恢复
 ← / →：上一张 / 下一张
 Ctrl/Command+S：保存项目
@@ -1341,6 +1345,7 @@ F1：显示本快捷键表""")
                 self.base_dir.set("")
                 self.base_selection_summary.set("请选择唯一底图")
         self.global_preview_rgb = None
+        self.global_labeled_preview_rgb = None
         self.global_preview_signature = None
         self._update_output_mode_ui()
         self._schedule_autosave()
@@ -1358,9 +1363,9 @@ F1：显示本快捷键表""")
         return self.output_mode.get() == "combined"
 
     def _update_blend_preview_label(self) -> None:
-        self.blend_preview_label.set(
-            "3 总融合预览" if self._uses_shared_base() else "3 当前图融合预览"
-        )
+        shared = self._uses_shared_base()
+        self.blend_preview_label.set("3 总融合预览" if shared else "3 当前图融合预览")
+        self.source_preview_label.set("4 总图来源标注" if shared else "4 当前图来源标注")
 
     def scan_inputs(self) -> None:
         try:
@@ -1768,6 +1773,7 @@ F1：显示本快捷键表""")
         preview_height, preview_width = result.shape[:2]
         total = max(1, len(marked))
         included = 0
+        preview_annotations = []
         for index, (source_path, strokes) in enumerate(marked.items(), start=1):
             actual_path = read_paths.get(str(source_path), source_path)
             source = read_image(actual_path)
@@ -1794,11 +1800,15 @@ F1：显示本快捷键表""")
             )
             if np.any(mask > 0.001):
                 included += 1
+                boxes = meteor_mask_boxes(mask)
+                if boxes:
+                    preview_annotations.append({"source": source_path.stem, "boxes": boxes})
             self.work_queue.put((
                 "progress", index / total * 100,
                 f"正在生成总融合预览 {index}/{len(marked)}：{source_path.name}",
             ))
-        return "global_preview", signature, result, included
+        labeled, _records = annotate_meteor_sources(result, preview_annotations)
+        return "global_preview", signature, result, labeled, included
 
     def _render_preview(self) -> None:
         if self.preview_source is None or self.preview_base is None:
@@ -1812,34 +1822,44 @@ F1：显示本快捷键表""")
             item.rotation, item.length_scale, item.width_scale, item.opacity,
         ) for item in self.strokes.get(str(self.current_path), [])]
         mode = self.view_mode.get()
+        composite_mode = mode in {"blend", "labeled"}
         if mode == "base":
             shown = self.preview_base.copy()
-        elif mode == "blend":
+        elif composite_mode:
             if self._uses_shared_base():
                 signature = self._global_preview_state_signature()
-                if self.global_preview_signature == signature and self.global_preview_rgb is not None:
-                    shown = self.global_preview_rgb.copy()
+                cached = (
+                    self.global_labeled_preview_rgb if mode == "labeled"
+                    else self.global_preview_rgb
+                )
+                if self.global_preview_signature == signature and cached is not None:
+                    shown = cached.copy()
                 else:
                     shown = self.preview_base.copy()
                     self._request_global_preview(signature)
             else:
-                shown, _current_mask = compose_meteor_objects(
+                shown, current_mask = compose_meteor_objects(
                     self.preview_source, self.preview_base, scaled_strokes,
                     bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
                     float(self.curve_shadows.get()), float(self.curve_highlights.get()),
                     self.blend_mode.get(),
                 )
+                if mode == "labeled" and self.current_path:
+                    boxes = meteor_mask_boxes(current_mask)
+                    shown, _records = annotate_meteor_sources(
+                        shown, [{"source": self.current_path.stem, "boxes": boxes}]
+                    )
         else:
             shown = self.preview_source.copy()
         mask = np.zeros(shown.shape[:2], dtype=np.float32)
-        if mode != "blend":
+        if not composite_mode:
             _composed, mask = compose_meteor_objects(
                 self.preview_source, self.preview_base, scaled_strokes,
                 bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
                 float(self.curve_shadows.get()), float(self.curve_highlights.get()),
                 self.blend_mode.get(),
             )
-        if mode != "blend" and self.show_mask.get() and np.any(mask > 0.001):
+        if not composite_mode and self.show_mask.get() and np.any(mask > 0.001):
             opacity = (mask * 0.55)[..., None]
             red = np.empty_like(shown)
             red[:] = (255, 35, 25)
@@ -1859,12 +1879,12 @@ F1：显示本快捷键表""")
         self.hover_candidate_items = []
         self.hover_candidate_index = None
         self.canvas.create_image(x0, y0, anchor="nw", image=self.preview_photo)
-        if mode != "blend" and self.show_mask.get():
+        if not composite_mode and self.show_mask.get():
             self._draw_candidate_guides()
             self._draw_mask_annotations()
         self.cursor_items = []
         self._update_brush_cursor()
-        if mode != "blend" and self.cursor_position is not None and not self.active_points:
+        if not composite_mode and self.cursor_position is not None and not self.active_points:
             self._update_candidate_hover(*self.cursor_position)
 
     def _draw_candidate_guides(self) -> None:
@@ -1929,7 +1949,7 @@ F1：显示本快捷键表""")
     def _cursor_motion(self, event) -> None:
         self.cursor_position = (float(event.x), float(event.y))
         self._update_brush_cursor()
-        if self.view_mode.get() == "blend":
+        if self.view_mode.get() in {"blend", "labeled"}:
             self._clear_candidate_hover()
             return
         if self.active_points:
@@ -2049,7 +2069,7 @@ F1：显示本快捷键表""")
             self.canvas.delete(item)
         self.cursor_items = []
         if (self.cursor_position is None or self.preview_source is None
-                or self.view_mode.get() == "blend"):
+                or self.view_mode.get() in {"blend", "labeled"}):
             self.canvas.configure(cursor="arrow")
             return
         x, y = self.cursor_position
@@ -2305,8 +2325,8 @@ F1：显示本快捷键表""")
     def _stroke_start(self, event) -> None:
         if not self.current_path:
             return
-        if self.view_mode.get() == "blend":
-            self.status.set("融合预览只用于检查成片；请切回“原图 TIFF”编辑蒙版")
+        if self.view_mode.get() in {"blend", "labeled"}:
+            self.status.set("融合预览/来源标注预览只用于检查成片；请切回“原图 TIFF”编辑蒙版")
             return "break"
         # The floating candidate button is handled only by the canvas, so selecting a
         # candidate and painting can never compete for the same press.
@@ -2936,15 +2956,16 @@ F1：显示本快捷键表""")
                     self.status.set(f"已加载 {path.name}；可拖动画笔，或单击起点后 Shift+单击终点画直线。")
                     self._render_preview()
                 elif kind == "global_preview":
-                    _, signature, image, included = item
+                    _, signature, image, labeled_image, included = item
                     if self.global_preview_loading_signature == signature:
                         self.global_preview_loading_signature = None
                     if signature == self._global_preview_state_signature():
                         self.global_preview_signature = signature
                         self.global_preview_rgb = image
+                        self.global_labeled_preview_rgb = labeled_image
                         self.progress["value"] = 100
                         self.status.set(f"总融合预览完成：已合成 {included} 张图片中的全部流星")
-                        if self.view_mode.get() == "blend":
+                        if self.view_mode.get() in {"blend", "labeled"}:
                             self._render_preview()
                 elif kind == "progress":
                     _, value, text = item

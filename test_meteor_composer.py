@@ -158,6 +158,17 @@ class CandidateButtonGeometryTests(unittest.TestCase):
         self.assertEqual(result, "break")
         self.assertIn("融合预览", messages[0])
 
+    def test_labeled_preview_blocks_mask_painting(self):
+        messages = []
+        fake = SimpleNamespace(
+            current_path="image.tif",
+            view_mode=FakeVar("labeled"),
+            status=SimpleNamespace(set=lambda message: messages.append(message)),
+        )
+        result = MeteorComposer._stroke_start(fake, SimpleNamespace(x=10, y=10, state=0))
+        self.assertEqual(result, "break")
+        self.assertIn("来源标注", messages[0])
+
     def test_preview_scope_follows_explicit_output_mode(self):
         shared = SimpleNamespace(output_mode=FakeVar("combined"))
         paired = SimpleNamespace(output_mode=FakeVar("separate"))
@@ -252,6 +263,25 @@ class ExportModeTests(unittest.TestCase):
             )
             names = sorted(path.name for path in (Path(result[1]) / "final_jpg").glob("*.jpg"))
             self.assertEqual(names, ["a.jpg", "b.jpg"])
+
+    def test_global_preview_returns_clean_and_labeled_versions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "DSC01000.tif"
+            image = np.zeros((80, 120, 3), dtype=np.uint16)
+            image[30:42, 20:95] = 52000
+            self.write_tiff(source, image)
+            fake = SimpleNamespace(work_queue=queue.Queue())
+            result = MeteorComposer._global_preview_worker(
+                fake, "signature", np.zeros((80, 120, 3), dtype=np.uint8),
+                {source: [Stroke([(0.15, 0.45), (0.82, 0.45)], 14, 2)]}, {},
+                {"match_exposure": False, "curve_enabled": False,
+                 "curve_shadows": 15, "curve_highlights": 25},
+                "普通粘贴", {str(source): source},
+            )
+            kind, signature, clean, labeled, included = result
+            self.assertEqual((kind, signature, included), ("global_preview", "signature", 1))
+            self.assertFalse(np.array_equal(clean, labeled))
 
 
 
