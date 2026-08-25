@@ -23,8 +23,8 @@ from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.11-local-output-modes"
-PROJECT_VERSION = 20
+APP_VERSION = "0.1.12-local-source-labels"
+PROJECT_VERSION = 21
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
@@ -123,6 +123,86 @@ def atomic_write_jpeg(path: Path, array16: np.ndarray, quality: int = 95) -> Non
     with Image.open(temp) as check:
         check.verify()
     os.replace(temp, path)
+
+
+def meteor_mask_boxes(mask: np.ndarray, preview_limit: int = 2000) -> list[tuple[int, int, int, int]]:
+    """Return compact full-resolution boxes for disconnected meteor regions."""
+    height, width = mask.shape[:2]
+    scale = min(1.0, preview_limit / max(1, width, height))
+    if scale < 1.0:
+        preview = cv2.resize(
+            mask, (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        preview = mask
+    binary = np.where(preview > 0.06, 255, 0).astype(np.uint8)
+    if not np.any(binary):
+        return []
+    kernel_size = max(3, int(round(min(binary.shape[:2]) * 0.003)))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    inverse = 1.0 / scale
+    boxes = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w * h < 4:
+            continue
+        x0 = max(0, int(np.floor(x * inverse)))
+        y0 = max(0, int(np.floor(y * inverse)))
+        x1 = min(width, int(np.ceil((x + w) * inverse)))
+        y1 = min(height, int(np.ceil((y + h) * inverse)))
+        boxes.append((x0, y0, x1, y1))
+    return sorted(boxes, key=lambda box: (box[1], box[0]))
+
+
+def annotate_meteor_sources(
+    image16: np.ndarray, annotations: list[dict]
+) -> tuple[np.ndarray, list[dict]]:
+    """Create an 8-bit review copy with source names beside each meteor region."""
+    shown = np.right_shift(to_uint16(image16), 8).astype(np.uint8)
+    height, width = shown.shape[:2]
+    longest = max(width, height)
+    font_scale = float(np.clip(longest / 3600.0, 0.65, 2.4))
+    thickness = max(1, round(font_scale * 1.6))
+    pad = max(4, round(font_scale * 5))
+    palette = (
+        (255, 190, 45), (80, 220, 255), (255, 105, 190), (120, 255, 120),
+        (195, 135, 255), (255, 145, 80),
+    )
+    label_records = []
+    for source_index, annotation in enumerate(annotations):
+        source_name = str(annotation["source"])
+        boxes = annotation.get("boxes", [])
+        color = palette[source_index % len(palette)]
+        for region_index, (x0, y0, x1, y1) in enumerate(boxes, start=1):
+            suffix = f" #{region_index}" if len(boxes) > 1 else ""
+            label = (source_name + suffix).encode("ascii", "replace").decode("ascii")
+            cv2.rectangle(shown, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), color, thickness)
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
+            )
+            label_x = int(np.clip(x0, 0, max(0, width - text_width - pad * 2)))
+            preferred_y = y0 - pad * 2
+            if preferred_y - text_height - baseline < 0:
+                preferred_y = min(height - baseline - pad, y1 + text_height + pad * 2)
+            text_y = int(np.clip(preferred_y, text_height + pad, height - baseline - pad))
+            cv2.rectangle(
+                shown,
+                (label_x, text_y - text_height - pad),
+                (min(width - 1, label_x + text_width + pad * 2), min(height - 1, text_y + baseline + pad)),
+                (10, 10, 10), -1,
+            )
+            cv2.putText(
+                shown, label, (label_x + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale, color, thickness, cv2.LINE_AA,
+            )
+            cv2.line(shown, (x0, y0), (label_x + pad, text_y + baseline), color, thickness)
+            label_records.append({"label": label, "source": source_name, "box": [x0, y0, x1, y1]})
+    return shown, label_records
 
 
 def unique_path(path: Path) -> Path:
@@ -2705,6 +2785,8 @@ F1：显示本快捷键表""")
         combined_result = None
         combined_base_path = None
         combined_outputs: list[str] = []
+        combined_annotations: list[dict] = []
+        source_label_records: list[dict] = []
         for index, (source_path, strokes) in enumerate(marked.items(), start=1):
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
             match = bool(adjustment["match_exposure"])
@@ -2732,6 +2814,9 @@ F1：显示本快捷键表""")
             )
             if not np.any(mask_float > 0.001):
                 continue
+            source_boxes = meteor_mask_boxes(mask_float) if combined else []
+            if source_boxes:
+                combined_annotations.append({"source": source_path.stem, "boxes": source_boxes})
             mask_full = np.clip(mask_float * 65535, 0, 65535).astype(np.uint16)
             mask_path = masks_dir / f"{source_path.stem}_mask.png"
             ok, encoded = cv2.imencode(".png", mask_full)
@@ -2757,6 +2842,7 @@ F1：显示本快捷键表""")
                 "meteor_highlight_protection": match,
                 "curve_shadows": curve_shadows, "curve_highlights": curve_highlights,
                 "blend_mode": blend_mode,
+                "source_regions": [list(box) for box in source_boxes],
                 "outputs": outputs,
             })
             del source, source16, mask_full
@@ -2772,6 +2858,12 @@ F1：显示本快捷键表""")
                 tif_path = tif_dir / f"{output_stem}.tif"
                 atomic_write_tiff(tif_path, combined_result)
                 combined_outputs.append(str(tif_path))
+            annotated, source_label_records = annotate_meteor_sources(
+                combined_result, combined_annotations
+            )
+            labeled_path = jpg_dir / f"{output_stem}_来源标注.jpg"
+            atomic_write_jpeg(labeled_path, annotated.astype(np.uint16) * 257)
+            combined_outputs.append(str(labeled_path))
             for entry in report:
                 entry["outputs"] = combined_outputs.copy()
         manifest = {
@@ -2782,6 +2874,7 @@ F1：显示本快捷键表""")
             "export_tiff": export_tiff,
             "output_mode": output_mode,
             "final_outputs": combined_outputs if combined else [],
+            "source_labels": source_label_records,
             "items": report,
         }
         (run_dir / "processing_report.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
