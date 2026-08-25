@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -23,8 +23,8 @@ from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.13-local-labeled-preview"
-PROJECT_VERSION = 22
+APP_VERSION = "0.1.14-editable-composite"
+PROJECT_VERSION = 23
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
@@ -856,6 +856,7 @@ class MeteorComposer(tk.Tk):
         self.setting_candidate_threshold = False
         self.edit_history: dict[str, list[tuple[str, int, object]]] = {}
         self.edit_redo: dict[str, list[tuple[str, int, object]]] = {}
+        self.last_edit_key: str | None = None
         self.current_path: Path | None = None
         self.preview_rgb: np.ndarray | None = None
         self.preview_source: np.ndarray | None = None
@@ -882,6 +883,12 @@ class MeteorComposer(tk.Tk):
         self.active_action_index = -1
         self.context_stroke_index: int | None = None
         self.context_highlight: int | None = None
+        self.selected_object: tuple[str, int] | None = None
+        self.object_drag_mode: str | None = None
+        self.object_drag_start: tuple[float, float] | None = None
+        self.object_drag_original: Stroke | None = None
+        self.object_handle_centers: dict[str, tuple[float, float]] = {}
+        self.object_overlay_items: list[int] = []
         self.hover_candidate_index: int | None = None
         self.hover_candidate_items: list[int] = []
         self.work_queue: queue.Queue = queue.Queue()
@@ -968,8 +975,8 @@ class MeteorComposer(tk.Tk):
         ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._render_preview).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._render_preview).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Label(view_bar, text="编辑视图显示红色蒙版；按住 H 临时隐藏").pack(side="left", padx=(16, 0))
-        ttk.Label(view_bar, text="普通拖动绘制；单击后 Shift+单击可画直线").pack(side="right")
+        ttk.Label(view_bar, text="3/4 视图可直接选择、移动和变换流星").pack(side="left", padx=(16, 0))
+        ttk.Label(view_bar, text="编辑视图：拖动画蒙版；按住 H 临时隐藏红色").pack(side="right")
         self.canvas = tk.Canvas(center, background="#181818", cursor="none", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _e: self._render_preview())
@@ -995,6 +1002,10 @@ class MeteorComposer(tk.Tk):
         self.mask_menu.add_command(label="删除整条蒙版", command=self._delete_context_stroke)
         self.mask_menu.add_command(label="锁定这条蒙版", command=self._toggle_context_lock)
         self.mask_menu.add_command(label="移动／旋转／拉伸这颗流星…", command=self._transform_context_stroke)
+        self.object_menu = tk.Menu(self, tearoff=0)
+        self.object_menu.add_command(label="删除这颗流星", command=self._delete_selected_object)
+        self.object_menu.add_command(label="重置移动／旋转／拉伸", command=self._reset_selected_object)
+        self.object_menu.add_command(label="精确变换参数…", command=self._transform_selected_object)
 
         tools = ttk.LabelFrame(root, text="流星蒙版", padding=8)
         tools.pack(fill="x")
@@ -1143,12 +1154,20 @@ class MeteorComposer(tk.Tk):
             "<KeyPress-2>": lambda: self._set_view_mode("base"),
             "<KeyPress-3>": lambda: self._set_view_mode("blend"),
             "<KeyPress-4>": lambda: self._set_view_mode("labeled"),
-            "<KeyPress-Left>": lambda: self._select_relative(-1),
-            "<KeyPress-Right>": lambda: self._select_relative(1),
+            "<KeyPress-Left>": lambda: self._arrow_action(-1, 0, 1),
+            "<KeyPress-Right>": lambda: self._arrow_action(1, 0, 1),
+            "<KeyPress-Up>": lambda: self._arrow_action(0, -1, 1),
+            "<KeyPress-Down>": lambda: self._arrow_action(0, 1, 1),
+            "<Shift-KeyPress-Left>": lambda: self._arrow_action(-1, 0, 10),
+            "<Shift-KeyPress-Right>": lambda: self._arrow_action(1, 0, 10),
+            "<Shift-KeyPress-Up>": lambda: self._arrow_action(0, -1, 10),
+            "<Shift-KeyPress-Down>": lambda: self._arrow_action(0, 1, 10),
         }
         for sequence, callback in plain.items():
             self.bind_all(sequence, lambda event, fn=callback: self._run_plain_shortcut(event, fn))
         self.bind_all("<Escape>", lambda _e: self._cancel_active_stroke())
+        self.bind_all("<Delete>", self._delete_selected_shortcut)
+        self.bind_all("<BackSpace>", self._delete_selected_shortcut)
         self.bind_all("<F1>", lambda _e: self.show_shortcuts())
         self.bind_all("<KeyPress-h>", self._mask_hold_press)
         self.bind_all("<KeyRelease-h>", self._mask_hold_release)
@@ -1216,8 +1235,26 @@ class MeteorComposer(tk.Tk):
         self._tool_settings_changed()
 
     def _set_view_mode(self, mode: str) -> None:
+        if mode not in {"blend", "labeled"}:
+            self._clear_object_selection()
         self.view_mode.set(mode)
         self._render_preview()
+
+    def _arrow_action(self, dx: int, dy: int, amount: int) -> None:
+        if self.view_mode.get() in {"blend", "labeled"} and self.selected_object:
+            stroke = self._selected_stroke()
+            if stroke is None:
+                return
+            before = replace(stroke, points=stroke.points.copy())
+            stroke.offset_x += dx * amount
+            stroke.offset_y += dy * amount
+            self._record_object_transform(before)
+            self._invalidate_global_preview()
+            self._render_preview()
+            self.status.set(f"已移动流星 {dx * amount:+d}, {dy * amount:+d} px")
+            return
+        if dx:
+            self._select_relative(dx)
 
     def _mask_hold_press(self, event):
         widget_class = event.widget.winfo_class() if event.widget else ""
@@ -1266,6 +1303,12 @@ Ctrl/Command+Shift+Z 或 Ctrl/Command+Y：重做
 Ctrl/Command+单击蒙版：直接删除整条蒙版
 Shift+右键单击蒙版：直接删除整条蒙版
 Esc：取消当前尚未完成的一笔
+
+最终融合／来源标注
+单击流星：选中对象；拖动对象内部：移动
+拖动端点／侧边／四角手柄：拉伸或缩放；拖动圆形手柄：旋转
+Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 10 px
+右键所选流星：删除、重置或输入精确变换参数
 
 单张候选
 点击“AI分析当前单张候选”，再拖动 AI 分数阈值；阈值越低，加入的候选越多
@@ -1369,6 +1412,7 @@ F1：显示本快捷键表""")
 
     def scan_inputs(self) -> None:
         try:
+            self._clear_object_selection()
             source = Path(self.source_dir.get()).expanduser()
             base_text = self.base_dir.get().strip()
             base_input = Path(base_text).expanduser() if base_text else None
@@ -1835,7 +1879,10 @@ F1：显示本快捷键表""")
                 if self.global_preview_signature == signature and cached is not None:
                     shown = cached.copy()
                 else:
-                    shown = self.preview_base.copy()
+                    # Keep the last composite visible while a transformed object is
+                    # recomposited in the worker; otherwise the entire sky flashes
+                    # back to the empty base after every mouse release.
+                    shown = cached.copy() if cached is not None else self.preview_base.copy()
                     self._request_global_preview(signature)
             else:
                 shown, current_mask = compose_meteor_objects(
@@ -1879,6 +1926,8 @@ F1：显示本快捷键表""")
         self.hover_candidate_items = []
         self.hover_candidate_index = None
         self.canvas.create_image(x0, y0, anchor="nw", image=self.preview_photo)
+        if composite_mode:
+            self._draw_selected_object_overlay()
         if not composite_mode and self.show_mask.get():
             self._draw_candidate_guides()
             self._draw_mask_annotations()
@@ -1951,6 +2000,7 @@ F1：显示本快捷键表""")
         self._update_brush_cursor()
         if self.view_mode.get() in {"blend", "labeled"}:
             self._clear_candidate_hover()
+            self._update_object_cursor(event.x, event.y)
             return
         if self.active_points:
             self._clear_candidate_hover()
@@ -2111,6 +2161,339 @@ F1：显示本快捷键表""")
                 x - center, y - center, x + center, y + center, fill=color, outline="#000000"
             ))
 
+    def _editable_object_refs(self) -> list[tuple[str, int]]:
+        if self._uses_shared_base():
+            sources = self.strokes.items()
+        elif self.current_path:
+            key = str(self.current_path)
+            sources = ((key, self.strokes.get(key, [])),)
+        else:
+            sources = ()
+        return [
+            (key, index)
+            for key, values in sources
+            for index, stroke in enumerate(values)
+            if not stroke.erase and stroke.points
+        ]
+
+    def _selected_stroke(self) -> Stroke | None:
+        if self.selected_object is None:
+            return None
+        key, index = self.selected_object
+        values = self.strokes.get(key, [])
+        if not (0 <= index < len(values)) or values[index].erase:
+            self.selected_object = None
+            return None
+        return values[index]
+
+    def _object_canvas_geometry(
+        self, reference: tuple[str, int], stroke_override: Stroke | None = None
+    ) -> dict | None:
+        key, index = reference
+        values = self.strokes.get(key, [])
+        if stroke_override is None:
+            if not (0 <= index < len(values)):
+                return None
+            stroke = values[index]
+        else:
+            stroke = stroke_override
+        if stroke.erase or not stroke.points:
+            return None
+        x0, y0, x1, y1 = self.display_box
+        full_width, full_height = self.current_dims
+        normalized = transformed_stroke_points(stroke, full_width, full_height)
+        points = np.asarray([
+            (x0 + px * (x1 - x0), y0 + py * (y1 - y0)) for px, py in normalized
+        ], dtype=np.float64)
+        if not len(points):
+            return None
+        center = points.mean(axis=0)
+        direction = points[-1] - points[0] if len(points) > 1 else np.asarray([1.0, 0.0])
+        length = float(np.hypot(direction[0], direction[1]))
+        axis = direction / length if length > 1e-6 else np.asarray([1.0, 0.0])
+        normal = np.asarray([-axis[1], axis[0]])
+        along = (points - center) @ axis
+        across = (points - center) @ normal
+        display_scale = (x1 - x0) / max(1, full_width)
+        half_length = max(8.0, float(np.max(np.abs(along))) + 4.0)
+        half_width = max(
+            7.0,
+            float(np.max(np.abs(across))) + stroke.width * stroke.width_scale * display_scale * 0.5 + 4.0,
+        )
+        corners = [
+            center - axis * half_length - normal * half_width,
+            center + axis * half_length - normal * half_width,
+            center + axis * half_length + normal * half_width,
+            center - axis * half_length + normal * half_width,
+        ]
+        handles = {
+            "length_start": center - axis * half_length,
+            "length_end": center + axis * half_length,
+            "width_neg": center - normal * half_width,
+            "width_pos": center + normal * half_width,
+            "scale_nw": corners[0],
+            "scale_ne": corners[1],
+            "scale_se": corners[2],
+            "scale_sw": corners[3],
+            "rotate": center - normal * (half_width + 30.0),
+        }
+        return {
+            "points": points, "center": center, "axis": axis, "normal": normal,
+            "half_length": half_length, "half_width": half_width, "corners": corners,
+            "handles": handles, "display_scale": max(1e-9, display_scale),
+        }
+
+    def _draw_selected_object_overlay(self) -> None:
+        for item in self.object_overlay_items:
+            self.canvas.delete(item)
+        self.object_overlay_items = []
+        self.object_handle_centers = {}
+        if self.view_mode.get() not in {"blend", "labeled"} or self.selected_object is None:
+            return
+        stroke = self._selected_stroke()
+        if stroke is None:
+            return
+        geometry = self._object_canvas_geometry(self.selected_object)
+        if geometry is None:
+            return
+        corners = geometry["corners"]
+        polygon = [coordinate for point in corners for coordinate in point]
+        color = "#ffb000" if stroke.locked else "#00e5ff"
+        self.object_overlay_items.append(self.canvas.create_polygon(
+            *polygon, fill="", outline=color, width=2, dash=(6, 3), tags=("object_overlay",)
+        ))
+        rotate = geometry["handles"]["rotate"]
+        top = (corners[0] + corners[1]) * 0.5
+        self.object_overlay_items.append(self.canvas.create_line(
+            top[0], top[1], rotate[0], rotate[1], fill=color, width=2, tags=("object_overlay",)
+        ))
+        self.object_handle_centers = {
+            name: (float(point[0]), float(point[1])) for name, point in geometry["handles"].items()
+        }
+        for name, (hx, hy) in self.object_handle_centers.items():
+            radius = 7 if name == "rotate" else 5
+            shape = self.canvas.create_oval if name == "rotate" else self.canvas.create_rectangle
+            self.object_overlay_items.append(shape(
+                hx - radius, hy - radius, hx + radius, hy + radius,
+                fill="#181818", outline=color, width=2, tags=("object_overlay",),
+            ))
+        key, _index = self.selected_object
+        label = Path(key).stem + ("  [已锁定]" if stroke.locked else "")
+        label_x, label_y = corners[0]
+        self.object_overlay_items.append(self.canvas.create_text(
+            label_x, label_y - 12, text=label, anchor="sw", fill=color,
+            font=("TkDefaultFont", 10, "bold"), tags=("object_overlay",),
+        ))
+
+    def _object_handle_at(self, canvas_x: float, canvas_y: float) -> str | None:
+        best = None
+        best_distance = 12.0
+        for name, (hx, hy) in self.object_handle_centers.items():
+            distance = float(np.hypot(canvas_x - hx, canvas_y - hy))
+            if distance < best_distance:
+                best, best_distance = name, distance
+        return best
+
+    def _find_object_near(self, canvas_x: float, canvas_y: float) -> tuple[str, int] | None:
+        x0, y0, x1, y1 = self.display_box
+        if not (x0 <= canvas_x <= x1 and y0 <= canvas_y <= y1):
+            return None
+        best_reference = None
+        best_distance = float("inf")
+        for reference in reversed(self._editable_object_refs()):
+            geometry = self._object_canvas_geometry(reference)
+            if geometry is None:
+                continue
+            points = geometry["points"]
+            if len(points) == 1:
+                distance = float(np.hypot(*(np.asarray((canvas_x, canvas_y)) - points[0])))
+            else:
+                distance = min(
+                    self._point_segment_distance(canvas_x, canvas_y, *start, *end)
+                    for start, end in zip(points, points[1:])
+                )
+            edge_distance = distance - geometry["half_width"]
+            if edge_distance <= 12.0 and edge_distance < best_distance:
+                best_reference, best_distance = reference, edge_distance
+        return best_reference
+
+    def _update_object_cursor(self, canvas_x: float, canvas_y: float) -> None:
+        handle = self._object_handle_at(canvas_x, canvas_y)
+        if handle == "rotate":
+            cursor = "exchange"
+        elif handle is not None:
+            cursor = "sizing"
+        elif self._find_object_near(canvas_x, canvas_y) is not None:
+            cursor = "fleur"
+        else:
+            cursor = "arrow"
+        try:
+            self.canvas.configure(cursor=cursor)
+        except tk.TclError:
+            self.canvas.configure(cursor="crosshair" if handle else "arrow")
+
+    def _object_pointer_start(self, event):
+        handle = self._object_handle_at(event.x, event.y)
+        reference = self.selected_object if handle else self._find_object_near(event.x, event.y)
+        if reference is None:
+            self._clear_object_selection()
+            self.status.set("单击一颗流星即可选中；选中后可拖动或使用变换手柄")
+            return "break"
+        self.selected_object = reference
+        stroke = self._selected_stroke()
+        self._draw_selected_object_overlay()
+        if stroke is None:
+            return "break"
+        self.object_drag_mode = handle or "move"
+        self.object_drag_start = (float(event.x), float(event.y))
+        self.object_drag_original = replace(stroke, points=stroke.points.copy())
+        self.status.set("拖动中：松开鼠标后重新生成最终融合与来源标注预览")
+        return "break"
+
+    def _object_pointer_move(self, event):
+        stroke = self._selected_stroke()
+        original = self.object_drag_original
+        start = self.object_drag_start
+        if stroke is None or original is None or start is None or self.selected_object is None:
+            return "break"
+        geometry = self._object_canvas_geometry(self.selected_object, original)
+        if geometry is None:
+            return "break"
+        cursor = np.asarray((float(event.x), float(event.y)))
+        start_point = np.asarray(start)
+        center = geometry["center"]
+        mode = self.object_drag_mode or "move"
+        if mode == "move":
+            delta = (cursor - start_point) / geometry["display_scale"]
+            stroke.offset_x = original.offset_x + float(delta[0])
+            stroke.offset_y = original.offset_y + float(delta[1])
+        elif mode == "rotate":
+            first = float(np.arctan2(start_point[1] - center[1], start_point[0] - center[0]))
+            current = float(np.arctan2(cursor[1] - center[1], cursor[0] - center[0]))
+            delta = np.rad2deg(current - first)
+            stroke.rotation = original.rotation + float((delta + 180.0) % 360.0 - 180.0)
+        elif mode.startswith("length"):
+            start_distance = abs(float((start_point - center) @ geometry["axis"]))
+            current_distance = abs(float((cursor - center) @ geometry["axis"]))
+            stroke.length_scale = max(0.05, original.length_scale * current_distance / max(3.0, start_distance))
+        elif mode.startswith("width"):
+            start_distance = abs(float((start_point - center) @ geometry["normal"]))
+            current_distance = abs(float((cursor - center) @ geometry["normal"]))
+            stroke.width_scale = max(0.05, original.width_scale * current_distance / max(3.0, start_distance))
+        elif mode.startswith("scale"):
+            start_distance = float(np.hypot(*(start_point - center)))
+            current_distance = float(np.hypot(*(cursor - center)))
+            ratio = current_distance / max(3.0, start_distance)
+            stroke.length_scale = max(0.05, original.length_scale * ratio)
+            stroke.width_scale = max(0.05, original.width_scale * ratio)
+        self._draw_selected_object_overlay()
+        return "break"
+
+    def _object_pointer_end(self, _event=None):
+        stroke = self._selected_stroke()
+        before = self.object_drag_original
+        self.object_drag_mode = None
+        self.object_drag_start = None
+        self.object_drag_original = None
+        if stroke is not None and before is not None and stroke != before:
+            self._record_object_transform(before)
+            self._invalidate_global_preview()
+            self._render_preview()
+            self.status.set("流星变换已应用；最终效果与来源标注已同步更新")
+        else:
+            self._draw_selected_object_overlay()
+        return "break"
+
+    def _record_object_transform(self, before: Stroke) -> None:
+        if self.selected_object is None:
+            return
+        key, index = self.selected_object
+        stroke = self._selected_stroke()
+        if stroke is None:
+            return
+        self._sync_matching_candidate(key, stroke)
+        after = replace(stroke, points=stroke.points.copy())
+        self._record_edit(key, ("transform", index, (before, after)))
+
+    def _matching_candidate(self, key: str, stroke: Stroke) -> tuple[int, Stroke] | None:
+        for index, candidate in enumerate(self.candidates.get(key, [])):
+            if candidate.auto_score == stroke.auto_score and candidate.points == stroke.points:
+                return index, candidate
+        return None
+
+    def _sync_matching_candidate(self, key: str, stroke: Stroke) -> None:
+        match = self._matching_candidate(key, stroke)
+        if match is None:
+            return
+        _index, candidate = match
+        candidate.offset_x = stroke.offset_x
+        candidate.offset_y = stroke.offset_y
+        candidate.rotation = stroke.rotation
+        candidate.length_scale = stroke.length_scale
+        candidate.width_scale = stroke.width_scale
+        candidate.opacity = stroke.opacity
+
+    def _invalidate_global_preview(self) -> None:
+        self.global_preview_signature = None
+        self.global_preview_loading_signature = None
+
+    def _clear_object_selection(self) -> None:
+        self.selected_object = None
+        self.object_drag_mode = None
+        self.object_drag_start = None
+        self.object_drag_original = None
+        for item in self.object_overlay_items:
+            self.canvas.delete(item)
+        self.object_overlay_items = []
+        self.object_handle_centers = {}
+
+    def _delete_selected_shortcut(self, event):
+        widget_class = event.widget.winfo_class() if event.widget else ""
+        if widget_class in {"Entry", "TEntry", "Text", "TCombobox", "Spinbox", "TSpinbox"}:
+            return None
+        return self._delete_selected_object()
+
+    def _delete_selected_object(self):
+        if self.view_mode.get() not in {"blend", "labeled"} or self.selected_object is None:
+            return None
+        key, index = self.selected_object
+        values = self.strokes.get(key, [])
+        if not (0 <= index < len(values)):
+            self._clear_object_selection()
+            return "break"
+        stroke = values.pop(index)
+        candidate_match = self._matching_candidate(key, stroke)
+        if candidate_match is None:
+            self._record_edit(key, ("delete", index, stroke))
+        else:
+            candidate_index, candidate = candidate_match
+            self.candidates[key].pop(candidate_index)
+            self._record_edit(key, ("delete_object", index, (stroke, candidate_index, candidate)))
+        self._clear_object_selection()
+        self._update_tree_status_for_key(key)
+        self._invalidate_global_preview()
+        self._render_preview()
+        self.status.set("已从最终合成中删除整颗流星；可用 Ctrl/Command+Z 恢复")
+        return "break"
+
+    def _reset_selected_object(self) -> None:
+        stroke = self._selected_stroke()
+        if stroke is None:
+            self.status.set("没有可重置的流星")
+            return
+        before = replace(stroke, points=stroke.points.copy())
+        stroke.offset_x = stroke.offset_y = stroke.rotation = 0.0
+        stroke.length_scale = stroke.width_scale = stroke.opacity = 1.0
+        if stroke != before:
+            self._record_object_transform(before)
+            self._invalidate_global_preview()
+            self._render_preview()
+        self.status.set("已恢复这颗流星的真实位置和原始比例")
+
+    def _transform_selected_object(self) -> None:
+        if self.selected_object is not None:
+            self._open_transform_dialog(*self.selected_object)
+
     def _event_normalized(self, event) -> tuple[float, float] | None:
         x0, y0, x1, y1 = self.display_box
         if not (x0 <= event.x <= x1 and y0 <= event.y <= y1):
@@ -2141,7 +2524,8 @@ F1：显示本快捷键表""")
         for index, stroke in enumerate(self.strokes.get(str(self.current_path), [])):
             if stroke.erase or not stroke.points:
                 continue
-            points = [(x0 + px * (x1 - x0), y0 + py * (y1 - y0)) for px, py in stroke.points]
+            transformed = transformed_stroke_points(stroke, *self.current_dims)
+            points = [(x0 + px * (x1 - x0), y0 + py * (y1 - y0)) for px, py in transformed]
             if len(points) == 1:
                 distance = float(np.hypot(canvas_x - points[0][0], canvas_y - points[0][1]))
             else:
@@ -2179,6 +2563,20 @@ F1：显示本快捷键表""")
             )
 
     def _show_mask_menu(self, event):
+        if self.view_mode.get() in {"blend", "labeled"}:
+            reference = self._find_object_near(event.x, event.y)
+            if reference is not None:
+                self.selected_object = reference
+            if self._selected_stroke() is None:
+                self.status.set("此处附近没有可编辑的流星")
+                self._draw_selected_object_overlay()
+                return "break"
+            self._draw_selected_object_overlay()
+            try:
+                self.object_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.object_menu.grab_release()
+            return "break"
         index = self._find_stroke_near(event.x, event.y)
         if index is None:
             self.status.set("此处附近没有可整条删除的蒙版")
@@ -2196,6 +2594,12 @@ F1：显示本快捷键表""")
         return "break"
 
     def _delete_mask_at_event(self, event):
+        if self.view_mode.get() in {"blend", "labeled"}:
+            reference = self._find_object_near(event.x, event.y)
+            if reference is not None:
+                self.selected_object = reference
+                return self._delete_selected_object()
+            return "break"
         index = self._find_stroke_near(event.x, event.y)
         if index is None:
             self.status.set("此处附近没有可整条删除的蒙版")
@@ -2207,6 +2611,7 @@ F1：显示本快捷键表""")
     def _record_edit(self, key: str, action: tuple[str, int, object]) -> None:
         self.edit_history.setdefault(key, []).append(action)
         self.edit_redo.pop(key, None)
+        self.last_edit_key = key
         self._schedule_autosave()
 
     def _delete_context_stroke(self) -> None:
@@ -2256,11 +2661,14 @@ F1：显示本快捷键表""")
     def _transform_context_stroke(self) -> None:
         if not self.current_path or self.context_stroke_index is None:
             return
-        values = self.strokes.get(str(self.current_path), [])
-        index = self.context_stroke_index
+        self._open_transform_dialog(str(self.current_path), self.context_stroke_index)
+
+    def _open_transform_dialog(self, object_key: str, index: int) -> None:
+        values = self.strokes.get(object_key, [])
         if not (0 <= index < len(values)) or values[index].erase:
             return
         stroke = values[index]
+        before = replace(stroke, points=stroke.points.copy())
         dialog = tk.Toplevel(self)
         dialog.title("变换这颗流星")
         dialog.transient(self)
@@ -2312,10 +2720,12 @@ F1：显示本快捷键表""")
                 messagebox.showerror(APP_NAME, "变换参数无效", parent=dialog)
                 return
             self.context_stroke_index = None
-            self.edit_history.pop(str(self.current_path), None)
-            self.edit_redo.pop(str(self.current_path), None)
+            if stroke != before:
+                self._sync_matching_candidate(object_key, stroke)
+                after = replace(stroke, points=stroke.points.copy())
+                self._record_edit(object_key, ("transform", index, (before, after)))
+            self._invalidate_global_preview()
             self._render_preview()
-            self._schedule_autosave()
             dialog.destroy()
 
         ttk.Button(buttons, text="恢复真实位置", command=lambda: apply_values(True)).pack(side="left")
@@ -2326,8 +2736,7 @@ F1：显示本快捷键表""")
         if not self.current_path:
             return
         if self.view_mode.get() in {"blend", "labeled"}:
-            self.status.set("融合预览/来源标注预览只用于检查成片；请切回“原图 TIFF”编辑蒙版")
-            return "break"
+            return self._object_pointer_start(event)
         # The floating candidate button is handled only by the canvas, so selecting a
         # candidate and painting can never compete for the same press.
         if self.hover_candidate_items and point_in_padded_bbox(
@@ -2384,6 +2793,8 @@ F1：显示本快捷键表""")
         return int(self.eraser_width.get() if self.edit_mode.get() == "erase" else self.brush_width.get())
 
     def _stroke_move(self, event) -> None:
+        if self.object_drag_mode is not None:
+            return self._object_pointer_move(event)
         if not self.active_points:
             return
         point = self._event_normalized(event)
@@ -2401,6 +2812,8 @@ F1：显示本快捷键表""")
             self._draw_active_stroke()
 
     def _stroke_end(self, event) -> None:
+        if self.object_drag_mode is not None:
+            return self._object_pointer_end(event)
         if not self.active_points or not self.current_path:
             return
         point = self._event_normalized(event)
@@ -2439,7 +2852,11 @@ F1：显示本快捷键表""")
     def undo_stroke(self) -> None:
         if not self.current_path:
             return
-        key = str(self.current_path)
+        key = (
+            self.last_edit_key
+            if self.view_mode.get() in {"blend", "labeled"} and self.last_edit_key
+            else str(self.current_path)
+        )
         values = self.strokes.setdefault(key, [])
         history = self.edit_history.setdefault(key, [])
         if history:
@@ -2452,9 +2869,18 @@ F1：显示本快捷键表""")
                     values.remove(payload)
             elif kind == "delete":
                 values.insert(min(index, len(values)), payload)
+            elif kind == "delete_object":
+                stroke, candidate_index, candidate = payload
+                values.insert(min(index, len(values)), stroke)
+                pool = self.candidates.setdefault(key, [])
+                pool.insert(min(candidate_index, len(pool)), candidate)
             elif kind == "clear":
                 before, _after = payload
                 values[:] = list(before)
+            elif kind == "transform" and 0 <= index < len(values):
+                before, _after = payload
+                values[index] = replace(before, points=before.points.copy())
+                self._sync_matching_candidate(key, values[index])
         elif values:
             index = len(values) - 1
             payload = values.pop()
@@ -2463,14 +2889,19 @@ F1：显示本快捷键表""")
             return
         self.edit_redo.setdefault(key, []).append(action)
         self._restore_shift_anchor()
-        self._update_tree_status()
+        self._update_tree_status_for_key(key)
+        self._invalidate_global_preview()
         self._render_preview()
         self._schedule_autosave()
 
     def redo_stroke(self) -> None:
         if not self.current_path:
             return
-        key = str(self.current_path)
+        key = (
+            self.last_edit_key
+            if self.view_mode.get() in {"blend", "labeled"} and self.last_edit_key
+            else str(self.current_path)
+        )
         if not self.edit_redo.get(key):
             return
         action = self.edit_redo[key].pop()
@@ -2483,12 +2914,26 @@ F1：显示本快捷键表""")
                 values.pop(index)
             elif payload in values:
                 values.remove(payload)
+        elif kind == "delete_object":
+            stroke, _candidate_index, candidate = payload
+            if 0 <= index < len(values) and values[index] is stroke:
+                values.pop(index)
+            elif stroke in values:
+                values.remove(stroke)
+            pool = self.candidates.get(key, [])
+            if candidate in pool:
+                pool.remove(candidate)
         elif kind == "clear":
             _before, after = payload
             values[:] = list(after)
+        elif kind == "transform" and 0 <= index < len(values):
+            _before, after = payload
+            values[index] = replace(after, points=after.points.copy())
+            self._sync_matching_candidate(key, values[index])
         self.edit_history.setdefault(key, []).append(action)
         self._restore_shift_anchor()
-        self._update_tree_status()
+        self._update_tree_status_for_key(key)
+        self._invalidate_global_preview()
         self._render_preview()
         self._schedule_autosave()
 
@@ -2503,6 +2948,21 @@ F1：显示本快捷键表""")
             self.shift_anchors.pop(key, None)
 
     def _cancel_active_stroke(self):
+        if self.object_drag_mode is not None and self.object_drag_original is not None and self.selected_object:
+            key, index = self.selected_object
+            values = self.strokes.get(key, [])
+            if 0 <= index < len(values):
+                values[index] = replace(self.object_drag_original, points=self.object_drag_original.points.copy())
+            self.object_drag_mode = None
+            self.object_drag_start = None
+            self.object_drag_original = None
+            self._draw_selected_object_overlay()
+            self.status.set("已取消当前流星变换")
+            return "break"
+        if self.selected_object is not None:
+            self._clear_object_selection()
+            self.status.set("已取消选择")
+            return "break"
         if self.current_path and self.live_erase_stroke is not None:
             key = str(self.current_path)
             values = self.strokes.get(key, [])
@@ -2546,9 +3006,12 @@ F1：显示本快捷键表""")
     def _update_tree_status(self) -> None:
         if not self.current_path:
             return
+        self._update_tree_status_for_key(str(self.current_path))
+
+    def _update_tree_status_for_key(self, key: str) -> None:
         for index, path in enumerate(self.files):
-            if path == self.current_path and self.tree.exists(str(index)):
-                count = len(self.strokes.get(str(path), []))
+            if str(path) == key and self.tree.exists(str(index)):
+                count = len(self.strokes.get(key, []))
                 self.tree.set(str(index), "status", count or "—")
 
     def _setup_autosave(self) -> None:
@@ -2597,6 +3060,8 @@ F1：显示本快捷键表""")
         self.autosave_suspended = True
         self.loading_adjustments = True
         try:
+            self._clear_object_selection()
+            self.last_edit_key = None
             self.current_path = None
             self.preview_source = None
             self.preview_base = None
@@ -3093,7 +3558,19 @@ F1：显示本快捷键表""")
 
 if __name__ == "__main__":
     smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
-    if smoke_project:
+    editable_smoke_report = os.environ.get("METEOR_EDITABLE_SMOKE_REPORT")
+    if editable_smoke_report:
+        from editable_composite_smoke import run_smoke
+
+        application = MeteorComposer()
+        try:
+            smoke_result = run_smoke(application)
+            Path(editable_smoke_report).write_text(
+                json.dumps(smoke_result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        finally:
+            application.destroy()
+    elif smoke_project:
         from gui_interaction_smoke import run_smoke
 
         application = MeteorComposer()

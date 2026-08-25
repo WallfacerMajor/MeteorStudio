@@ -112,11 +112,39 @@ def run_smoke(app, project_path: Path) -> dict:
             json.dumps(app._project_data(), ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
+    # In the final/labeled preview the same manual stroke must behave as an
+    # editable meteor object rather than starting another paint stroke.
+    app.output_mode.set("separate")
+    app.view_mode.set("labeled")
+    app._render_preview()
+    app.update()
+    object_index = len(app.strokes[candidate_key]) - 1
+    geometry = app._object_canvas_geometry((candidate_key, object_index))
+    if geometry is None:
+        raise AssertionError("Editable object geometry was not created")
+    center = geometry["center"]
+    ox, oy = app.strokes[candidate_key][object_index].offset_x, app.strokes[candidate_key][object_index].offset_y
+    app.canvas.event_generate("<ButtonPress-1>", x=int(center[0]), y=int(center[1]))
+    app.canvas.event_generate("<B1-Motion>", x=int(center[0] + 36), y=int(center[1] + 18), state=0x0100)
+    app.canvas.event_generate("<ButtonRelease-1>", x=int(center[0] + 36), y=int(center[1] + 18))
+    app.update()
+    moved = app.strokes[candidate_key][object_index]
+    if moved.offset_x == ox and moved.offset_y == oy:
+        raise AssertionError("Dragging selected meteor did not update its transform")
+    before_delete = len(app.strokes[candidate_key])
+    app._delete_selected_object()
+    if len(app.strokes[candidate_key]) != before_delete - 1:
+        raise AssertionError("Delete did not remove selected meteor object")
+    app.undo_stroke()
+    if len(app.strokes[candidate_key]) != before_delete:
+        raise AssertionError("Undo did not restore deleted meteor object")
+
     result = {
         "candidate_button": "passed",
         "candidate_locked": candidate.auto_score,
         "manual_brush": "passed",
         "manual_points": len(app.strokes[candidate_key][-1].points),
+        "editable_composite": "passed",
         "mask_pixels_before": int(np.count_nonzero(selected_mask > 0.05)),
         "mask_pixels_after": int(np.count_nonzero(manual_mask > 0.05)),
         "image": candidate_key,

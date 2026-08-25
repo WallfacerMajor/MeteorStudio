@@ -147,27 +147,29 @@ class CandidateButtonGeometryTests(unittest.TestCase):
         self.assertEqual(fake.active_tool_mode, "paint")
         self.assertEqual(cleared, [True])
 
-    def test_blend_preview_blocks_mask_painting(self):
-        messages = []
+    def test_blend_preview_routes_press_to_object_editor(self):
+        events = []
         fake = SimpleNamespace(
             current_path="image.tif",
             view_mode=SimpleNamespace(get=lambda: "blend"),
-            status=SimpleNamespace(set=lambda message: messages.append(message)),
+            _object_pointer_start=lambda event: events.append(event) or "break",
         )
-        result = MeteorComposer._stroke_start(fake, SimpleNamespace(x=10, y=10, state=0))
+        event = SimpleNamespace(x=10, y=10, state=0)
+        result = MeteorComposer._stroke_start(fake, event)
         self.assertEqual(result, "break")
-        self.assertIn("融合预览", messages[0])
+        self.assertEqual(events, [event])
 
-    def test_labeled_preview_blocks_mask_painting(self):
-        messages = []
+    def test_labeled_preview_routes_press_to_object_editor(self):
+        events = []
         fake = SimpleNamespace(
             current_path="image.tif",
             view_mode=FakeVar("labeled"),
-            status=SimpleNamespace(set=lambda message: messages.append(message)),
+            _object_pointer_start=lambda event: events.append(event) or "break",
         )
-        result = MeteorComposer._stroke_start(fake, SimpleNamespace(x=10, y=10, state=0))
+        event = SimpleNamespace(x=10, y=10, state=0)
+        result = MeteorComposer._stroke_start(fake, event)
         self.assertEqual(result, "break")
-        self.assertIn("来源标注", messages[0])
+        self.assertEqual(events, [event])
 
     def test_preview_scope_follows_explicit_output_mode(self):
         shared = SimpleNamespace(output_mode=FakeVar("combined"))
