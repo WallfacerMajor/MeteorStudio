@@ -8,6 +8,10 @@ build_*/
 dist/
 dist_*/
 *.spec.bak
+MeteorStudio-*.zip
+MeteorStudio-*-Windows/
+interaction-smoke-*.json
+*_proof/
 
 # Local projects, outputs, and source media
 outputs/

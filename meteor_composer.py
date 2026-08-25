@@ -23,7 +23,8 @@ from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-PROJECT_VERSION = 18
+APP_VERSION = "0.1.11-local-output-modes"
+PROJECT_VERSION = 20
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
@@ -360,6 +361,29 @@ def point_in_padded_bbox(
     return x0 - padding <= x <= x1 + padding and y0 - padding <= y <= y1 + padding
 
 
+def content_distance_map(image: np.ndarray) -> np.ndarray:
+    """Distance to black projection padding in an aligned source image."""
+    signal = np.max(image.astype(np.float32), axis=2)
+    valid = (signal > 1.0).astype(np.uint8)
+    valid = cv2.morphologyEx(valid, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    return cv2.distanceTransform(valid, cv2.DIST_L2, 5)
+
+
+def line_inside_valid_content(
+    distance: np.ndarray, start: tuple[int, int], end: tuple[int, int]
+) -> bool:
+    """Reject lines running on PTGui's black projection/panorama boundary."""
+    height, width = distance.shape
+    length = max(1.0, float(np.hypot(end[0] - start[0], end[1] - start[1])))
+    samples = max(30, int(length))
+    xs = np.linspace(start[0], end[0], samples).clip(0, width - 1).astype(int)
+    ys = np.linspace(start[1], end[1], samples).clip(0, height - 1).astype(int)
+    # A generous inset is intentional: LSD often finds a second line tens of
+    # pixels inside a resampled PTGui boundary, not just the zero-valued edge.
+    safe_margin = max(8.0, min(height, width) * 0.035)
+    return float(np.mean(distance[ys, xs] >= safe_margin)) >= 0.90
+
+
 def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     src = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY).astype(np.float32)
     dst = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY).astype(np.float32)
@@ -372,6 +396,7 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     residual = difference - cv2.GaussianBlur(difference, (0, 0), sigmaX=sigma, sigmaY=sigma)
     magnitude = np.abs(residual)
     height, width = magnitude.shape
+    content_distance = content_distance_map(source)
     detector = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV)
     detected_parts = []
     for low_percentile, high_percentile in ((97.0, 99.90), (93.0, 99.65), (88.0, 99.30)):
@@ -397,6 +422,8 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
         if length < min_length:
             continue
         start, end = (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2)))
+        if not line_inside_valid_content(content_distance, start, end):
+            continue
         samples = max(30, int(length))
         xs = np.linspace(start[0], end[0], samples).clip(0, width - 1).astype(int)
         ys = np.linspace(start[1], end[1], samples).clip(0, height - 1).astype(int)
@@ -699,17 +726,21 @@ def compose_meteor_objects(
 class MeteorComposer(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} — {APP_VERSION}")
         self.geometry("1280x820")
         self.minsize(1000, 680)
 
         self.source_dir = tk.StringVar()
         self.base_dir = tk.StringVar()
         self.output_dir = tk.StringVar()
+        self.output_mode = tk.StringVar(value="combined")
+        self.base_selection_summary = tk.StringVar(value="")
         self.brush_width = tk.IntVar(value=18)
         self.eraser_width = tk.IntVar(value=40)
         self.feather = tk.IntVar(value=10)
         self.match_exposure = tk.BooleanVar(value=False)
+        self.default_match_exposure = tk.BooleanVar(value=False)
+        self.match_exposure_policy = tk.StringVar(value="跟随全局")
         self.curve_enabled = tk.BooleanVar(value=False)
         self.curve_shadows = tk.IntVar(value=15)
         self.curve_highlights = tk.IntVar(value=25)
@@ -721,11 +752,13 @@ class MeteorComposer(tk.Tk):
         self.blend_mode = tk.StringVar(value="自然融合")
         self.edit_mode = tk.StringVar(value="paint")
         self.view_mode = tk.StringVar(value="source")
+        self.blend_preview_label = tk.StringVar(value="3 融合预览")
         self.show_mask = tk.BooleanVar(value=True)
         self.h_mask_held = False
         self.status = tk.StringVar(value="请选择输入和输出位置。")
 
         self.files: list[Path] = []
+        self.selected_base_files: list[Path] = []
         self.pairs: dict[str, Path] = {}
         self.original_sources: dict[str, Path] = {}
         self.use_original_sources: set[str] = set()
@@ -747,6 +780,9 @@ class MeteorComposer(tk.Tk):
         self.preview_source: np.ndarray | None = None
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self.global_preview_rgb: np.ndarray | None = None
+        self.global_preview_signature: str | None = None
+        self.global_preview_loading_signature: str | None = None
         self.current_dims = (1, 1)
         self.display_box = (0, 0, 1, 1)
         self.active_points: list[tuple[float, float]] = []
@@ -766,7 +802,6 @@ class MeteorComposer(tk.Tk):
         self.context_highlight: int | None = None
         self.hover_candidate_index: int | None = None
         self.hover_candidate_items: list[int] = []
-        self.candidate_click_active = False
         self.work_queue: queue.Queue = queue.Queue()
         self.ranker_model = load_meteor_ranker()
         if self.ranker_model:
@@ -800,11 +835,31 @@ class MeteorComposer(tk.Tk):
 
         paths = ttk.LabelFrame(root, text="输入与输出（源素材只读）", padding=8)
         paths.pack(fill="x")
-        self._path_row(paths, 0, "原图 TIFF 文件夹", self.source_dir, self._browse_source)
-        self._path_row(paths, 1, "干净 JPG 文件夹", self.base_dir, self._browse_base)
-        self._path_row(paths, 2, "独立输出文件夹", self.output_dir, self._browse_output)
-        ttk.Button(paths, text="只读扫描", command=self.scan_inputs).grid(row=0, column=3, rowspan=3, padx=8, sticky="ns")
+        mode_row = ttk.Frame(paths)
+        mode_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        ttk.Label(mode_row, text="最终输出方式", width=18).pack(side="left")
+        ttk.Radiobutton(
+            mode_row, text="拼合到同一张底图（输出一张总图）", variable=self.output_mode,
+            value="combined", command=self._output_mode_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mode_row, text="分别输出（按同名底图逐张生成）", variable=self.output_mode,
+            value="separate", command=self._output_mode_changed,
+        ).pack(side="left", padx=(18, 0))
+        self._path_row(paths, 1, "原图 TIFF 文件夹", self.source_dir, self._browse_source)
+        ttk.Label(paths, text="干净底图", width=18).grid(row=2, column=0, sticky="w", pady=2)
+        ttk.Entry(paths, textvariable=self.base_dir).grid(row=2, column=1, sticky="ew", padx=5)
+        base_buttons = ttk.Frame(paths)
+        base_buttons.grid(row=2, column=2, sticky="w")
+        self.base_files_button = ttk.Button(base_buttons, text="选择一张…", command=self._browse_base_files)
+        self.base_files_button.pack(side="left")
+        self.base_folder_button = ttk.Button(base_buttons, text="选择文件夹…", command=self._browse_base_folder)
+        self.base_folder_button.pack(side="left", padx=(4, 0))
+        ttk.Label(paths, textvariable=self.base_selection_summary).grid(row=2, column=4, sticky="w", padx=(4, 0))
+        self._path_row(paths, 3, "独立输出文件夹", self.output_dir, self._browse_output)
+        ttk.Button(paths, text="只读扫描", command=self.scan_inputs).grid(row=1, column=3, rowspan=3, padx=8, sticky="ns")
         paths.columnconfigure(1, weight=1)
+        self._update_output_mode_ui()
 
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(10, 6))
@@ -829,17 +884,23 @@ class MeteorComposer(tk.Tk):
         ttk.Label(view_bar, text="查看：").pack(side="left")
         ttk.Radiobutton(view_bar, text="1 原图 TIFF", variable=self.view_mode, value="source", command=self._render_preview).pack(side="left")
         ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(view_bar, text="3 融合后预览", variable=self.view_mode, value="blend", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Label(view_bar, text="红色蒙版默认显示；按住 H 临时隐藏").pack(side="left", padx=(16, 0))
+        ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._render_preview).pack(side="left", padx=(8, 0))
+        ttk.Label(view_bar, text="编辑视图显示红色蒙版；按住 H 临时隐藏").pack(side="left", padx=(16, 0))
         ttk.Label(view_bar, text="普通拖动绘制；单击后 Shift+单击可画直线").pack(side="right")
         self.canvas = tk.Canvas(center, background="#181818", cursor="none", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _e: self._render_preview())
         self.canvas.bind("<Motion>", self._cursor_motion)
         self.canvas.bind("<Leave>", self._cursor_leave)
-        self.canvas.bind("<ButtonPress-1>", self._stroke_start)
-        self.canvas.bind("<B1-Motion>", self._stroke_move)
-        self.canvas.bind("<ButtonRelease-1>", self._stroke_end)
+        # Put left-button editing in its own highest-priority bind tag. On some
+        # Windows/Tk combinations NumLock contributes a modifier bit and a more
+        # specific widget binding can otherwise swallow ButtonPress while drag
+        # and release still arrive, leaving painting impossible.
+        pointer_tag = f"MeteorCanvasPointer{id(self.canvas)}"
+        self.canvas.bindtags((pointer_tag, *self.canvas.bindtags()))
+        self.bind_class(pointer_tag, "<ButtonPress-1>", self._stroke_start)
+        self.bind_class(pointer_tag, "<B1-Motion>", self._stroke_move)
+        self.bind_class(pointer_tag, "<ButtonRelease-1>", self._stroke_end)
         self.canvas.bind("<Button-3>", self._show_mask_menu)
         self.canvas.bind("<Shift-Button-3>", self._delete_mask_at_event)
         self.canvas.bind("<Control-Button-1>", self._delete_mask_at_event)
@@ -870,7 +931,20 @@ class MeteorComposer(tk.Tk):
         ttk.Label(tools, text="橡皮擦宽度(px)").grid(row=1, column=2, pady=(6, 0))
         ttk.Scale(tools, from_=2, to=200, variable=self.eraser_width, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=1, column=3, sticky="ew", padx=5, pady=(6, 0))
         ttk.Label(tools, textvariable=self.eraser_width, width=4).grid(row=1, column=4, pady=(6, 0))
-        ttk.Checkbutton(tools, text="当前图：局部匹配曝光/颜色＋保护流星亮部", variable=self.match_exposure, command=self._render_preview).grid(row=1, column=5, columnspan=3, sticky="w", pady=(6, 0), padx=(15, 0))
+        exposure_tools = ttk.Frame(tools)
+        exposure_tools.grid(row=1, column=5, columnspan=3, sticky="w", pady=(6, 0), padx=(15, 0))
+        ttk.Checkbutton(
+            exposure_tools, text="全局默认：局部曝光匹配", variable=self.default_match_exposure,
+            command=self._match_exposure_default_changed,
+        ).pack(side="left")
+        ttk.Label(exposure_tools, text="当前图").pack(side="left", padx=(12, 4))
+        exposure_policy = ttk.Combobox(
+            exposure_tools, textvariable=self.match_exposure_policy, state="readonly", width=10,
+            values=("跟随全局", "强制启用", "强制关闭"),
+        )
+        exposure_policy.pack(side="left")
+        exposure_policy.bind("<<ComboboxSelected>>", self._match_exposure_policy_changed)
+        ttk.Label(exposure_tools, text="（含颜色匹配与流星亮部保护）").pack(side="left", padx=(5, 0))
         ttk.Checkbutton(tools, text="同时导出16位TIFF（占用空间较大）", variable=self.export_tiff).grid(row=1, column=8, columnspan=3, sticky="w", pady=(6, 0))
         ttk.Label(tools, text="合成方式").grid(row=2, column=8, sticky="e", pady=(6, 0))
         blend_combo = ttk.Combobox(
@@ -893,7 +967,7 @@ class MeteorComposer(tk.Tk):
         ttk.Label(tools, textvariable=self.candidate_threshold, width=4).grid(row=3, column=4, pady=(7, 0))
         ttk.Label(tools, textvariable=self.candidate_summary).grid(row=3, column=5, columnspan=4, sticky="w", padx=(15, 0), pady=(7, 0))
         ttk.Label(tools, textvariable=self.ai_model_status).grid(row=3, column=9, sticky="e", pady=(7, 0))
-        ttk.Label(tools, text="点绿色按钮选候选；画布其余位置拖动画蒙版").grid(row=3, column=10, columnspan=3, sticky="e", pady=(7, 0))
+        ttk.Label(tools, text="绿色虚线=候选；移到线上点绿色按钮选中").grid(row=3, column=10, columnspan=3, sticky="e", pady=(7, 0))
         tools.columnconfigure(3, weight=1)
         tools.columnconfigure(6, weight=1)
 
@@ -938,6 +1012,9 @@ class MeteorComposer(tk.Tk):
         base = Path(result.base_layer)
         self.source_dir.set(str(exported[0].parent))
         self.base_dir.set(str(base))
+        self.selected_base_files = [base]
+        self.output_mode.set("combined")
+        self._update_output_mode_ui()
         final_output = Path(result.project_dir) / "final_composite"
         final_output.mkdir(parents=True, exist_ok=True)
         self.output_dir.set(str(final_output))
@@ -1112,7 +1189,8 @@ Esc：取消当前尚未完成的一笔
 红色蒙版及候选分数默认显示；按住 H 可临时隐藏
 
 查看与文件
-1：原图 TIFF    2：干净 JPG    3：融合后预览
+1：原图 TIFF    2：干净 JPG    3：融合预览
+拼合到同一张底图：第 3 模式汇总全部流星；分别输出：只预览当前图片对
 红色蒙版默认显示；按住 H：临时隐藏，松开恢复
 ← / →：上一张 / 下一张
 Ctrl/Command+S：保存项目
@@ -1131,41 +1209,130 @@ F1：显示本快捷键表""")
         if value:
             self.source_dir.set(value)
 
-    def _browse_base(self) -> None:
-        value = filedialog.askdirectory(title="选择干净底图 JPG 文件夹")
+    @staticmethod
+    def _base_filetypes():
+        return [("图片", "*.jpg *.jpeg *.png *.tif *.tiff"), ("所有文件", "*.*")]
+
+    def _browse_base_files(self) -> None:
+        if self.output_mode.get() == "combined":
+            value = filedialog.askopenfilename(title="选择唯一的干净底图", filetypes=self._base_filetypes())
+            values = [value] if value else []
+        else:
+            values = list(filedialog.askopenfilenames(
+                title="选择一张或多张同名底图", filetypes=self._base_filetypes()
+            ))
+        if not values:
+            return
+        self.selected_base_files = [Path(value) for value in values]
+        if len(values) == 1:
+            self.base_dir.set(values[0])
+            self.base_selection_summary.set("已选 1 张")
+        else:
+            parents = {str(Path(value).parent) for value in values}
+            self.base_dir.set(next(iter(parents)) if len(parents) == 1 else f"已选择 {len(values)} 张底图")
+            self.base_selection_summary.set(f"已选 {len(values)} 张")
+        self._update_blend_preview_label()
+
+    def _browse_base_folder(self) -> None:
+        if self.output_mode.get() == "combined":
+            messagebox.showinfo(APP_NAME, "“拼合到同一张底图”只能选择一张底图照片")
+            return
+        value = filedialog.askdirectory(title="选择包含同名底图的文件夹")
         if value:
+            self.selected_base_files = []
             self.base_dir.set(value)
+            self.base_selection_summary.set("按文件夹同名匹配")
+
+    def _update_output_mode_ui(self) -> None:
+        combined = self.output_mode.get() == "combined"
+        if hasattr(self, "base_files_button"):
+            self.base_files_button.configure(text="选择一张…" if combined else "选择图片…")
+            self.base_folder_button.configure(state="disabled" if combined else "normal")
+        self._update_blend_preview_label()
+
+    def _output_mode_changed(self) -> None:
+        combined = self.output_mode.get() == "combined"
+        current = Path(self.base_dir.get()).expanduser() if self.base_dir.get().strip() else None
+        if combined:
+            if len(self.selected_base_files) == 1:
+                self.base_dir.set(str(self.selected_base_files[0]))
+            elif current is None or not current.is_file():
+                self.selected_base_files = []
+                self.base_dir.set("")
+                self.base_selection_summary.set("请选择唯一底图")
+        self.global_preview_rgb = None
+        self.global_preview_signature = None
+        self._update_output_mode_ui()
+        self._schedule_autosave()
+        self.status.set(
+            "输出方式：全部流星拼合为一张总图；请选择一张底图"
+            if combined else "输出方式：逐张输出；请选择一张/多张同名底图，或底图文件夹"
+        )
 
     def _browse_output(self) -> None:
         value = filedialog.askdirectory(title="选择独立输出文件夹")
         if value:
             self.output_dir.set(value)
 
+    def _uses_shared_base(self) -> bool:
+        return self.output_mode.get() == "combined"
+
+    def _update_blend_preview_label(self) -> None:
+        self.blend_preview_label.set(
+            "3 总融合预览" if self._uses_shared_base() else "3 当前图融合预览"
+        )
+
     def scan_inputs(self) -> None:
         try:
             source = Path(self.source_dir.get()).expanduser()
-            base_dir = Path(self.base_dir.get()).expanduser()
+            base_text = self.base_dir.get().strip()
+            base_input = Path(base_text).expanduser() if base_text else None
+            combined = self.output_mode.get() == "combined"
             output_text = self.output_dir.get().strip()
             if not output_text:
                 raise ValueError("请选择独立输出文件夹")
             output = Path(output_text).expanduser()
             if not source.is_dir():
                 raise ValueError("请选择有效的 TIFF 文件夹")
-            if not (base_dir.is_dir() or base_dir.is_file()):
-                raise ValueError("请选择有效的干净底图文件夹，或从PTGui工作区回载单张底图")
+            selected = [path for path in self.selected_base_files if path.is_file()]
+            selected_parents = {path.parent.resolve() for path in selected}
+            use_selected = bool(selected) and (
+                (len(selected) == 1 and base_input == selected[0])
+                or (len(selected_parents) == 1 and base_input is not None
+                    and base_input.resolve() == next(iter(selected_parents)))
+                or base_text.startswith("已选择 ")
+            )
+            if combined:
+                if base_input is None or not base_input.is_file():
+                    raise ValueError("“拼合到同一张底图”模式必须选择一张干净底图照片")
+                base_files = [base_input]
+                self.selected_base_files = [base_input]
+                base_roots = {base_input.parent}
+            elif use_selected:
+                base_files = selected
+                base_roots = {path.parent for path in selected}
+            elif base_input is not None and base_input.is_dir():
+                base_files = sorted(
+                    path for path in base_input.iterdir()
+                    if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
+                )
+                self.selected_base_files = []
+                base_roots = {base_input}
+            elif base_input is not None and base_input.is_file():
+                base_files = [base_input]
+                self.selected_base_files = [base_input]
+                base_roots = {base_input.parent}
+            else:
+                raise ValueError("“分别输出”模式请选择一张/多张底图，或包含同名底图的文件夹")
+            if not base_files:
+                raise ValueError("没有找到可用的干净底图")
             if (path_is_within(output, source) or path_is_within(source, output)
-                    or (base_dir.is_dir() and (path_is_within(output, base_dir) or path_is_within(base_dir, output)))):
+                    or any(path_is_within(output, root) or path_is_within(root, output)
+                           for root in base_roots)):
                 raise ValueError("输出目录必须与输入素材位置完全分开")
             source_files = sorted(p for p in source.iterdir() if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES)
             if not source_files:
                 raise ValueError("原图文件夹中没有 TIFF 文件")
-            if base_dir.is_file():
-                base_files = [base_dir]
-            else:
-                base_files = sorted(
-                    p for p in base_dir.iterdir()
-                    if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
-                )
             base_by_stem: dict[str, Path] = {}
             duplicates = set()
             for path in base_files:
@@ -1179,7 +1346,7 @@ F1：显示本快捷键表""")
             valid, mismatched, missing = [], [], []
             pairs: dict[str, Path] = {}
             for path in source_files:
-                base = base_files[0] if base_dir.is_file() else base_by_stem.get(path.stem.casefold())
+                base = base_files[0] if combined else base_by_stem.get(path.stem.casefold())
                 if base is None:
                     missing.append(path.name)
                     continue
@@ -1192,12 +1359,13 @@ F1：显示本快捷键表""")
                     mismatched.append(f"{path.name}: TIFF {sw}×{sh} / JPG {bw}×{bh}")
             self.files = valid
             self.pairs = pairs
+            self._update_blend_preview_label()
             self.tree.delete(*self.tree.get_children())
             for index, path in enumerate(valid):
                 count = len(self.strokes.get(str(path), []))
                 prefix = "[原始状态] " if str(path) in self.use_original_sources else ""
                 self.tree.insert("", "end", iid=str(index), text=prefix + path.name, values=(count or "—",))
-            base_label = "单张PTGui底图" if base_dir.is_file() else f"底图 {len(base_files)} 张"
+            base_label = "单张共享底图" if combined else f"同名底图 {len(base_files)} 张"
             message = f"TIFF {len(source_files)} 张，{base_label}；成功配对 {len(valid)} 对"
             if missing:
                 message += f"；缺少同名 JPG {len(missing)} 张"
@@ -1254,16 +1422,57 @@ F1：显示本快捷键表""")
             "curve_highlights": int(self.curve_highlights.get()),
         }
 
+    def _match_exposure_default_changed(self, *_args) -> None:
+        if self.loading_adjustments:
+            return
+        enabled = bool(self.default_match_exposure.get())
+        self.adjustment_defaults["match_exposure"] = enabled
+        if self.current_path:
+            self._load_image_adjustments(str(self.current_path))
+        self.global_preview_signature = None
+        self._schedule_autosave()
+        self._render_preview()
+        self.status.set(
+            f"全局默认局部曝光匹配已{'启用' if enabled else '关闭'}；单张强制设置保持不变"
+        )
+
+    def _match_exposure_policy_changed(self, *_args) -> None:
+        if self.loading_adjustments or not self.current_path:
+            return
+        key = str(self.current_path)
+        adjustment = self.image_adjustments.setdefault(key, {})
+        policy = self.match_exposure_policy.get()
+        if policy == "跟随全局":
+            adjustment.pop("match_exposure", None)
+        else:
+            adjustment["match_exposure"] = policy == "强制启用"
+        if not adjustment:
+            self.image_adjustments.pop(key, None)
+        self._load_image_adjustments(key)
+        self.global_preview_signature = None
+        self._schedule_autosave()
+        self._render_preview()
+        self.status.set(f"当前图局部曝光匹配：{policy}")
+
     def _current_adjustment_changed(self, *_args) -> None:
         if self.loading_adjustments or not self.current_path:
             return
-        self.image_adjustments[str(self.current_path)] = self._current_adjustment_values()
+        key = str(self.current_path)
+        adjustment = self.image_adjustments.setdefault(key, {})
+        values = self._current_adjustment_values()
+        for name in ("curve_enabled", "curve_shadows", "curve_highlights"):
+            adjustment[name] = values[name]
 
     def _load_image_adjustments(self, key: str) -> None:
         values = {**self.adjustment_defaults, **self.image_adjustments.get(key, {})}
+        explicit_match = self.image_adjustments.get(key, {}).get("match_exposure", None)
         self.loading_adjustments = True
         try:
             self.match_exposure.set(bool(values["match_exposure"]))
+            self.match_exposure_policy.set(
+                "跟随全局" if explicit_match is None
+                else ("强制启用" if bool(explicit_match) else "强制关闭")
+            )
             self.curve_enabled.set(bool(values["curve_enabled"]))
             self.curve_shadows.set(int(values["curve_shadows"]))
             self.curve_highlights.set(int(values["curve_highlights"]))
@@ -1435,6 +1644,82 @@ F1：显示本快捷键表""")
         )
         return mask
 
+    def _global_preview_state_signature(self) -> str:
+        selected = {
+            key: [asdict(stroke) for stroke in values]
+            for key, values in self.strokes.items() if values
+        }
+        payload = {
+            "base": self.base_dir.get(),
+            "blend_mode": self.blend_mode.get(),
+            "strokes": selected,
+            "adjustments": self.image_adjustments,
+            "defaults": self.adjustment_defaults,
+            "shape": tuple(self.preview_base.shape) if self.preview_base is not None else (),
+        }
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False)
+
+    def _request_global_preview(self, signature: str) -> None:
+        if self.preview_base is None or self.global_preview_loading_signature == signature:
+            return
+        marked = {
+            Path(key): [Stroke(
+                item.points.copy(), item.width, item.feather, item.erase, item.locked,
+                item.auto_score, item.offset_x, item.offset_y, item.rotation,
+                item.length_scale, item.width_scale, item.opacity,
+            ) for item in values]
+            for key, values in self.strokes.items() if values
+        }
+        self.global_preview_loading_signature = signature
+        self.status.set(f"正在生成总融合预览：合成 {len(marked)} 张已标记图片…")
+        self._run_worker(
+            self._global_preview_worker, signature, self.preview_base.copy(), marked,
+            {key: value.copy() for key, value in self.image_adjustments.items()},
+            self.adjustment_defaults.copy(), self.blend_mode.get(),
+            {str(path): self._effective_source_path(path) for path in marked},
+        )
+
+    def _global_preview_worker(
+        self, signature: str, base_preview: np.ndarray,
+        marked: dict[Path, list[Stroke]], adjustments: dict[str, dict],
+        adjustment_defaults: dict, blend_mode: str, read_paths: dict[str, Path],
+    ):
+        result = base_preview.copy()
+        preview_height, preview_width = result.shape[:2]
+        total = max(1, len(marked))
+        included = 0
+        for index, (source_path, strokes) in enumerate(marked.items(), start=1):
+            actual_path = read_paths.get(str(source_path), source_path)
+            source = read_image(actual_path)
+            full_height, full_width = source.shape[:2]
+            source16 = to_uint16(source)
+            resized = cv2.resize(
+                source16, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+            )
+            source_preview = np.right_shift(resized, 8).astype(np.uint8)
+            scale_to_preview = preview_width / max(1, full_width)
+            scaled = [Stroke(
+                item.points, max(1, int(round(item.width * scale_to_preview))),
+                max(0, int(round(item.feather * scale_to_preview))), item.erase,
+                item.locked, item.auto_score, item.offset_x * scale_to_preview,
+                item.offset_y * scale_to_preview, item.rotation, item.length_scale,
+                item.width_scale, item.opacity,
+            ) for item in strokes]
+            adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
+            result, mask = compose_meteor_objects(
+                source_preview, result, scaled,
+                bool(adjustment["match_exposure"]), bool(adjustment["curve_enabled"]),
+                float(adjustment["curve_shadows"]), float(adjustment["curve_highlights"]),
+                blend_mode,
+            )
+            if np.any(mask > 0.001):
+                included += 1
+            self.work_queue.put((
+                "progress", index / total * 100,
+                f"正在生成总融合预览 {index}/{len(marked)}：{source_path.name}",
+            ))
+        return "global_preview", signature, result, included
+
     def _render_preview(self) -> None:
         if self.preview_source is None or self.preview_base is None:
             return
@@ -1446,20 +1731,35 @@ F1：显示本快捷键表""")
             item.auto_score, item.offset_x * scale_to_preview, item.offset_y * scale_to_preview,
             item.rotation, item.length_scale, item.width_scale, item.opacity,
         ) for item in self.strokes.get(str(self.current_path), [])]
-        composed, mask = compose_meteor_objects(
-            self.preview_source, self.preview_base, scaled_strokes,
-            bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
-            float(self.curve_shadows.get()), float(self.curve_highlights.get()),
-            self.blend_mode.get(),
-        )
         mode = self.view_mode.get()
         if mode == "base":
             shown = self.preview_base.copy()
         elif mode == "blend":
-            shown = composed
+            if self._uses_shared_base():
+                signature = self._global_preview_state_signature()
+                if self.global_preview_signature == signature and self.global_preview_rgb is not None:
+                    shown = self.global_preview_rgb.copy()
+                else:
+                    shown = self.preview_base.copy()
+                    self._request_global_preview(signature)
+            else:
+                shown, _current_mask = compose_meteor_objects(
+                    self.preview_source, self.preview_base, scaled_strokes,
+                    bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
+                    float(self.curve_shadows.get()), float(self.curve_highlights.get()),
+                    self.blend_mode.get(),
+                )
         else:
             shown = self.preview_source.copy()
-        if self.show_mask.get() and np.any(mask > 0.001):
+        mask = np.zeros(shown.shape[:2], dtype=np.float32)
+        if mode != "blend":
+            _composed, mask = compose_meteor_objects(
+                self.preview_source, self.preview_base, scaled_strokes,
+                bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
+                float(self.curve_shadows.get()), float(self.curve_highlights.get()),
+                self.blend_mode.get(),
+            )
+        if mode != "blend" and self.show_mask.get() and np.any(mask > 0.001):
             opacity = (mask * 0.55)[..., None]
             red = np.empty_like(shown)
             red[:] = (255, 35, 25)
@@ -1479,12 +1779,50 @@ F1：显示本快捷键表""")
         self.hover_candidate_items = []
         self.hover_candidate_index = None
         self.canvas.create_image(x0, y0, anchor="nw", image=self.preview_photo)
-        if self.show_mask.get():
+        if mode != "blend" and self.show_mask.get():
+            self._draw_candidate_guides()
             self._draw_mask_annotations()
         self.cursor_items = []
         self._update_brush_cursor()
-        if self.cursor_position is not None and not self.active_points and not self.candidate_click_active:
+        if mode != "blend" and self.cursor_position is not None and not self.active_points:
             self._update_candidate_hover(*self.cursor_position)
+
+    def _draw_candidate_guides(self) -> None:
+        """Keep every selectable AI candidate visible before it is chosen."""
+        if not self.current_path:
+            return
+        x0, y0, x1, y1 = self.display_box
+        threshold = self.candidate_thresholds.get(
+            str(self.current_path), int(self.candidate_threshold.get())
+        )
+        for index, stroke in enumerate(self.candidates.get(str(self.current_path), [])):
+            if stroke.locked or not stroke.points:
+                continue
+            transformed = transformed_stroke_points(stroke, *self.current_dims)
+            points = [
+                (x0 + px * (x1 - x0), y0 + py * (y1 - y0))
+                for px, py in transformed
+            ]
+            score = int(stroke.auto_score or 0)
+            color = "#55f29a" if score >= threshold else "#43c985"
+            tags = ("candidate_guide", f"candidate_{index}")
+            if len(points) == 1:
+                px, py = points[0]
+                self.canvas.create_oval(
+                    px - 5, py - 5, px + 5, py + 5,
+                    outline=color, width=2, dash=(4, 3), tags=tags,
+                )
+            else:
+                coords = [coordinate for point in points for coordinate in point]
+                self.canvas.create_line(
+                    *coords, fill=color, width=2, dash=(7, 4),
+                    capstyle="round", tags=tags,
+                )
+            px, py = points[len(points) // 2]
+            self.canvas.create_text(
+                px, py - 8, text=str(score), fill=color,
+                font=("TkDefaultFont", 8, "bold"), tags=tags,
+            )
 
     def _draw_mask_annotations(self) -> None:
         if not self.current_path:
@@ -1511,7 +1849,10 @@ F1：显示本快捷键表""")
     def _cursor_motion(self, event) -> None:
         self.cursor_position = (float(event.x), float(event.y))
         self._update_brush_cursor()
-        if self.active_points or self.candidate_click_active:
+        if self.view_mode.get() == "blend":
+            self._clear_candidate_hover()
+            return
+        if self.active_points:
             self._clear_candidate_hover()
             return
         self._update_candidate_hover(event.x, event.y)
@@ -1558,7 +1899,7 @@ F1：显示本快捷键表""")
     def _update_candidate_hover(self, canvas_x: float, canvas_y: float) -> None:
         # Keep the button alive while the pointer crosses the small gap from the
         # candidate line to the button. Previously Motion cleared it before the
-        # subsequent click could reach the canvas item binding.
+        # subsequent click could reach the button area handled by the canvas.
         if self.hover_candidate_items:
             button_bbox = self.canvas.bbox("candidate_pick")
             if point_in_padded_bbox(canvas_x, canvas_y, button_bbox, padding=16.0):
@@ -1586,7 +1927,9 @@ F1：显示本快捷键表""")
             icon_x, icon_y, text=label, fill="#ffffff", font=("TkDefaultFont", 9, "bold"), tags=(tag,)
         )
         self.hover_candidate_items = [rectangle, text_item]
-        self.canvas.tag_bind(tag, "<Button-1>", self._pick_hover_candidate)
+        # The canvas widget owns the click. Binding the same press to both the
+        # item tag and the canvas caused ordering differences across Tk builds:
+        # one handler could redraw/delete the item before the other ran.
 
     def _pick_hover_candidate(self, _event=None):
         if not self.current_path or self.hover_candidate_index is None:
@@ -1597,7 +1940,6 @@ F1：显示本快捷键表""")
         if not (0 <= index < len(pool)):
             return "break"
         candidate = pool[index]
-        self.candidate_click_active = True
         candidate.locked = True
         matching = next(
             (stroke for stroke in self.strokes.get(key, [])
@@ -1626,7 +1968,9 @@ F1：显示本快捷键表""")
         for item in self.cursor_items:
             self.canvas.delete(item)
         self.cursor_items = []
-        if self.cursor_position is None or self.preview_source is None:
+        if (self.cursor_position is None or self.preview_source is None
+                or self.view_mode.get() == "blend"):
+            self.canvas.configure(cursor="arrow")
             return
         x, y = self.cursor_position
         x0, y0, x1, y1 = self.display_box
@@ -1881,11 +2225,11 @@ F1：显示本快捷键表""")
     def _stroke_start(self, event) -> None:
         if not self.current_path:
             return
-        if self.candidate_click_active:
+        if self.view_mode.get() == "blend":
+            self.status.set("融合预览只用于检查成片；请切回“原图 TIFF”编辑蒙版")
             return "break"
-        # Canvas widget bindings can also receive a click after an item binding.
-        # Handle the floating candidate button here as a reliable fallback and
-        # never start a paint stroke underneath it.
+        # The floating candidate button is handled only by the canvas, so selecting a
+        # candidate and painting can never compete for the same press.
         if self.hover_candidate_items and point_in_padded_bbox(
             float(event.x), float(event.y), self.canvas.bbox("candidate_pick"), padding=2.0
         ):
@@ -1957,11 +2301,6 @@ F1：显示本快捷键表""")
             self._draw_active_stroke()
 
     def _stroke_end(self, event) -> None:
-        if self.candidate_click_active:
-            self.candidate_click_active = False
-            self.active_points = []
-            self.active_canvas_line = None
-            return "break"
         if not self.active_points or not self.current_path:
             return
         point = self._event_normalized(event)
@@ -2115,13 +2454,14 @@ F1：显示本快捷键表""")
     def _setup_autosave(self) -> None:
         variables = (
             self.source_dir, self.base_dir, self.output_dir, self.brush_width,
-            self.eraser_width, self.feather, self.match_exposure, self.curve_enabled,
+            self.eraser_width, self.feather, self.default_match_exposure, self.curve_enabled,
             self.curve_shadows, self.curve_highlights, self.export_tiff, self.blend_mode,
+            self.output_mode,
         )
         for variable in variables:
             variable.trace_add("write", lambda *_args: self._schedule_autosave())
         for variable in (
-            self.match_exposure, self.curve_enabled, self.curve_shadows, self.curve_highlights
+            self.curve_enabled, self.curve_shadows, self.curve_highlights
         ):
             variable.trace_add("write", self._current_adjustment_changed)
         self.autosave_suspended = False
@@ -2131,8 +2471,10 @@ F1：显示本快捷键表""")
             "version": PROJECT_VERSION,
             "source_dir": self.source_dir.get(),
             "base_dir": self.base_dir.get(),
+            "base_files": [str(path) for path in self.selected_base_files],
             "output_dir": self.output_dir.get(),
-            "match_exposure": self.match_exposure.get(),
+            "output_mode": self.output_mode.get(),
+            "match_exposure": self.default_match_exposure.get(),
             "curve_enabled": self.curve_enabled.get(),
             "curve_shadows": self.curve_shadows.get(),
             "curve_highlights": self.curve_highlights.get(),
@@ -2160,6 +2502,17 @@ F1：显示本快捷键表""")
             self.preview_base = None
             self.source_dir.set(data.get("source_dir", ""))
             self.base_dir.set(data.get("base_dir", ""))
+            saved_base = Path(data.get("base_dir", "")).expanduser()
+            inferred_mode = "combined" if saved_base.is_file() else "separate"
+            self.output_mode.set(data.get("output_mode", inferred_mode))
+            self.selected_base_files = [Path(value) for value in data.get("base_files", [])]
+            if not self.selected_base_files and saved_base.is_file():
+                self.selected_base_files = [saved_base]
+            self.base_selection_summary.set(
+                f"已选 {len(self.selected_base_files)} 张" if self.selected_base_files
+                else ("按文件夹同名匹配" if saved_base.is_dir() else "")
+            )
+            self._update_output_mode_ui()
             self.output_dir.set(data.get("output_dir", ""))
             self.match_exposure.set(bool(data.get("match_exposure", False)))
             self.curve_enabled.set(bool(data.get("curve_enabled", False)))
@@ -2174,15 +2527,19 @@ F1：显示本快捷键表""")
             self.adjustment_defaults = {
                 **legacy_defaults, **data.get("adjustment_defaults", {})
             }
-            self.image_adjustments = {
-                key: {
-                    "match_exposure": bool(value.get("match_exposure", self.adjustment_defaults["match_exposure"])),
+            self.default_match_exposure.set(bool(self.adjustment_defaults["match_exposure"]))
+            self.image_adjustments = {}
+            for key, value in data.get("image_adjustments", {}).items():
+                normalized = {
                     "curve_enabled": bool(value.get("curve_enabled", self.adjustment_defaults["curve_enabled"])),
                     "curve_shadows": int(value.get("curve_shadows", self.adjustment_defaults["curve_shadows"])),
                     "curve_highlights": int(value.get("curve_highlights", self.adjustment_defaults["curve_highlights"])),
                 }
-                for key, value in data.get("image_adjustments", {}).items()
-            }
+                # Absence means "follow global". Preserve it instead of turning
+                # the current global value into a permanent per-image override.
+                if "match_exposure" in value:
+                    normalized["match_exposure"] = bool(value["match_exposure"])
+                self.image_adjustments[key] = normalized
             self.export_tiff.set(bool(data.get("export_tiff", False)))
             self.blend_mode.set(str(data.get("blend_mode", "自然融合")))
             self.brush_width.set(int(data.get("brush_width", 18)))
@@ -2296,13 +2653,20 @@ F1：显示本快捷键表""")
             messagebox.showerror(APP_NAME, "请选择独立输出文件夹")
             return
         output = Path(output_text)
+        base_locations = {path.parent for path in self.pairs.values()}
         if (path_is_within(output, source) or path_is_within(source, output)
-                or path_is_within(output, base_dir) or path_is_within(base_dir, output)):
+                or any(path_is_within(output, base) or path_is_within(base, output)
+                       for base in base_locations)):
             messagebox.showerror(APP_NAME, "输出目录必须与 TIFF/JPG 两个输入文件夹完全分开")
             return
+        combined = self.output_mode.get() == "combined"
+        export_summary = (
+            f"将把 {len(marked)} 张图片中的全部流星累计拼合到一张底图。\n"
+            if combined else f"将分别处理 {len(marked)} 组同名 TIFF/底图。\n"
+        )
         learning_choice = messagebox.askyesnocancel(
             APP_NAME + " — 导出与 AI 学习",
-            f"将逐对处理 {len(marked)} 组同名 TIFF/JPG。\n"
+            export_summary +
             f"源素材只读，结果写入新的运行目录：\n{output}\n\n"
             "是否在导出完成后，用本次最终蒙版继续训练本地 AI？\n\n"
             "是：导出并自动学习\n否：仅导出\n取消：停止",
@@ -2317,13 +2681,14 @@ F1：显示本快捷键表""")
             self.adjustment_defaults.copy(),
             bool(self.export_tiff.get()), bool(learning_choice), self.blend_mode.get(),
             {str(path): self._effective_source_path(path) for path in marked},
+            self.output_mode.get(),
         )
 
     def _export_worker(
         self, output_dir: Path, marked: dict[Path, list[Stroke]], pairs: dict[str, Path],
         adjustments: dict[str, dict], adjustment_defaults: dict,
         export_tiff: bool, learn_after_export: bool, blend_mode: str,
-        read_paths: dict[str, Path],
+        read_paths: dict[str, Path], output_mode: str,
     ):
         output_dir.mkdir(parents=True, exist_ok=True)
         run_dir = unique_path(output_dir / ("meteor_restore_" + datetime.now().strftime("%Y%m%d_%H%M%S")))
@@ -2336,6 +2701,10 @@ F1：显示本快捷键表""")
             tif_dir.mkdir()
         report = []
         total = len(marked)
+        combined = output_mode == "combined"
+        combined_result = None
+        combined_base_path = None
+        combined_outputs: list[str] = []
         for index, (source_path, strokes) in enumerate(marked.items(), start=1):
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
             match = bool(adjustment["match_exposure"])
@@ -2345,9 +2714,13 @@ F1：显示本快捷键表""")
             if str(source_path) not in pairs:
                 raise ValueError(f"找不到同名底图配对：{source_path.name}")
             base_path = pairs[str(source_path)]
-            base = to_uint16(read_image(base_path))
+            if combined and combined_result is not None:
+                base = combined_result
+            else:
+                base = to_uint16(read_image(base_path))
+                if combined:
+                    combined_base_path = base_path
             height, width = base.shape[:2]
-            result = base.copy()
             actual_source_path = read_paths.get(str(source_path), source_path)
             source = read_image(actual_source_path)
             if source.shape[:2] != (height, width):
@@ -2365,13 +2738,17 @@ F1：显示本快捷键表""")
             if not ok:
                 raise IOError(f"蒙版保存失败：{mask_path.name}")
             encoded.tofile(mask_path)
-            jpg_path = jpg_dir / base_path.name
-            atomic_write_jpeg(jpg_path, result)
-            outputs = [str(jpg_path)]
-            if export_tiff:
-                tif_path = tif_dir / f"{source_path.stem}.tif"
-                atomic_write_tiff(tif_path, result)
-                outputs.append(str(tif_path))
+            outputs = []
+            if combined:
+                combined_result = result
+            else:
+                jpg_path = jpg_dir / f"{source_path.stem}.jpg"
+                atomic_write_jpeg(jpg_path, result)
+                outputs = [str(jpg_path)]
+                if export_tiff:
+                    tif_path = tif_dir / f"{source_path.stem}.tif"
+                    atomic_write_tiff(tif_path, result)
+                    outputs.append(str(tif_path))
             report.append({
                 "source_tiff": str(actual_source_path), "workspace_layer": str(source_path),
                 "clean_jpg": str(base_path),
@@ -2382,18 +2759,33 @@ F1：显示本快捷键表""")
                 "blend_mode": blend_mode,
                 "outputs": outputs,
             })
-            del source, source16, mask_full, base, result
+            del source, source16, mask_full
+            if not combined:
+                del base, result
             self.work_queue.put(("progress", index / total * 90, f"正在合成 {index}/{total}：{source_path.name}"))
+        if combined and combined_result is not None and combined_base_path is not None:
+            output_stem = f"{combined_base_path.stem}_全部流星"
+            jpg_path = jpg_dir / f"{output_stem}.jpg"
+            atomic_write_jpeg(jpg_path, combined_result)
+            combined_outputs = [str(jpg_path)]
+            if export_tiff:
+                tif_path = tif_dir / f"{output_stem}.tif"
+                atomic_write_tiff(tif_path, combined_result)
+                combined_outputs.append(str(tif_path))
+            for entry in report:
+                entry["outputs"] = combined_outputs.copy()
         manifest = {
             "version": PROJECT_VERSION,
             "per_image_adjustments": True,
             "meteor_highlight_protection": True,
             "adjustment_defaults": adjustment_defaults,
             "export_tiff": export_tiff,
+            "output_mode": output_mode,
+            "final_outputs": combined_outputs if combined else [],
             "items": report,
         }
         (run_dir / "processing_report.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "exported", run_dir, len(report), learn_after_export, marked, pairs, read_paths
+        return "exported", run_dir, len(report), learn_after_export, marked, pairs, read_paths, output_mode
 
     def _learn_worker(self, marked: dict[Path, list[Stroke]], pairs: dict[str, Path]):
         try:
@@ -2450,6 +2842,17 @@ F1：显示本快捷键表""")
                     self._update_candidate_summary(key)
                     self.status.set(f"已加载 {path.name}；可拖动画笔，或单击起点后 Shift+单击终点画直线。")
                     self._render_preview()
+                elif kind == "global_preview":
+                    _, signature, image, included = item
+                    if self.global_preview_loading_signature == signature:
+                        self.global_preview_loading_signature = None
+                    if signature == self._global_preview_state_signature():
+                        self.global_preview_signature = signature
+                        self.global_preview_rgb = image
+                        self.progress["value"] = 100
+                        self.status.set(f"总融合预览完成：已合成 {included} 张图片中的全部流星")
+                        if self.view_mode.get() == "blend":
+                            self._render_preview()
                 elif kind == "progress":
                     _, value, text = item
                     self.progress["value"] = value
@@ -2507,13 +2910,17 @@ F1：显示本快捷键表""")
                         "拖动分数阈值筛选，确认后右键锁定。"
                     )
                 elif kind == "exported":
-                    _, run_dir, count, learn_after_export, marked, pairs, read_paths = item
+                    _, run_dir, count, learn_after_export, marked, pairs, read_paths, output_mode = item
                     self.progress["value"] = 100
                     self.status.set(f"导出完成：{run_dir}")
+                    result_summary = (
+                        f"已累计处理 {count} 张流星素材，输出 1 张总合成图。"
+                        if output_mode == "combined" else f"已分别输出 {count} 张合成图。"
+                    )
                     if learn_after_export:
                         messagebox.showinfo(
                             APP_NAME,
-                            f"导出完成，共处理 {count} 对文件。\n\n结果目录：\n{run_dir}\n\n"
+                            f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}\n\n"
                             "现在开始在后台验证并训练个性化 AI。导出结果不受训练成败影响。",
                         )
                         self.progress["value"] = 0
@@ -2526,7 +2933,7 @@ F1：显示本快捷键表""")
                         }
                         self._run_worker(self._learn_worker, learning_marked, learning_pairs)
                     else:
-                        messagebox.showinfo(APP_NAME, f"导出完成，共处理 {count} 对文件。\n\n结果目录：\n{run_dir}")
+                        messagebox.showinfo(APP_NAME, f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}")
                 elif kind == "learned":
                     _, report = item
                     self.progress["value"] = 100
@@ -2571,4 +2978,16 @@ F1：显示本快捷键表""")
 
 
 if __name__ == "__main__":
-    MeteorComposer().mainloop()
+    smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
+    if smoke_project:
+        from gui_interaction_smoke import run_smoke
+
+        application = MeteorComposer()
+        try:
+            smoke_result = run_smoke(application, Path(smoke_project))
+            report_path = Path(os.environ.get("METEOR_INTERACTION_SMOKE_REPORT", "interaction-smoke.json"))
+            report_path.write_text(json.dumps(smoke_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        finally:
+            application.destroy()
+    else:
+        MeteorComposer().mainloop()
