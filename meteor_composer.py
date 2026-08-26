@@ -23,8 +23,8 @@ from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.38-adaptive-object-blend"
-PROJECT_VERSION = 26
+APP_VERSION = "0.1.45-per-meteor-source"
+PROJECT_VERSION = 27
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
 
@@ -54,6 +54,14 @@ class Stroke:
     auto_cleanup: float | None = None
     auto_brightness: float | None = None
     auto_feather: int | None = None
+    # Pixel source used by this meteor.  Geometry remains independent, so a
+    # meteor extracted from the untouched frame can still be moved onto the
+    # aligned clean-base canvas without forcing its neighbours back to raw.
+    source_mode: str = "aligned"
+
+
+def normalized_source_mode(stroke: Stroke) -> str:
+    return "original" if stroke.source_mode == "original" else "aligned"
 
 
 def stroke_is_transformed(stroke: Stroke, tolerance: float = 1e-4) -> bool:
@@ -82,6 +90,18 @@ def path_is_within(child: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def active_stroke_keys(
+    strokes: dict[str, list[Stroke]], pairs: dict[str, Path],
+) -> list[str]:
+    """Return only marked sources that belong to the current input pairing.
+
+    Autosave intentionally remembers masks from earlier batches.  Those masks
+    must remain recoverable, but they must never leak into preview or export
+    after the user selects a different source set and clean base.
+    """
+    return [key for key, values in strokes.items() if values and key in pairs]
 
 
 def normalize_array(array: np.ndarray) -> np.ndarray:
@@ -898,7 +918,8 @@ def meteor_source_annotations(
             "source": source_name,
             "boxes": [box],
             "original_boxes": [original_box] if original_box is not None else [],
-            "original_state": original_state,
+            "original_state": original_state or normalized_source_mode(stroke) == "original",
+            "source_mode": normalized_source_mode(stroke),
             "transformed": transformed,
             "meteor_index": meteor_index,
             "transform": {
@@ -1376,6 +1397,224 @@ def compose_meteor_objects(
     return np.clip(result, 0, clip_max).astype(base.dtype), union
 
 
+def compose_meteor_sources(
+    aligned_source: np.ndarray,
+    original_source: np.ndarray,
+    base: np.ndarray,
+    strokes: Iterable[Stroke],
+    *settings,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Composite one photograph whose meteors may use different pixel sources.
+
+    The aligned and untouched images share the same canvas dimensions, but each
+    positive stroke is evaluated only against the source selected for that
+    meteor. Erasers are source-local as well, matching what the user saw while
+    painting in either source view.
+    """
+    ordered = list(strokes)
+    result = base.copy()
+    union = np.zeros(base.shape[:2], dtype=np.float32)
+    sources = {"aligned": aligned_source, "original": original_source}
+    for mode in ("aligned", "original"):
+        selected = [item for item in ordered if normalized_source_mode(item) == mode]
+        if not any(not item.erase and item.points for item in selected):
+            continue
+        result, source_mask = compose_meteor_objects(
+            sources[mode], result, selected, *settings
+        )
+        union = np.maximum(union, source_mask)
+    return result, union
+
+
+class ExactPreviewViewer(tk.Toplevel):
+    """Scrollable full-resolution viewer for the export-equivalent composite."""
+
+    def __init__(
+        self, parent: tk.Misc, final_image: np.ndarray, labeled_image: np.ndarray,
+        initial_mode: str = "blend",
+    ) -> None:
+        super().__init__(parent)
+        self.title("导出级精确预览 — 滚轮缩放，左键拖动")
+        self.geometry("1280x820")
+        self.minsize(760, 520)
+        self.images = {"blend": final_image, "labeled": labeled_image}
+        self.mode = tk.StringVar(value="labeled" if initial_mode == "labeled" else "blend")
+        self.zoom = 1.0
+        self.center_x = final_image.shape[1] / 2.0
+        self.center_y = final_image.shape[0] / 2.0
+        self.fit_pending = True
+        self.drag_start: tuple[int, int, float, float] | None = None
+        self.photo: ImageTk.PhotoImage | None = None
+        self.image_item: int | None = None
+        self.zoom_label = tk.StringVar()
+
+        toolbar = ttk.Frame(self, padding=(8, 6))
+        toolbar.pack(fill="x")
+        ttk.Radiobutton(
+            toolbar, text="最终效果", variable=self.mode, value="blend", command=self._render
+        ).pack(side="left")
+        ttk.Radiobutton(
+            toolbar, text="来源标注", variable=self.mode, value="labeled", command=self._render
+        ).pack(side="left", padx=(8, 18))
+        ttk.Button(toolbar, text="适合窗口", command=self.fit).pack(side="left")
+        ttk.Button(toolbar, text="100%", command=self.actual_size).pack(side="left", padx=4)
+        ttk.Button(toolbar, text="−", width=3, command=lambda: self._zoom_by(1 / 1.25)).pack(side="left")
+        ttk.Button(toolbar, text="+", width=3, command=lambda: self._zoom_by(1.25)).pack(side="left", padx=(4, 0))
+        ttk.Label(toolbar, textvariable=self.zoom_label).pack(side="left", padx=12)
+        ttk.Label(
+            toolbar, text="鼠标滚轮缩放 · 左键拖动平移 · 双击切换 100%/适合窗口"
+        ).pack(side="right")
+
+        self.canvas = tk.Canvas(self, background="#111111", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._on_configure)
+        self.canvas.bind("<MouseWheel>", self._wheel)
+        self.canvas.bind("<Button-4>", lambda event: self._wheel_steps(event, 1))
+        self.canvas.bind("<Button-5>", lambda event: self._wheel_steps(event, -1))
+        self.canvas.bind("<ButtonPress-1>", self._pan_start)
+        self.canvas.bind("<B1-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-1>", self._pan_end)
+        self.canvas.bind("<Double-Button-1>", self._toggle_actual)
+        self.bind("<KeyPress-0>", lambda _event: self.fit())
+        self.bind("<KeyPress-1>", lambda _event: self.actual_size())
+        self.bind("<KeyPress-plus>", lambda _event: self._zoom_by(1.25))
+        self.bind("<KeyPress-minus>", lambda _event: self._zoom_by(1 / 1.25))
+        # An export-quality preview is primarily used to inspect seams, dark
+        # residuals and feathering. Open at one image pixel per screen pixel;
+        # "适合窗口" remains available when the user wants the whole frame.
+        self.after_idle(self.actual_size)
+
+    def _image(self) -> np.ndarray:
+        return self.images[self.mode.get()]
+
+    def _fit_scale(self) -> float:
+        image = self._image()
+        height, width = image.shape[:2]
+        return min(
+            max(1, self.canvas.winfo_width()) / max(1, width),
+            max(1, self.canvas.winfo_height()) / max(1, height),
+        )
+
+    def fit(self) -> None:
+        image = self._image()
+        self.center_x = image.shape[1] / 2.0
+        self.center_y = image.shape[0] / 2.0
+        self.zoom = self._fit_scale()
+        self.fit_pending = False
+        self._render()
+
+    def actual_size(self) -> None:
+        self.zoom = 1.0
+        self.fit_pending = False
+        self._clamp_center()
+        self._render()
+
+    def _toggle_actual(self, _event=None) -> str:
+        if abs(self.zoom - 1.0) < 0.02:
+            self.fit()
+        else:
+            self.actual_size()
+        return "break"
+
+    def _view_origin(self) -> tuple[float, float]:
+        return (
+            self.center_x - self.canvas.winfo_width() / (2.0 * self.zoom),
+            self.center_y - self.canvas.winfo_height() / (2.0 * self.zoom),
+        )
+
+    def _clamp_center(self) -> None:
+        image = self._image()
+        height, width = image.shape[:2]
+        half_w = self.canvas.winfo_width() / (2.0 * self.zoom)
+        half_h = self.canvas.winfo_height() / (2.0 * self.zoom)
+        self.center_x = width / 2.0 if half_w >= width / 2.0 else float(np.clip(self.center_x, half_w, width - half_w))
+        self.center_y = height / 2.0 if half_h >= height / 2.0 else float(np.clip(self.center_y, half_h, height - half_h))
+
+    def _zoom_by(self, factor: float, anchor: tuple[int, int] | None = None) -> None:
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+        anchor_x, anchor_y = anchor or (canvas_w // 2, canvas_h // 2)
+        origin_x, origin_y = self._view_origin()
+        image_x = origin_x + anchor_x / self.zoom
+        image_y = origin_y + anchor_y / self.zoom
+        fit_scale = self._fit_scale()
+        self.zoom = float(np.clip(self.zoom * factor, fit_scale * 0.5, 8.0))
+        new_origin_x = image_x - anchor_x / self.zoom
+        new_origin_y = image_y - anchor_y / self.zoom
+        self.center_x = new_origin_x + canvas_w / (2.0 * self.zoom)
+        self.center_y = new_origin_y + canvas_h / (2.0 * self.zoom)
+        self.fit_pending = False
+        self._clamp_center()
+        self._render()
+
+    def _wheel(self, event) -> str:
+        steps = 1 if event.delta > 0 else -1
+        return self._wheel_steps(event, steps)
+
+    def _wheel_steps(self, event, steps: int) -> str:
+        self._zoom_by(1.25 ** steps, (int(event.x), int(event.y)))
+        return "break"
+
+    def _pan_start(self, event) -> str:
+        self.drag_start = (event.x, event.y, self.center_x, self.center_y)
+        self.canvas.configure(cursor="fleur")
+        return "break"
+
+    def _pan_move(self, event) -> str:
+        if self.drag_start is None:
+            return "break"
+        start_x, start_y, center_x, center_y = self.drag_start
+        self.center_x = center_x - (event.x - start_x) / self.zoom
+        self.center_y = center_y - (event.y - start_y) / self.zoom
+        self._clamp_center()
+        self._render()
+        return "break"
+
+    def _pan_end(self, _event=None) -> str:
+        self.drag_start = None
+        self.canvas.configure(cursor="")
+        return "break"
+
+    def _on_configure(self, _event=None) -> None:
+        if self.fit_pending:
+            self.fit()
+        else:
+            self._clamp_center()
+            self._render()
+
+    def _render(self) -> None:
+        if not self.winfo_exists():
+            return
+        image = self._image()
+        height, width = image.shape[:2]
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+        self._clamp_center()
+        origin_x, origin_y = self._view_origin()
+        x0 = max(0, int(np.floor(origin_x)))
+        y0 = max(0, int(np.floor(origin_y)))
+        x1 = min(width, int(np.ceil(origin_x + canvas_w / self.zoom)))
+        y1 = min(height, int(np.ceil(origin_y + canvas_h / self.zoom)))
+        if x1 <= x0 or y1 <= y0:
+            return
+        crop = Image.fromarray(image[y0:y1, x0:x1])
+        display_w = max(1, int(round((x1 - x0) * self.zoom)))
+        display_h = max(1, int(round((y1 - y0) * self.zoom)))
+        if (display_w, display_h) != crop.size:
+            resample = Image.Resampling.LANCZOS if self.zoom < 1.0 else Image.Resampling.BICUBIC
+            crop = crop.resize((display_w, display_h), resample)
+        draw_x = int(round((x0 - origin_x) * self.zoom))
+        draw_y = int(round((y0 - origin_y) * self.zoom))
+        self.photo = ImageTk.PhotoImage(crop)
+        if self.image_item is None or not self.canvas.type(self.image_item):
+            self.canvas.delete("all")
+            self.image_item = self.canvas.create_image(draw_x, draw_y, anchor="nw", image=self.photo)
+        else:
+            self.canvas.itemconfigure(self.image_item, image=self.photo)
+            self.canvas.coords(self.image_item, draw_x, draw_y)
+        self.zoom_label.set(f"{self.zoom * 100:.0f}% · {width}×{height}")
+
+
 class MeteorComposer(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1408,6 +1647,7 @@ class MeteorComposer(tk.Tk):
         self.base_exposure_tenths = tk.IntVar(value=0)
         self.base_exposure_label = tk.StringVar(value="+0.0 EV")
         self.exact_preview_status = tk.StringVar(value="导出级预览：未生成")
+        self.preview_quality_status = tk.StringVar(value="当前画布：快速预览")
         self.selected_object_summary = tk.StringVar(value="尚未选择流星")
         self.selected_override_enabled = tk.BooleanVar(value=False)
         self.selected_brightness = tk.IntVar(value=100)
@@ -1417,6 +1657,7 @@ class MeteorComposer(tk.Tk):
         self.selected_match = tk.BooleanVar(value=False)
         self.selected_blend = tk.StringVar(value="自然融合")
         self.selected_feather = tk.IntVar(value=10)
+        self.selected_source_mode = tk.StringVar(value="自动对齐素材")
         self.loading_selected_adjustments = False
         self.candidate_threshold = tk.IntVar(value=55)
         self.candidate_summary = tk.StringVar(value="当前图尚未分析候选")
@@ -1435,6 +1676,7 @@ class MeteorComposer(tk.Tk):
         self.files: list[Path] = []
         self.selected_base_files: list[Path] = []
         self.pairs: dict[str, Path] = {}
+        self.pairing_signature: str | None = None
         self.original_sources: dict[str, Path] = {}
         self.use_original_sources: set[str] = set()
         self.alignment_statuses: dict[str, str] = {}
@@ -1457,21 +1699,36 @@ class MeteorComposer(tk.Tk):
         self.current_path: Path | None = None
         self.preview_rgb: np.ndarray | None = None
         self.preview_source: np.ndarray | None = None
+        self.preview_aligned_source: np.ndarray | None = None
+        self.preview_original_source: np.ndarray | None = None
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_image_item: int | None = None
         self.preview_display_size: tuple[int, int] | None = None
+        self.canvas_zoom = 1.0
+        self.canvas_fit_mode = True
+        self.canvas_center_x = 0.0
+        self.canvas_center_y = 0.0
+        self.canvas_image_shape: tuple[int, int] | None = None
+        self.canvas_pan_start: tuple[int, int, float, float] | None = None
+        self.canvas_pan_with_left = False
+        self.space_pan_held = False
+        self.canvas_zoom_label = tk.StringVar(value="适合窗口")
         self.global_preview_rgb: np.ndarray | None = None
         self.global_labeled_preview_rgb: np.ndarray | None = None
         self.global_preview_signature: str | None = None
         self.global_preview_loading_signature: str | None = None
         self.global_preview_pending_signature: str | None = None
         self.global_preview_request_after_id: str | None = None
+        self.shared_base_loading_signature: str | None = None
         self.global_exact_after_id: str | None = None
         self.exact_preview_rgb: np.ndarray | None = None
         self.exact_labeled_preview_rgb: np.ndarray | None = None
+        self.exact_preview_full_rgb: np.ndarray | None = None
+        self.exact_labeled_preview_full_rgb: np.ndarray | None = None
         self.exact_preview_signature: str | None = None
         self.exact_preview_loading_signature: str | None = None
+        self.exact_preview_window: ExactPreviewViewer | None = None
         self.current_dims = (1, 1)
         self.display_box = (0, 0, 1, 1)
         self.active_points: list[tuple[float, float]] = []
@@ -1485,6 +1742,8 @@ class MeteorComposer(tk.Tk):
         self.shift_anchors: dict[str, tuple[float, float]] = {}
         self.cursor_position: tuple[float, float] | None = None
         self.cursor_items: list[int] = []
+        self.last_candidate_hover_time = 0.0
+        self.last_candidate_hover_position: tuple[float, float] | None = None
         self.alt_previous_mode: str | None = None
         self.active_action_index = -1
         self.context_stroke_index: int | None = None
@@ -1531,10 +1790,13 @@ class MeteorComposer(tk.Tk):
         ttk.Label(header, text=APP_NAME, font=("TkDefaultFont", 15, "bold")).pack(side="left")
         ttk.Label(header, text="图片合成工作区").pack(side="left", padx=12)
         ttk.Button(header, text="打开视频动态工作区…", command=self.open_video_workspace).pack(side="right")
-        ttk.Button(header, text="Siril＋PTGui星空对齐…", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
+        ttk.Button(header, text="2  Siril＋PTGui星空对齐…", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
+        self.paths_toggle_button = ttk.Button(header, text="收起 1 素材与输出", command=self._toggle_paths_panel)
+        self.paths_toggle_button.pack(side="right", padx=(0, 6))
 
-        paths = ttk.LabelFrame(root, text="输入与输出（源素材只读）", padding=8)
+        paths = ttk.LabelFrame(root, text="1  素材与输出（源素材只读）", padding=8)
         paths.pack(fill="x")
+        self.paths_panel = paths
         mode_row = ttk.Frame(paths)
         mode_row.grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
         ttk.Label(mode_row, text="最终输出方式", width=18).pack(side="left")
@@ -1575,25 +1837,40 @@ class MeteorComposer(tk.Tk):
         self.tree.pack(fill="both", expand=True, pady=4)
         self.tree.bind("<Double-1>", lambda _e: self.load_selected())
         ttk.Button(left, text="加载所选", command=self.load_selected).pack(fill="x")
-        ttk.Button(left, text="切换：自动对齐 / 原始状态", command=self.toggle_original_state).pack(fill="x", pady=(4, 0))
+        ttk.Button(left, text="切换查看/绘制源：自动对齐 / 原始图", command=self.toggle_original_state).pack(fill="x", pady=(4, 0))
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
         view_bar = ttk.Frame(center)
-        view_bar.pack(fill="x", pady=(0, 4))
+        view_bar.pack(fill="x", pady=(0, 2))
         ttk.Label(view_bar, text="查看：").pack(side="left")
-        ttk.Radiobutton(view_bar, text="1 原图 TIFF", variable=self.view_mode, value="source", command=self._render_preview).pack(side="left")
-        ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._render_preview).pack(side="left", padx=(8, 0))
-        ttk.Button(view_bar, text="生成导出级精确预览", command=self.request_exact_preview).pack(side="left", padx=(16, 0))
-        ttk.Label(view_bar, textvariable=self.exact_preview_status).pack(side="left", padx=(6, 0))
+        ttk.Radiobutton(view_bar, text="1 原图 TIFF", variable=self.view_mode, value="source", command=self._view_mode_changed).pack(side="left")
+        ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Label(view_bar, text="编辑视图：拖动画蒙版；按住 H 临时隐藏红色").pack(side="right")
+        exact_bar = ttk.Frame(center)
+        exact_bar.pack(fill="x", pady=(0, 4))
+        ttk.Button(exact_bar, text="生成并打开导出级精确预览", command=self.request_exact_preview).pack(side="left")
+        ttk.Button(exact_bar, text="打开已生成预览", command=self.open_exact_preview).pack(side="left", padx=(6, 0))
+        ttk.Label(exact_bar, textvariable=self.preview_quality_status).pack(side="left", padx=(12, 0))
+        ttk.Label(exact_bar, textvariable=self.exact_preview_status).pack(side="left", padx=(8, 0))
+        ttk.Button(exact_bar, text="适合窗口", command=self._canvas_fit).pack(side="right", padx=(4, 0))
+        ttk.Button(exact_bar, text="100%", command=self._canvas_actual_size).pack(side="right", padx=(4, 0))
+        ttk.Button(exact_bar, text="+", width=3, command=lambda: self._canvas_zoom_by(1.25)).pack(side="right", padx=(4, 0))
+        ttk.Button(exact_bar, text="−", width=3, command=lambda: self._canvas_zoom_by(1 / 1.25)).pack(side="right")
+        ttk.Label(exact_bar, textvariable=self.canvas_zoom_label).pack(side="right", padx=(8, 4))
         self.canvas = tk.Canvas(center, background="#181818", cursor="none", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda _e: self._render_preview())
+        self.canvas.bind("<Configure>", self._canvas_configure)
         self.canvas.bind("<Motion>", self._cursor_motion)
         self.canvas.bind("<Leave>", self._cursor_leave)
+        self.canvas.bind("<MouseWheel>", self._canvas_wheel)
+        self.canvas.bind("<Button-4>", lambda event: self._canvas_wheel_steps(event, 1))
+        self.canvas.bind("<Button-5>", lambda event: self._canvas_wheel_steps(event, -1))
+        self.canvas.bind("<ButtonPress-2>", self._canvas_pan_start_event)
+        self.canvas.bind("<B2-Motion>", self._canvas_pan_move_event)
+        self.canvas.bind("<ButtonRelease-2>", self._canvas_pan_end_event)
         # Put left-button editing in its own highest-priority bind tag. On some
         # Windows/Tk combinations NumLock contributes a modifier bit and a more
         # specific widget binding can otherwise swallow ButtonPress while drag
@@ -1606,6 +1883,8 @@ class MeteorComposer(tk.Tk):
         # A release can be delivered to another widget when rendering takes long
         # enough for the pointer to leave the canvas. Catch it application-wide.
         self.bind_all("<ButtonRelease-1>", self._global_pointer_release, add=True)
+        self.bind_all("<KeyPress-space>", self._space_pan_press, add=True)
+        self.bind_all("<KeyRelease-space>", self._space_pan_release, add=True)
         self.canvas.bind("<Button-3>", self._show_mask_menu)
         self.canvas.bind("<Shift-Button-3>", self._delete_mask_at_event)
         self.mask_menu = tk.Menu(self, tearoff=0)
@@ -1616,123 +1895,106 @@ class MeteorComposer(tk.Tk):
         self.object_menu.add_command(label="删除这颗流星", command=self._delete_selected_object)
         self.object_menu.add_command(label="一键恢复原始位置／形态", command=self._reset_selected_object)
         self.object_menu.add_command(label="精确变换参数…", command=self._transform_selected_object)
+        self.object_menu.add_separator()
+        self.object_menu.add_command(label="使用自动对齐素材", command=lambda: self._set_selected_source_mode("aligned"))
+        self.object_menu.add_command(label="使用原始素材", command=lambda: self._set_selected_source_mode("original"))
 
-        tools = ttk.LabelFrame(root, text="流星蒙版", padding=8)
-        tools.pack(fill="x")
-        ttk.Radiobutton(tools, text="B ✎ 画笔", variable=self.edit_mode, value="paint", command=self._tool_settings_changed).grid(row=0, column=0, padx=(0, 4))
-        ttk.Radiobutton(tools, text="E ▱ 橡皮擦", variable=self.edit_mode, value="erase", command=self._tool_settings_changed).grid(row=0, column=1, padx=(0, 12))
-        ttk.Label(tools, text="画笔宽度(px)").grid(row=0, column=2)
-        ttk.Scale(tools, from_=2, to=100, variable=self.brush_width, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=3, sticky="ew", padx=5)
-        ttk.Label(tools, textvariable=self.brush_width, width=4).grid(row=0, column=4)
-        ttk.Label(tools, text="羽化(px)").grid(row=0, column=5, padx=(15, 0))
-        ttk.Scale(tools, from_=0, to=80, variable=self.feather, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=6, sticky="ew", padx=5)
-        ttk.Label(tools, textvariable=self.feather, width=4).grid(row=0, column=7)
-        ttk.Button(tools, text="撤销 Ctrl+Z", command=self.undo_stroke).grid(row=0, column=8, padx=3)
-        ttk.Button(tools, text="清除此图蒙版", command=self.clear_strokes).grid(row=0, column=9, padx=3)
-        ttk.Button(tools, text="自动检测全部", command=self.auto_detect_all).grid(row=0, column=10, padx=3)
-        ttk.Button(tools, text="保存项目", command=self.save_project).grid(row=0, column=11, padx=3)
-        ttk.Button(tools, text="载入项目", command=self.load_project).grid(row=0, column=12, padx=3)
-        ttk.Label(tools, text="橡皮擦宽度(px)").grid(row=1, column=2, pady=(6, 0))
-        ttk.Scale(tools, from_=2, to=200, variable=self.eraser_width, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=1, column=3, sticky="ew", padx=5, pady=(6, 0))
-        ttk.Label(tools, textvariable=self.eraser_width, width=4).grid(row=1, column=4, pady=(6, 0))
-        exposure_tools = ttk.Frame(tools)
-        exposure_tools.grid(row=1, column=5, columnspan=3, sticky="w", pady=(6, 0), padx=(15, 0))
-        ttk.Checkbutton(
-            exposure_tools, text="全局默认：局部曝光匹配", variable=self.default_match_exposure,
-            command=self._match_exposure_default_changed,
-        ).pack(side="left")
-        ttk.Label(exposure_tools, text="当前图").pack(side="left", padx=(12, 4))
-        exposure_policy = ttk.Combobox(
-            exposure_tools, textvariable=self.match_exposure_policy, state="readonly", width=10,
-            values=("跟随全局", "强制启用", "强制关闭"),
-        )
+        self.control_notebook = ttk.Notebook(root)
+        self.control_notebook.pack(fill="x", pady=(0, 5))
+
+        mask_tools = ttk.Frame(self.control_notebook, padding=8)
+        blend_tools = ttk.Frame(self.control_notebook, padding=8)
+        selected_tools = ttk.Frame(self.control_notebook, padding=8)
+        self.mask_tools_tab = mask_tools
+        self.blend_tools_tab = blend_tools
+        self.selected_tools_tab = selected_tools
+        self.control_notebook.add(mask_tools, text="3  蒙版与候选")
+        self.control_notebook.add(blend_tools, text="4  融合与底图")
+        self.control_notebook.add(selected_tools, text="5  所选流星")
+
+        ttk.Label(mask_tools, text="当前工具", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Radiobutton(mask_tools, text="B ✎ 画笔", variable=self.edit_mode, value="paint", command=self._tool_settings_changed).grid(row=0, column=1, padx=4)
+        ttk.Radiobutton(mask_tools, text="E ▱ 橡皮擦", variable=self.edit_mode, value="erase", command=self._tool_settings_changed).grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(mask_tools, text="画笔宽度").grid(row=0, column=3)
+        ttk.Scale(mask_tools, from_=2, to=100, variable=self.brush_width, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=4, sticky="ew", padx=5)
+        ttk.Label(mask_tools, textvariable=self.brush_width, width=4).grid(row=0, column=5)
+        ttk.Label(mask_tools, text="橡皮擦宽度").grid(row=0, column=6, padx=(12, 0))
+        ttk.Scale(mask_tools, from_=2, to=200, variable=self.eraser_width, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=7, sticky="ew", padx=5)
+        ttk.Label(mask_tools, textvariable=self.eraser_width, width=4).grid(row=0, column=8)
+        ttk.Label(mask_tools, text="羽化").grid(row=0, column=9, padx=(12, 0))
+        ttk.Scale(mask_tools, from_=0, to=80, variable=self.feather, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=10, sticky="ew", padx=5)
+        ttk.Label(mask_tools, textvariable=self.feather, width=4).grid(row=0, column=11)
+
+        ttk.Button(mask_tools, text="AI分析当前单张候选", command=self.detect_current_candidates).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Label(mask_tools, text="AI分数阈值").grid(row=1, column=2, pady=(7, 0))
+        ttk.Scale(mask_tools, from_=1, to=100, variable=self.candidate_threshold, orient="horizontal", command=self._candidate_threshold_changed).grid(row=1, column=3, columnspan=2, sticky="ew", padx=5, pady=(7, 0))
+        ttk.Label(mask_tools, textvariable=self.candidate_threshold, width=4).grid(row=1, column=5, pady=(7, 0))
+        ttk.Label(mask_tools, textvariable=self.candidate_summary).grid(row=1, column=6, columnspan=3, sticky="w", padx=(12, 0), pady=(7, 0))
+        ttk.Label(mask_tools, textvariable=self.ai_model_status).grid(row=1, column=9, columnspan=3, sticky="e", pady=(7, 0))
+
+        ttk.Button(mask_tools, text="撤销 Ctrl+Z", command=self.undo_stroke).grid(row=2, column=0, pady=(7, 0), sticky="ew")
+        ttk.Button(mask_tools, text="清除此图蒙版", command=self.clear_strokes).grid(row=2, column=1, pady=(7, 0), padx=3, sticky="ew")
+        ttk.Button(mask_tools, text="自动检测全部", command=self.auto_detect_all).grid(row=2, column=2, pady=(7, 0), padx=3, sticky="ew")
+        ttk.Button(mask_tools, text="保存项目", command=self.save_project).grid(row=2, column=3, pady=(7, 0), padx=3, sticky="ew")
+        ttk.Button(mask_tools, text="载入项目", command=self.load_project).grid(row=2, column=4, pady=(7, 0), padx=3, sticky="ew")
+        ttk.Label(mask_tools, text="绿色虚线=候选；移到线上点击绿色按钮选中。Alt 临时切换画笔/橡皮擦。", foreground="#555555").grid(row=2, column=5, columnspan=7, sticky="e", pady=(7, 0))
+        for column in (4, 7, 10):
+            mask_tools.columnconfigure(column, weight=1)
+
+        scope_row = ttk.Frame(blend_tools)
+        scope_row.pack(fill="x")
+        ttk.Label(scope_row, text="作用范围：全局默认", style="Heading.TLabel").pack(side="left")
+        ttk.Checkbutton(scope_row, text="局部曝光/颜色匹配", variable=self.default_match_exposure, command=self._match_exposure_default_changed).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(scope_row, text="保持流星亮部", variable=self.default_preserve_brightness, command=self._brightness_default_changed).pack(side="left", padx=(8, 0))
+        ttk.Label(scope_row, text="当前图曝光匹配").pack(side="left", padx=(16, 4))
+        exposure_policy = ttk.Combobox(scope_row, textvariable=self.match_exposure_policy, state="readonly", width=10, values=("跟随全局", "强制启用", "强制关闭"))
         exposure_policy.pack(side="left")
         exposure_policy.bind("<<ComboboxSelected>>", self._match_exposure_policy_changed)
-        ttk.Label(exposure_tools, text="（含颜色匹配与流星亮部保护）").pack(side="left", padx=(5, 0))
-        ttk.Checkbutton(tools, text="同时导出16位TIFF（占用空间较大）", variable=self.export_tiff).grid(row=1, column=8, columnspan=3, sticky="w", pady=(6, 0))
-        ttk.Label(tools, text="合成方式").grid(row=2, column=8, sticky="e", pady=(6, 0))
-        blend_combo = ttk.Combobox(
-            tools, textvariable=self.blend_mode, state="readonly", width=12,
-            values=("自然融合", "亮度残差", "普通粘贴"),
-        )
-        blend_combo.grid(row=2, column=9, columnspan=2, sticky="w", pady=(6, 0), padx=5)
+        ttk.Checkbutton(scope_row, text="导出16位TIFF", variable=self.export_tiff).pack(side="right")
+        blend_combo = ttk.Combobox(scope_row, textvariable=self.blend_mode, state="readonly", width=12, values=("自然融合", "亮度残差", "普通粘贴"))
+        blend_combo.pack(side="right", padx=(4, 12))
         blend_combo.bind("<<ComboboxSelected>>", lambda _event: self._render_preview())
-        ttk.Checkbutton(tools, text="当前图：启用流星曲线", variable=self.curve_enabled, command=self._render_preview).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        ttk.Label(tools, text="暗部压低").grid(row=2, column=2, pady=(6, 0))
-        ttk.Scale(tools, from_=0, to=100, variable=self.curve_shadows, orient="horizontal", command=lambda _v: self._render_preview()).grid(row=2, column=3, sticky="ew", padx=5, pady=(6, 0))
-        ttk.Label(tools, textvariable=self.curve_shadows, width=4).grid(row=2, column=4, pady=(6, 0))
-        ttk.Label(tools, text="亮部提升").grid(row=2, column=5, padx=(15, 0), pady=(6, 0))
-        ttk.Scale(tools, from_=0, to=100, variable=self.curve_highlights, orient="horizontal", command=lambda _v: self._render_preview()).grid(row=2, column=6, sticky="ew", padx=5, pady=(6, 0))
-        ttk.Label(tools, textvariable=self.curve_highlights, width=4).grid(row=2, column=7, pady=(6, 0))
-        ttk.Checkbutton(
-            tools, text="全局默认：保持流星亮部", variable=self.default_preserve_brightness,
-            command=self._brightness_default_changed,
-        ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Label(tools, text="全局亮度%").grid(row=3, column=2, pady=(7, 0))
-        ttk.Scale(
-            tools, from_=50, to=250, variable=self.default_meteor_brightness,
-            orient="horizontal", command=self._brightness_default_changed,
-        ).grid(row=3, column=3, sticky="ew", padx=5, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.default_meteor_brightness, width=4).grid(row=3, column=4, pady=(7, 0))
-        ttk.Checkbutton(
-            tools, text="当前图单独设置", variable=self.brightness_override,
-            command=self._brightness_override_changed,
-        ).grid(row=3, column=5, sticky="e", padx=(15, 4), pady=(7, 0))
-        self.current_brightness_scale = ttk.Scale(
-            tools, from_=50, to=250, variable=self.meteor_brightness,
-            orient="horizontal", state="disabled", command=self._current_brightness_changed,
-        )
-        self.current_brightness_scale.grid(row=3, column=6, sticky="ew", padx=5, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.meteor_brightness, width=4).grid(row=3, column=7, pady=(7, 0))
-        ttk.Label(tools, text="全局背景净化").grid(row=3, column=8, sticky="e", pady=(7, 0))
-        ttk.Scale(
-            tools, from_=0, to=100, variable=self.default_background_cleanup,
-            orient="horizontal", command=self._background_cleanup_default_changed,
-        ).grid(row=3, column=9, columnspan=2, sticky="ew", padx=5, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.default_background_cleanup, width=4).grid(row=3, column=11, pady=(7, 0))
-        ttk.Button(tools, text="AI分析当前单张候选", command=self.detect_current_candidates).grid(row=4, column=0, columnspan=2, sticky="ew", pady=(7, 0))
-        ttk.Label(tools, text="AI分数阈值").grid(row=4, column=2, pady=(7, 0))
-        ttk.Scale(tools, from_=1, to=100, variable=self.candidate_threshold, orient="horizontal",
-                  command=self._candidate_threshold_changed).grid(row=4, column=3, sticky="ew", padx=5, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.candidate_threshold, width=4).grid(row=4, column=4, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.candidate_summary).grid(row=4, column=5, columnspan=4, sticky="w", padx=(15, 0), pady=(7, 0))
-        ttk.Label(tools, textvariable=self.ai_model_status).grid(row=4, column=9, sticky="e", pady=(7, 0))
-        ttk.Label(tools, text="绿色虚线=候选；移到线上点绿色按钮选中").grid(row=4, column=10, columnspan=3, sticky="e", pady=(7, 0))
-        ttk.Label(tools, text="底图曝光").grid(row=5, column=0, sticky="w", pady=(7, 0))
-        ttk.Scale(
-            tools, from_=-20, to=20, variable=self.base_exposure_tenths,
-            orient="horizontal", command=self._base_exposure_changed,
-        ).grid(row=5, column=1, columnspan=3, sticky="ew", padx=5, pady=(7, 0))
-        ttk.Label(tools, textvariable=self.base_exposure_label, width=8).grid(row=5, column=4, pady=(7, 0))
-        ttk.Button(tools, text="重置底图曝光", command=self._reset_base_exposure).grid(
-            row=5, column=5, columnspan=2, sticky="w", padx=(15, 0), pady=(7, 0)
-        )
-        ttk.Label(tools, text="只改变干净底图；流星亮度保持独立").grid(
-            row=5, column=7, columnspan=6, sticky="w", pady=(7, 0)
-        )
-        ttk.Checkbutton(
-            tools, text="自动优化每颗流星（补足羽化＋自适应暗部）",
-            variable=self.auto_optimize, command=self._auto_optimize_changed,
-        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(7, 0))
-        ttk.Combobox(
-            tools, textvariable=self.auto_optimize_strength, state="readonly", width=7,
-            values=("保守", "标准", "强力"),
-        ).grid(row=6, column=3, sticky="w", padx=5, pady=(7, 0))
-        ttk.Button(tools, text="自动优化当前流星", command=self.auto_optimize_selected).grid(
-            row=6, column=4, columnspan=2, sticky="ew", padx=3, pady=(7, 0)
-        )
-        ttk.Button(tools, text="自动优化全部流星", command=self.auto_optimize_all).grid(
-            row=6, column=6, columnspan=2, sticky="ew", padx=3, pady=(7, 0)
-        )
-        ttk.Label(tools, text="按原尺寸逐颗分析，不修改手绘蒙版").grid(
-            row=6, column=8, columnspan=5, sticky="w", padx=(15, 0), pady=(7, 0)
-        )
-        tools.columnconfigure(3, weight=1)
-        tools.columnconfigure(6, weight=1)
+        ttk.Label(scope_row, text="合成方式").pack(side="right")
 
-        selected_tools = ttk.LabelFrame(root, text="所选流星独立设置（在 3/4 视图中单击流星）", padding=7)
-        selected_tools.pack(fill="x", pady=(0, 5))
-        ttk.Label(selected_tools, textvariable=self.selected_object_summary, width=24).grid(row=0, column=0, sticky="w")
+        curve_row = ttk.Frame(blend_tools)
+        curve_row.pack(fill="x", pady=(7, 0))
+        ttk.Checkbutton(curve_row, text="当前图：启用流星曲线", variable=self.curve_enabled, command=self._render_preview).pack(side="left")
+        ttk.Label(curve_row, text="暗部压低").pack(side="left", padx=(16, 4))
+        ttk.Scale(curve_row, from_=0, to=100, variable=self.curve_shadows, orient="horizontal", command=lambda _v: self._render_preview()).pack(side="left", fill="x", expand=True)
+        ttk.Label(curve_row, textvariable=self.curve_shadows, width=4).pack(side="left")
+        ttk.Label(curve_row, text="亮部提升").pack(side="left", padx=(16, 4))
+        ttk.Scale(curve_row, from_=0, to=100, variable=self.curve_highlights, orient="horizontal", command=lambda _v: self._render_preview()).pack(side="left", fill="x", expand=True)
+        ttk.Label(curve_row, textvariable=self.curve_highlights, width=4).pack(side="left")
+
+        brightness_row = ttk.Frame(blend_tools)
+        brightness_row.pack(fill="x", pady=(7, 0))
+        ttk.Label(brightness_row, text="全局流星亮度%").pack(side="left")
+        ttk.Scale(brightness_row, from_=50, to=250, variable=self.default_meteor_brightness, orient="horizontal", command=self._brightness_default_changed).pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Label(brightness_row, textvariable=self.default_meteor_brightness, width=4).pack(side="left")
+        ttk.Checkbutton(brightness_row, text="当前图单独设置", variable=self.brightness_override, command=self._brightness_override_changed).pack(side="left", padx=(16, 4))
+        self.current_brightness_scale = ttk.Scale(brightness_row, from_=50, to=250, variable=self.meteor_brightness, orient="horizontal", state="disabled", command=self._current_brightness_changed)
+        self.current_brightness_scale.pack(side="left", fill="x", expand=True)
+        ttk.Label(brightness_row, textvariable=self.meteor_brightness, width=4).pack(side="left")
+        ttk.Label(brightness_row, text="全局背景净化").pack(side="left", padx=(16, 4))
+        ttk.Scale(brightness_row, from_=0, to=100, variable=self.default_background_cleanup, orient="horizontal", command=self._background_cleanup_default_changed).pack(side="left", fill="x", expand=True)
+        ttk.Label(brightness_row, textvariable=self.default_background_cleanup, width=4).pack(side="left")
+
+        base_row = ttk.Frame(blend_tools)
+        base_row.pack(fill="x", pady=(7, 0))
+        ttk.Label(base_row, text="底图曝光（只改变底图）").pack(side="left")
+        ttk.Scale(base_row, from_=-20, to=20, variable=self.base_exposure_tenths, orient="horizontal", command=self._base_exposure_changed).pack(side="left", fill="x", expand=True, padx=5)
+        ttk.Label(base_row, textvariable=self.base_exposure_label, width=8).pack(side="left")
+        ttk.Button(base_row, text="重置底图曝光", command=self._reset_base_exposure).pack(side="left", padx=(8, 0))
+
+        optimize_row = ttk.Frame(blend_tools)
+        optimize_row.pack(fill="x", pady=(7, 0))
+        ttk.Checkbutton(optimize_row, text="自动优化每颗流星", variable=self.auto_optimize, command=self._auto_optimize_changed).pack(side="left")
+        ttk.Combobox(optimize_row, textvariable=self.auto_optimize_strength, state="readonly", width=7, values=("保守", "标准", "强力")).pack(side="left", padx=5)
+        ttk.Button(optimize_row, text="自动优化当前流星", command=self.auto_optimize_selected).pack(side="left", padx=3)
+        ttk.Button(optimize_row, text="自动优化全部流星", command=self.auto_optimize_all).pack(side="left", padx=3)
+        ttk.Label(optimize_row, text="按原尺寸逐颗分析，不修改手绘蒙版", foreground="#555555").pack(side="left", padx=(12, 0))
+
+        ttk.Label(selected_tools, textvariable=self.selected_object_summary, width=20).grid(row=0, column=0, sticky="w")
         independent = ttk.Checkbutton(
             selected_tools, text="单颗独立设置", variable=self.selected_override_enabled,
             command=self._selected_override_changed,
@@ -1744,12 +2006,18 @@ class MeteorComposer(tk.Tk):
             state="disabled",
         )
         self.reset_selected_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0), padx=(0, 8))
+        source_mode = ttk.Combobox(
+            selected_tools, textvariable=self.selected_source_mode, state="readonly", width=13,
+            values=("自动对齐素材", "原始素材"),
+        )
+        source_mode.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0), padx=(0, 8))
+        source_mode.bind("<<ComboboxSelected>>", self._selected_source_mode_changed)
 
         def selected_scale(column: int, label: str, variable, start: int, end: int):
             ttk.Label(selected_tools, text=label).grid(row=0, column=column, sticky="e")
             scale = ttk.Scale(
                 selected_tools, from_=start, to=end, variable=variable, orient="horizontal",
-                state="disabled", command=self._selected_adjustment_changed,
+                state="disabled", length=80, command=self._selected_adjustment_changed,
             )
             scale.grid(row=0, column=column + 1, sticky="ew", padx=4)
             value = ttk.Label(selected_tools, textvariable=variable, width=4)
@@ -1805,6 +2073,28 @@ class MeteorComposer(tk.Tk):
         self.progress.pack(side="left", padx=8)
         ttk.Button(bottom, text="导出合成结果", command=self.export).pack(side="right")
         ttk.Button(bottom, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
+
+        # Reserve the bottom controls before allowing the canvas to consume the
+        # remaining height. Packing the expanding body first can push later
+        # controls completely outside an 820px window on Windows display scales.
+        body.pack_forget()
+        self.control_notebook.pack_forget()
+        bottom.pack_forget()
+        bottom.pack(side="bottom", fill="x")
+        self.control_notebook.pack(side="bottom", fill="x", pady=(0, 5))
+        body.pack(fill="both", expand=True, pady=(10, 6))
+
+    def _toggle_paths_panel(self) -> None:
+        self._set_paths_panel_visible(not bool(self.paths_panel.winfo_manager()))
+
+    def _set_paths_panel_visible(self, visible: bool) -> None:
+        if not visible and self.paths_panel.winfo_manager():
+            self.paths_panel.pack_forget()
+            self.paths_toggle_button.configure(text="展开 1 素材与输出")
+        elif visible and not self.paths_panel.winfo_manager():
+            self.paths_panel.pack(fill="x", after=self.paths_toggle_button.master)
+            self.paths_toggle_button.configure(text="收起 1 素材与输出")
+        self.after_idle(self._render_preview)
 
     def open_video_workspace(self) -> None:
         if self.video_window is not None:
@@ -1874,6 +2164,7 @@ class MeteorComposer(tk.Tk):
         self.output_dir.set(str(final_output))
         self.files = exported
         self.pairs = {str(path): base for path in exported}
+        self.pairing_signature = self._base_selection_signature()
         self.original_sources = {
             str(Path(item.output_layer)): Path(item.source)
             for item in result.items
@@ -1922,6 +2213,9 @@ class MeteorComposer(tk.Tk):
             "<Shift-KeyPress-Right>": lambda: self._arrow_action(1, 0, 10),
             "<Shift-KeyPress-Up>": lambda: self._arrow_action(0, -1, 10),
             "<Shift-KeyPress-Down>": lambda: self._arrow_action(0, 1, 10),
+            "<KeyPress-plus>": lambda: self._canvas_zoom_by(1.25),
+            "<KeyPress-equal>": lambda: self._canvas_zoom_by(1.25),
+            "<KeyPress-minus>": lambda: self._canvas_zoom_by(1 / 1.25),
         }
         for sequence, callback in plain.items():
             self.bind_all(sequence, lambda event, fn=callback: self._run_plain_shortcut(event, fn))
@@ -1945,6 +2239,8 @@ class MeteorComposer(tk.Tk):
                 f"<{modifier}-s>": self.save_project,
                 f"<{modifier}-o>": self.load_project,
                 f"<{modifier}-Return>": self.export,
+                f"<{modifier}-0>": self._canvas_fit,
+                f"<{modifier}-1>": self._canvas_actual_size,
             }
             for sequence, callback in bindings.items():
                 try:
@@ -1998,6 +2294,20 @@ class MeteorComposer(tk.Tk):
         if mode not in {"blend", "labeled"}:
             self._clear_object_selection()
         self.view_mode.set(mode)
+        self._view_mode_changed()
+
+    def _view_mode_changed(self) -> None:
+        mode = self.view_mode.get()
+        if mode not in {"blend", "labeled"}:
+            self._clear_object_selection()
+        if hasattr(self, "control_notebook"):
+            target = self.mask_tools_tab if mode == "source" else self.blend_tools_tab
+            if mode in {"blend", "labeled"} and self.selected_object is not None:
+                target = self.selected_tools_tab
+            self.control_notebook.select(target)
+        if mode in {"blend", "labeled"} and self._uses_shared_base() and self.preview_base is None:
+            self._request_shared_base_preview()
+            return
         self._render_preview()
 
     def _arrow_action(self, dx: int, dy: int, amount: int) -> None:
@@ -2088,6 +2398,8 @@ Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 
 
 查看与文件
 1：原图 TIFF    2：干净 JPG    3：最终融合    4：来源标注
+鼠标滚轮或 +/-：以光标为中心缩放；中键拖动或按住空格+左键拖动：平移
+Ctrl/Command+0：适合窗口    Ctrl/Command+1：100% 快速预览像素
 拼合到同一张底图：第 3/4 模式汇总全部流星；分别输出：只预览当前图片对
 红色蒙版默认显示；按住 H：临时隐藏，松开恢复
 ← / →：上一张 / 下一张
@@ -2130,6 +2442,7 @@ F1：显示本快捷键表""")
             self.base_dir.set(next(iter(parents)) if len(parents) == 1 else f"已选择 {len(values)} 张底图")
             self.base_selection_summary.set(f"已选 {len(values)} 张")
         self._update_blend_preview_label()
+        self._base_selection_changed()
 
     def _browse_base_folder(self) -> None:
         if self.output_mode.get() == "combined":
@@ -2140,6 +2453,7 @@ F1：显示本快捷键表""")
             self.selected_base_files = []
             self.base_dir.set(value)
             self.base_selection_summary.set("按文件夹同名匹配")
+            self._base_selection_changed()
 
     def _update_output_mode_ui(self) -> None:
         combined = self.output_mode.get() == "combined"
@@ -2158,9 +2472,7 @@ F1：显示本快捷键表""")
                 self.selected_base_files = []
                 self.base_dir.set("")
                 self.base_selection_summary.set("请选择唯一底图")
-        self.global_preview_rgb = None
-        self.global_labeled_preview_rgb = None
-        self.global_preview_signature = None
+        self._invalidate_base_dependent_state()
         self._update_output_mode_ui()
         self._schedule_autosave()
         self.status.set(
@@ -2181,7 +2493,54 @@ F1：显示本快捷键表""")
         self.blend_preview_label.set("3 总融合预览" if shared else "3 当前图融合预览")
         self.source_preview_label.set("4 总图来源标注" if shared else "4 当前图来源标注")
 
-    def scan_inputs(self) -> None:
+    def _base_selection_signature(self) -> str:
+        """Identify the clean-base selection represented by the active pair table."""
+        return json.dumps({
+            "output_mode": self.output_mode.get(),
+            "base_dir": self.base_dir.get().strip(),
+            "base_files": [str(path) for path in self.selected_base_files],
+        }, ensure_ascii=False, sort_keys=True)
+
+    def _invalidate_base_dependent_state(self) -> None:
+        """Prevent previews and exports from retaining a previously selected base."""
+        self.pairs = {}
+        self.pairing_signature = None
+        self.preview_base = None
+        self.shared_base_loading_signature = None
+        self.global_preview_rgb = None
+        self.global_labeled_preview_rgb = None
+        self.global_preview_signature = None
+        self.global_preview_pending_signature = None
+        self.exact_preview_rgb = None
+        self.exact_labeled_preview_rgb = None
+        self.exact_preview_full_rgb = None
+        self.exact_labeled_preview_full_rgb = None
+        self.exact_preview_signature = None
+        self.exact_preview_status.set("导出级预览：底图已变化，请重新生成")
+        if self.global_preview_request_after_id is not None:
+            try:
+                self.after_cancel(self.global_preview_request_after_id)
+            except tk.TclError:
+                pass
+            self.global_preview_request_after_id = None
+        if self.exact_preview_window is not None:
+            try:
+                self.exact_preview_window.destroy()
+            except tk.TclError:
+                pass
+            self.exact_preview_window = None
+
+    def _base_selection_changed(self) -> None:
+        self._invalidate_base_dependent_state()
+        self._schedule_autosave()
+        source = Path(self.source_dir.get()).expanduser()
+        if source.is_dir() and self.output_dir.get().strip():
+            self.scan_inputs(reload_current=True)
+        else:
+            self.status.set("已选择新底图；选择完整的原图和输出目录后会建立新配对")
+
+    def scan_inputs(self, reload_current: bool = True) -> bool:
+        previous_current = self.current_path
         try:
             self._clear_object_selection()
             source = Path(self.source_dir.get()).expanduser()
@@ -2259,6 +2618,7 @@ F1：显示本快捷键表""")
                     mismatched.append(f"{path.name}: TIFF {sw}×{sh} / JPG {bw}×{bh}")
             self.files = valid
             self.pairs = pairs
+            self.pairing_signature = self._base_selection_signature()
             self._update_blend_preview_label()
             self.tree.delete(*self.tree.get_children())
             for index, path in enumerate(valid):
@@ -2272,8 +2632,29 @@ F1：显示本快捷键表""")
             if mismatched:
                 message += f"；尺寸不符 {len(mismatched)} 张，已跳过"
             self.status.set(message)
+            if valid:
+                self._set_paths_panel_visible(False)
+                if (
+                    combined and getattr(self, "view_mode", None) is not None
+                    and self.view_mode.get() in {"blend", "labeled"}
+                ):
+                    self.after_idle(self._request_shared_base_preview)
+            if previous_current in valid:
+                selected_index = valid.index(previous_current)
+                self.tree.selection_set(str(selected_index))
+                self.tree.see(str(selected_index))
+                if reload_current:
+                    self.load_selected()
+            elif previous_current is not None:
+                self.current_path = None
+                self.preview_source = None
+                self.preview_base = None
+            return True
         except Exception as exc:
+            self.pairs = {}
+            self.pairing_signature = None
             messagebox.showerror(APP_NAME, str(exc))
+            return False
 
     def load_selected(self) -> None:
         selection = self.tree.selection()
@@ -2281,15 +2662,23 @@ F1：显示本快捷键表""")
             return
         path = self.files[int(selection[0])]
         image_path = self._effective_source_path(path)
-        mode = "原始状态" if str(path) in self.use_original_sources else "自动对齐"
+        mode = "查看原始图" if str(path) in self.use_original_sources else "查看自动对齐图"
         self.status.set(f"正在加载 {path.name}（{mode}）…")
-        self._run_worker(self._load_preview_worker, path, image_path, self.pairs[str(path)])
+        self._run_worker(
+            self._load_preview_worker, path, image_path, path,
+            self.original_sources.get(str(path), path), self.pairs[str(path)],
+            self.pairing_signature,
+        )
 
     def _effective_source_path(self, path: Path) -> Path:
         key = str(path)
         if key in self.use_original_sources:
             return self.original_sources.get(key, path)
         return path
+
+    def _current_source_mode(self, path: Path | None = None) -> str:
+        target = path or self.current_path
+        return "original" if target is not None and str(target) in self.use_original_sources else "aligned"
 
     def toggle_original_state(self) -> None:
         selection = self.tree.selection()
@@ -2304,13 +2693,13 @@ F1：显示本快捷键表""")
             return
         if key in self.use_original_sources:
             self.use_original_sources.remove(key)
-            mode = "自动对齐"
+            mode = "自动对齐图"
         else:
             self.use_original_sources.add(key)
-            mode = "原始状态"
+            mode = "原始图"
         status = self.alignment_statuses.get(key, "")
         review = "[需复查] " if "需复查" in status else ""
-        self.tree.item(str(index), text=f"[{mode}] {review}{path.name}")
+        self.tree.item(str(index), text=f"[查看{mode}] {review}{path.name}")
         self._schedule_autosave()
         self.load_selected()
 
@@ -2413,15 +2802,23 @@ F1：显示本快捷键表""")
             base_path = self.pairs.get(key)
             if base_path is None:
                 continue
-            source = to_uint16(read_image(self._effective_source_path(source_path)))
             base = to_uint16(read_image(base_path))
-            if source.shape[:2] != base.shape[:2]:
-                continue
+            source_cache: dict[str, np.ndarray] = {}
             for index, expected_points in entries:
                 values = self.strokes.get(key, [])
                 if not (0 <= index < len(values)):
                     continue
                 snapshot = replace(values[index], points=expected_points.copy())
+                mode = normalized_source_mode(snapshot)
+                if mode not in source_cache:
+                    selected_path = (
+                        self.original_sources.get(key, source_path)
+                        if mode == "original" else source_path
+                    )
+                    source_cache[mode] = to_uint16(read_image(selected_path))
+                source = source_cache[mode]
+                if source.shape[:2] != base.shape[:2]:
+                    continue
                 parameters = analyze_meteor_blend_parameters(source, base, snapshot, strength)
                 results.append((key, index, expected_points, parameters))
                 completed += 1
@@ -2585,7 +2982,11 @@ F1：显示本快捷键表""")
         self.progress["value"] = 0
         self.status.set("正在用内置 AI 自动检测并排序流星候选…")
         read_paths = {str(path): self._effective_source_path(path) for path in self.files}
-        self._run_worker(self._auto_detect_worker, self.files.copy(), self.pairs.copy(), read_paths)
+        source_modes = {str(path): self._current_source_mode(path) for path in self.files}
+        self._run_worker(
+            self._auto_detect_worker, self.files.copy(), self.pairs.copy(), read_paths,
+            source_modes,
+        )
 
     def detect_current_candidates(self) -> None:
         if not self.current_path or str(self.current_path) not in self.pairs:
@@ -2595,10 +2996,12 @@ F1：显示本快捷键表""")
         self.progress["value"] = 10
         self._run_worker(
             self._candidate_worker, self.current_path, self._effective_source_path(self.current_path),
-            self.pairs[str(self.current_path)],
+            self.pairs[str(self.current_path)], self._current_source_mode(self.current_path),
         )
 
-    def _candidate_worker(self, path: Path, image_path: Path, base_path: Path):
+    def _candidate_worker(
+        self, path: Path, image_path: Path, base_path: Path, source_mode: str,
+    ):
         base_preview, _ = detection_preview(read_image(base_path))
         source_preview, source_scale = detection_preview(read_image(image_path))
         if source_preview.shape != base_preview.shape:
@@ -2621,9 +3024,12 @@ F1：显示本快捷键表""")
             preview_width = float(np.clip(core_length * 0.12, 10.0, 28.0))
             full_width = int(np.clip(round(preview_width / max(0.001, source_scale)), 36, 140))
             full_feather = int(np.clip(round(preview_width * 0.70 / max(0.001, source_scale)), 20, 100))
-            candidates.append(Stroke(points, full_width, full_feather, False, False, int(score)))
+            candidates.append(Stroke(
+                points, full_width, full_feather, False, False, int(score),
+                source_mode=source_mode,
+            ))
         candidates.sort(key=lambda item: item.auto_score or 0, reverse=True)
-        return "candidates", path, candidates, planes
+        return "candidates", path, candidates, planes, source_mode
 
     def _candidate_threshold_changed(self, _value=None) -> None:
         if self.setting_candidate_threshold or not self.current_path:
@@ -2646,7 +3052,9 @@ F1：显示本快捷键表""")
             stroke for stroke in self.candidates.get(key, [])
             if (stroke.locked or (stroke.auto_score or 0) >= threshold)
             and not any(
-                kept.auto_score == stroke.auto_score and kept.points == stroke.points for kept in retained
+                kept.auto_score == stroke.auto_score and kept.points == stroke.points
+                and normalized_source_mode(kept) == normalized_source_mode(stroke)
+                for kept in retained
             )
         ]
         # Never reorder manual paint/eraser history. Its order is semantic:
@@ -2669,7 +3077,10 @@ F1：显示本快捷键表""")
         locked = sum(item.locked for item in self.strokes.get(key, []))
         self.candidate_summary.set(f"候选 {len(pool)} 条，当前加入 {visible} 条，锁定 {locked} 条")
 
-    def _auto_detect_worker(self, files: list[Path], pairs: dict[str, Path], read_paths: dict[str, Path]):
+    def _auto_detect_worker(
+        self, files: list[Path], pairs: dict[str, Path], read_paths: dict[str, Path],
+        source_modes: dict[str, str],
+    ):
         found: dict[str, list[Stroke]] = {}
         plane_count = 0
         for index, path in enumerate(files, start=1):
@@ -2699,25 +3110,68 @@ F1：显示本快捷键表""")
                 full_width = int(np.clip(round(preview_width / max(0.001, source_scale)), 36, 140))
                 full_feather = int(np.clip(round(preview_width * 0.70 / max(0.001, source_scale)), 20, 100))
                 strokes.append(Stroke(
-                    points, width=full_width, feather=full_feather, auto_score=int(score)
+                    points, width=full_width, feather=full_feather, auto_score=int(score),
+                    source_mode=source_modes.get(str(path), "aligned"),
                 ))
             if strokes:
                 found[str(path)] = strokes
             self.work_queue.put(("progress", index / len(files) * 100, f"自动检测 {index}/{len(files)}：{path.name}"))
-        return "autodetected", found, plane_count
+        return "autodetected", found, plane_count, source_modes
 
-    def _load_preview_worker(self, path: Path, image_path: Path, base_path: Path):
+    def _load_preview_worker(
+        self, path: Path, image_path: Path, aligned_path: Path,
+        original_path: Path, base_path: Path,
+        pairing_signature: str | None = None,
+    ):
         rgb16 = to_uint16(read_image(image_path))
         height, width = rgb16.shape[:2]
         scale = min(1.0, 1800 / max(width, height))
-        preview = cv2.resize(rgb16, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        preview_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        preview = cv2.resize(rgb16, preview_size, interpolation=cv2.INTER_AREA)
         source_preview = np.right_shift(preview, 8).astype(np.uint8)
+        aligned16 = to_uint16(read_image(aligned_path))
+        original16 = to_uint16(read_image(original_path))
+        if aligned16.shape[:2] != (height, width) or original16.shape[:2] != (height, width):
+            raise ValueError(f"自动对齐图与原始图尺寸不一致：{path.name}")
+        aligned_preview = np.right_shift(
+            cv2.resize(aligned16, preview_size, interpolation=cv2.INTER_AREA), 8
+        ).astype(np.uint8)
+        original_preview = np.right_shift(
+            cv2.resize(original16, preview_size, interpolation=cv2.INTER_AREA), 8
+        ).astype(np.uint8)
         base16 = to_uint16(read_image(base_path))
         if base16.shape[:2] != (height, width):
             raise ValueError(f"尺寸不一致：{path.name} / {base_path.name}")
         base_preview = cv2.resize(base16, (source_preview.shape[1], source_preview.shape[0]), interpolation=cv2.INTER_AREA)
         base_preview = np.right_shift(base_preview, 8).astype(np.uint8)
-        return "preview", path, source_preview, base_preview, (width, height)
+        return (
+            "preview", path, source_preview, aligned_preview, original_preview,
+            base_preview, (width, height),
+            base_path, pairing_signature,
+        )
+
+    def _request_shared_base_preview(self) -> None:
+        """Prepare a shared-base composite without requiring a selected source image."""
+        if not self._uses_shared_base() or self.preview_base is not None or not self.pairs:
+            return
+        signature = self.pairing_signature
+        if self.shared_base_loading_signature == signature:
+            return
+        base_path = next(iter(self.pairs.values()))
+        self.shared_base_loading_signature = signature
+        self.status.set("正在准备总融合预览…")
+        self._run_worker(self._load_shared_base_preview_worker, base_path, signature)
+
+    def _load_shared_base_preview_worker(
+        self, base_path: Path, pairing_signature: str | None,
+    ):
+        base16 = to_uint16(read_image(base_path))
+        height, width = base16.shape[:2]
+        scale = min(1.0, 1800 / max(width, height))
+        preview_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        preview = cv2.resize(base16, preview_size, interpolation=cv2.INTER_AREA)
+        base_preview = np.right_shift(preview, 8).astype(np.uint8)
+        return "shared_base_preview", base_preview, (width, height), base_path, pairing_signature
 
     def _preview_mask(self) -> np.ndarray:
         if self.preview_source is None or not self.current_path:
@@ -2737,12 +3191,15 @@ F1：显示本快捷键表""")
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness,
                 (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale)))),
+                source_mode=item.source_mode,
             ))
         live_stroke = self.live_erase_stroke
         if live_stroke is not None:
             scaled.append(self._preview_clone(live_stroke, self.current_dims[0]))
+        current_mode = self._current_source_mode()
+        visible = [item for item in scaled if normalized_source_mode(item) == current_mode]
         _composed, mask = compose_meteor_objects(
-            self.preview_source, self.preview_base, scaled,
+            self.preview_source, self.preview_base, visible,
             bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
             float(self.curve_shadows.get()), float(self.curve_highlights.get()),
             self.blend_mode.get(), bool(self.default_preserve_brightness.get()),
@@ -2758,6 +3215,7 @@ F1：显示本快捷键表""")
         }
         payload = {
             "base": self.base_dir.get(),
+            "pairs": {key: str(value) for key, value in sorted(self.pairs.items())},
             "blend_mode": self.blend_mode.get(),
             "strokes": selected,
             "adjustments": self.image_adjustments,
@@ -2784,7 +3242,8 @@ F1：显示本快捷键表""")
         signature = self._exact_preview_state_signature()
         marked = {
             Path(key): [replace(item, points=item.points.copy()) for item in values]
-            for key, values in self.strokes.items() if values
+            for key, values in self.strokes.items()
+            if key in self.pairs and values
         }
         self.exact_preview_loading_signature = signature
         self.exact_preview_status.set("导出级预览：计算中…")
@@ -2794,15 +3253,45 @@ F1：显示本快捷键表""")
             self._exact_preview_worker, signature, marked, self.pairs.copy(),
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(), self.blend_mode.get(),
-            {str(path): self._effective_source_path(path) for path in marked},
+            {str(path): self.original_sources.get(str(path), path) for path in marked},
             self.output_mode.get(), Path(self.current_path),
             self.base_exposure_tenths.get() / 10.0, self.preview_base.shape[:2],
         )
 
+    def open_exact_preview(self) -> None:
+        if self.exact_preview_full_rgb is None or self.exact_labeled_preview_full_rgb is None:
+            messagebox.showinfo(APP_NAME, "尚未生成可放大的导出级预览，请先点击“生成并打开”。")
+            return
+        if self.exact_preview_signature != self._exact_preview_state_signature():
+            messagebox.showwarning(APP_NAME, "蒙版或融合参数已经变化，请重新生成导出级精确预览。")
+            return
+        if self.exact_preview_window is not None:
+            try:
+                if self.exact_preview_window.winfo_exists():
+                    self.exact_preview_window.deiconify()
+                    self.exact_preview_window.lift()
+                    self.exact_preview_window.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        viewer = ExactPreviewViewer(
+            self, self.exact_preview_full_rgb, self.exact_labeled_preview_full_rgb,
+            self.view_mode.get(),
+        )
+        self.exact_preview_window = viewer
+
+        def clear_window(event=None) -> None:
+            if event is None or event.widget is viewer:
+                self.exact_preview_window = None
+
+        viewer.bind("<Destroy>", clear_window, add=True)
+        viewer.lift()
+        viewer.focus_force()
+
     def _exact_preview_worker(
         self, signature: str, marked: dict[Path, list[Stroke]], pairs: dict[str, Path],
         adjustments: dict[str, dict], adjustment_defaults: dict, blend_mode: str,
-        read_paths: dict[str, Path], output_mode: str, current_path: Path,
+        original_paths: dict[str, Path], output_mode: str, current_path: Path,
         base_exposure_ev: float, preview_shape: tuple[int, int],
     ):
         selected = list(marked.items()) if output_mode == "combined" else [
@@ -2826,13 +3315,14 @@ F1：显示本快捷键表""")
                 height, width = result.shape[:2]
             if not strokes:
                 continue
-            actual_path = read_paths.get(str(source_path), source_path)
-            source = to_uint16(read_image(actual_path))
-            if source.shape[:2] != (height, width):
+            aligned_source = to_uint16(read_image(source_path))
+            original_path = original_paths.get(str(source_path), source_path)
+            original_source = to_uint16(read_image(original_path))
+            if aligned_source.shape[:2] != (height, width) or original_source.shape[:2] != (height, width):
                 raise ValueError(f"尺寸不一致：{source_path.name}")
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
-            result, mask = compose_meteor_objects(
-                source, result, strokes,
+            result, mask = compose_meteor_sources(
+                aligned_source, original_source, result, strokes,
                 bool(adjustment["match_exposure"]), bool(adjustment["curve_enabled"]),
                 float(adjustment["curve_shadows"]), float(adjustment["curve_highlights"]),
                 blend_mode, bool(adjustment.get("preserve_brightness", True)),
@@ -2844,7 +3334,7 @@ F1：显示本快捷键表""")
                 included += 1
                 annotations.extend(meteor_source_annotations(
                     source_path.stem, strokes, width, height,
-                    Path(actual_path) != Path(source_path), mask,
+                    False, mask,
                 ))
             self.work_queue.put((
                 "progress", index / max(1, len(selected)) * 90,
@@ -2853,10 +3343,15 @@ F1：显示本快捷键表""")
         result = adjust_composite_base_exposure(result, clean_base, base_exposure_ev)
         labeled, _records = annotate_meteor_sources(result, annotations)
         preview_h, preview_w = preview_shape
+        full_rgb = np.right_shift(result, 8).astype(np.uint8)
+        full_labeled_rgb = labeled.astype(np.uint8, copy=False)
         resized16 = cv2.resize(result, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
         preview_rgb = np.right_shift(resized16, 8).astype(np.uint8)
         labeled_rgb = cv2.resize(labeled, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
-        return "exact_preview", signature, preview_rgb, labeled_rgb, included, (width, height)
+        return (
+            "exact_preview", signature, preview_rgb, labeled_rgb,
+            full_rgb, full_labeled_rgb, included, (width, height),
+        )
 
     def _request_global_preview(self, signature: str) -> None:
         # Coalesce rapid slider/point edits before starting an expensive worker.
@@ -2892,8 +3387,10 @@ F1：显示本快捷键表""")
                 item.match_exposure_override, item.blend_mode_override,
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness, item.auto_feather,
+                source_mode=item.source_mode,
             ) for item in values]
-            for key, values in self.strokes.items() if values
+            for key, values in self.strokes.items()
+            if key in self.pairs and values
         }
         self.global_preview_loading_signature = signature
         self.status.set(f"正在生成总融合预览：合成 {len(marked)} 张已标记图片…")
@@ -2901,13 +3398,13 @@ F1：显示本快捷键表""")
             self._global_preview_worker, signature, self.preview_base.copy(), marked,
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(), self.blend_mode.get(),
-            {str(path): self._effective_source_path(path) for path in marked},
+            {str(path): self.original_sources.get(str(path), path) for path in marked},
         )
 
     def _global_preview_worker(
         self, signature: str, base_preview: np.ndarray,
         marked: dict[Path, list[Stroke]], adjustments: dict[str, dict],
-        adjustment_defaults: dict, blend_mode: str, read_paths: dict[str, Path],
+        adjustment_defaults: dict, blend_mode: str, original_paths: dict[str, Path],
     ):
         result = base_preview.copy()
         preview_height, preview_width = result.shape[:2]
@@ -2915,14 +3412,18 @@ F1：显示本快捷键表""")
         included = 0
         preview_annotations = []
         for index, (source_path, strokes) in enumerate(marked.items(), start=1):
-            actual_path = read_paths.get(str(source_path), source_path)
-            source = read_image(actual_path)
-            full_height, full_width = source.shape[:2]
-            source16 = to_uint16(source)
-            resized = cv2.resize(
-                source16, (preview_width, preview_height), interpolation=cv2.INTER_AREA
-            )
-            source_preview = np.right_shift(resized, 8).astype(np.uint8)
+            aligned = to_uint16(read_image(source_path))
+            original_path = original_paths.get(str(source_path), source_path)
+            original = to_uint16(read_image(original_path))
+            full_height, full_width = aligned.shape[:2]
+            if original.shape[:2] != (full_height, full_width):
+                raise ValueError(f"自动对齐图与原始图尺寸不一致：{source_path.name}")
+            aligned_preview = np.right_shift(cv2.resize(
+                aligned, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+            ), 8).astype(np.uint8)
+            original_preview = np.right_shift(cv2.resize(
+                original, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+            ), 8).astype(np.uint8)
             scale_to_preview = preview_width / max(1, full_width)
             scaled = [Stroke(
                 item.points, max(1, int(round(item.width * scale_to_preview))),
@@ -2936,10 +3437,11 @@ F1：显示本快捷键表""")
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness,
                 (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale_to_preview)))),
+                source_mode=item.source_mode,
             ) for item in strokes]
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
-            result, mask = compose_meteor_objects(
-                source_preview, result, scaled,
+            result, mask = compose_meteor_sources(
+                aligned_preview, original_preview, result, scaled,
                 bool(adjustment["match_exposure"]), bool(adjustment["curve_enabled"]),
                 float(adjustment["curve_shadows"]), float(adjustment["curve_highlights"]),
                 blend_mode, bool(adjustment.get("preserve_brightness", True)),
@@ -2951,7 +3453,7 @@ F1：显示本快捷键表""")
                 included += 1
                 preview_annotations.extend(meteor_source_annotations(
                     source_path.stem, scaled, preview_width, preview_height,
-                    Path(actual_path) != Path(source_path), mask,
+                    False, mask,
                 ))
             self.work_queue.put((
                 "progress", index / total * 100,
@@ -2961,9 +3463,14 @@ F1：显示本快捷键表""")
         return "global_preview", signature, result, labeled, included
 
     def _render_preview(self) -> None:
-        if self.preview_source is None or self.preview_base is None:
+        mode = self.view_mode.get()
+        shared_composite = mode in {"blend", "labeled"} and self._uses_shared_base()
+        if self.preview_base is None or (self.preview_source is None and not shared_composite):
             return
-        height, width = self.preview_source.shape[:2]
+        height, width = (
+            self.preview_source.shape[:2]
+            if self.preview_source is not None else self.preview_base.shape[:2]
+        )
         scale_to_preview = width / max(1, self.current_dims[0])
         scaled_strokes = [Stroke(
             item.points, max(1, int(round(item.width * scale_to_preview))),
@@ -2976,6 +3483,7 @@ F1：显示本快捷键表""")
             item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
             item.auto_cleanup, item.auto_brightness,
             (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale_to_preview)))),
+            source_mode=item.source_mode,
         ) for item in self.strokes.get(str(self.current_path), [])]
         preview_mask_strokes = scaled_strokes
         live_stroke = self.live_erase_stroke
@@ -2983,9 +3491,9 @@ F1：显示本快捷键表""")
             preview_mask_strokes = [
                 *scaled_strokes, self._preview_clone(live_stroke, self.current_dims[0])
             ]
-        mode = self.view_mode.get()
         composite_mode = mode in {"blend", "labeled"}
         mask_edit_mode = mode == "source"
+        self.preview_quality_status.set("当前画布：快速预览")
         if mode == "base":
             shown = adjust_composite_base_exposure(
                 self.preview_base, self.preview_base, self.base_exposure_tenths.get() / 10.0
@@ -2999,6 +3507,7 @@ F1：显示本快捷键表""")
                 self.exact_preview_status.set("导出级预览：参数已变化，请重新生成")
             if self.exact_preview_signature == exact_signature and exact_cached is not None:
                 shown = exact_cached.copy()
+                self.preview_quality_status.set("当前画布：导出级结果（缩放显示）")
             elif self._uses_shared_base():
                 signature = self._global_preview_state_signature()
                 cached = (
@@ -3014,8 +3523,10 @@ F1：显示本快捷键表""")
                     shown = cached.copy() if cached is not None else self.preview_base.copy()
                     self._request_global_preview(signature)
             else:
-                shown, current_mask = compose_meteor_objects(
-                    self.preview_source, self.preview_base, scaled_strokes,
+                shown, current_mask = compose_meteor_sources(
+                    self.preview_aligned_source if self.preview_aligned_source is not None else self.preview_source,
+                    self.preview_original_source if self.preview_original_source is not None else self.preview_source,
+                    self.preview_base, scaled_strokes,
                     bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
                     float(self.curve_shadows.get()), float(self.curve_highlights.get()),
                     self.blend_mode.get(), bool(self.default_preserve_brightness.get()),
@@ -3041,6 +3552,8 @@ F1：显示本快捷键表""")
             if any(stroke_is_transformed(item) for item in scaled_strokes if not item.erase):
                 reference_strokes = []
                 for item in scaled_strokes:
+                    if normalized_source_mode(item) != self._current_source_mode():
+                        continue
                     preview_item = replace(item, points=item.points.copy())
                     preview_item.brightness_override = None
                     preview_item.background_cleanup_override = None
@@ -3055,8 +3568,13 @@ F1：显示本快捷键表""")
                 )
         mask = np.zeros(shown.shape[:2], dtype=np.float32)
         if mask_edit_mode:
+            current_mode = self._current_source_mode()
+            visible_mask_strokes = [
+                item for item in preview_mask_strokes
+                if normalized_source_mode(item) == current_mode
+            ]
             _composed, mask = compose_meteor_objects(
-                self.preview_source, self.preview_base, preview_mask_strokes,
+                self.preview_source, self.preview_base, visible_mask_strokes,
                 bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
                 float(self.curve_shadows.get()), float(self.curve_highlights.get()),
                 self.blend_mode.get(), bool(self.default_preserve_brightness.get()),
@@ -3070,6 +3588,142 @@ F1：显示本快捷键表""")
             shown = np.clip(shown.astype(np.float32) * (1.0 - opacity) + red.astype(np.float32) * opacity, 0, 255).astype(np.uint8)
         self._present_preview_image(shown, composite_mode, mask_edit_mode)
 
+    def _canvas_fit_scale(self) -> float:
+        if self.preview_rgb is None:
+            return 1.0
+        height, width = self.preview_rgb.shape[:2]
+        return min(
+            max(1, self.canvas.winfo_width()) / max(1, width),
+            max(1, self.canvas.winfo_height()) / max(1, height),
+        )
+
+    def _canvas_view_origin(self) -> tuple[float, float]:
+        return (
+            self.canvas_center_x - self.canvas.winfo_width() / (2.0 * self.canvas_zoom),
+            self.canvas_center_y - self.canvas.winfo_height() / (2.0 * self.canvas_zoom),
+        )
+
+    def _clamp_canvas_center(self) -> None:
+        if self.preview_rgb is None:
+            return
+        height, width = self.preview_rgb.shape[:2]
+        half_w = self.canvas.winfo_width() / (2.0 * self.canvas_zoom)
+        half_h = self.canvas.winfo_height() / (2.0 * self.canvas_zoom)
+        self.canvas_center_x = (
+            width / 2.0 if half_w >= width / 2.0
+            else float(np.clip(self.canvas_center_x, half_w, width - half_w))
+        )
+        self.canvas_center_y = (
+            height / 2.0 if half_h >= height / 2.0
+            else float(np.clip(self.canvas_center_y, half_h, height - half_h))
+        )
+
+    def _redraw_canvas_only(self) -> None:
+        if self.preview_rgb is None:
+            return
+        mode = self.view_mode.get()
+        self._present_preview_image(
+            self.preview_rgb, mode in {"blend", "labeled"}, mode == "source"
+        )
+
+    def _canvas_fit(self) -> None:
+        if self.preview_rgb is None:
+            return
+        height, width = self.preview_rgb.shape[:2]
+        self.canvas_center_x = width / 2.0
+        self.canvas_center_y = height / 2.0
+        self.canvas_zoom = self._canvas_fit_scale()
+        self.canvas_fit_mode = True
+        self._redraw_canvas_only()
+
+    def _canvas_actual_size(self) -> None:
+        if self.preview_rgb is None:
+            return
+        self.canvas_zoom = 1.0
+        self.canvas_fit_mode = False
+        self._clamp_canvas_center()
+        self._redraw_canvas_only()
+
+    def _canvas_zoom_by(self, factor: float, anchor: tuple[int, int] | None = None) -> None:
+        if self.preview_rgb is None:
+            return
+        canvas_w = max(1, self.canvas.winfo_width())
+        canvas_h = max(1, self.canvas.winfo_height())
+        anchor_x, anchor_y = anchor or (canvas_w // 2, canvas_h // 2)
+        origin_x, origin_y = self._canvas_view_origin()
+        image_x = origin_x + anchor_x / self.canvas_zoom
+        image_y = origin_y + anchor_y / self.canvas_zoom
+        minimum = min(1.0, self._canvas_fit_scale())
+        self.canvas_zoom = float(np.clip(self.canvas_zoom * factor, minimum, 8.0))
+        new_origin_x = image_x - anchor_x / self.canvas_zoom
+        new_origin_y = image_y - anchor_y / self.canvas_zoom
+        self.canvas_center_x = new_origin_x + canvas_w / (2.0 * self.canvas_zoom)
+        self.canvas_center_y = new_origin_y + canvas_h / (2.0 * self.canvas_zoom)
+        self.canvas_fit_mode = False
+        self._clamp_canvas_center()
+        self._redraw_canvas_only()
+
+    def _canvas_wheel(self, event) -> str:
+        return self._canvas_wheel_steps(event, 1 if event.delta > 0 else -1)
+
+    def _canvas_wheel_steps(self, event, steps: int) -> str:
+        self._canvas_zoom_by(1.25 ** steps, (int(event.x), int(event.y)))
+        return "break"
+
+    def _canvas_pan_start_event(self, event, with_left: bool = False) -> str:
+        if self.preview_rgb is None:
+            return "break"
+        self.canvas_pan_start = (
+            int(event.x), int(event.y), self.canvas_center_x, self.canvas_center_y
+        )
+        self.canvas_pan_with_left = with_left
+        self.canvas.configure(cursor="fleur")
+        return "break"
+
+    def _canvas_pan_move_event(self, event) -> str:
+        if self.canvas_pan_start is None:
+            return "break"
+        start_x, start_y, center_x, center_y = self.canvas_pan_start
+        self.canvas_center_x = center_x - (event.x - start_x) / self.canvas_zoom
+        self.canvas_center_y = center_y - (event.y - start_y) / self.canvas_zoom
+        self.canvas_fit_mode = False
+        self._clamp_canvas_center()
+        self._redraw_canvas_only()
+        return "break"
+
+    def _canvas_pan_end_event(self, _event=None) -> str:
+        self.canvas_pan_start = None
+        self.canvas_pan_with_left = False
+        self._update_brush_cursor()
+        return "break"
+
+    def _space_pan_press(self, _event=None) -> str | None:
+        focused = self.focus_get()
+        if focused is not None and focused.winfo_class() in {"Entry", "TEntry", "Text", "Spinbox", "TSpinbox"}:
+            return None
+        hovered = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+        if focused is not self.canvas and hovered is not self.canvas:
+            return None
+        self.space_pan_held = True
+        if hovered is self.canvas:
+            self.canvas.configure(cursor="fleur")
+        return "break"
+
+    def _space_pan_release(self, _event=None) -> str | None:
+        if not self.space_pan_held:
+            return None
+        self.space_pan_held = False
+        if self.canvas_pan_with_left:
+            self._canvas_pan_end_event()
+        return "break"
+
+    def _canvas_configure(self, _event=None) -> None:
+        if self.preview_rgb is None:
+            return
+        if not self.canvas_fit_mode:
+            self._clamp_canvas_center()
+        self._redraw_canvas_only()
+
     def _present_preview_image(
         self, shown: np.ndarray, composite_mode: bool, mask_edit_mode: bool = False
     ) -> None:
@@ -3077,11 +3731,37 @@ F1：显示本快捷键表""")
         canvas_w = max(10, self.canvas.winfo_width())
         canvas_h = max(10, self.canvas.winfo_height())
         h, w = self.preview_rgb.shape[:2]
-        scale = min(canvas_w / w, canvas_h / h)
-        dw, dh = max(1, int(w * scale)), max(1, int(h * scale))
-        image = Image.fromarray(self.preview_rgb).resize((dw, dh), Image.Resampling.LANCZOS)
-        x0, y0 = (canvas_w - dw) // 2, (canvas_h - dh) // 2
-        self.display_box = (x0, y0, x0 + dw, y0 + dh)
+        if self.canvas_image_shape != (h, w):
+            self.canvas_image_shape = (h, w)
+            self.canvas_center_x = w / 2.0
+            self.canvas_center_y = h / 2.0
+            self.canvas_fit_mode = True
+        if self.canvas_fit_mode:
+            self.canvas_zoom = self._canvas_fit_scale()
+            self.canvas_center_x = w / 2.0
+            self.canvas_center_y = h / 2.0
+        self._clamp_canvas_center()
+        origin_x, origin_y = self._canvas_view_origin()
+        crop_x0 = max(0, int(np.floor(origin_x)))
+        crop_y0 = max(0, int(np.floor(origin_y)))
+        crop_x1 = min(w, int(np.ceil(origin_x + canvas_w / self.canvas_zoom)))
+        crop_y1 = min(h, int(np.ceil(origin_y + canvas_h / self.canvas_zoom)))
+        if crop_x1 <= crop_x0 or crop_y1 <= crop_y0:
+            return
+        image = Image.fromarray(self.preview_rgb[crop_y0:crop_y1, crop_x0:crop_x1])
+        dw = max(1, int(round((crop_x1 - crop_x0) * self.canvas_zoom)))
+        dh = max(1, int(round((crop_y1 - crop_y0) * self.canvas_zoom)))
+        if image.size != (dw, dh):
+            resample = Image.Resampling.LANCZOS if self.canvas_zoom < 1.0 else Image.Resampling.BICUBIC
+            image = image.resize((dw, dh), resample)
+        draw_x = int(round((crop_x0 - origin_x) * self.canvas_zoom))
+        draw_y = int(round((crop_y0 - origin_y) * self.canvas_zoom))
+        full_x0 = draw_x - crop_x0 * self.canvas_zoom
+        full_y0 = draw_y - crop_y0 * self.canvas_zoom
+        self.display_box = (
+            full_x0, full_y0, full_x0 + w * self.canvas_zoom,
+            full_y0 + h * self.canvas_zoom,
+        )
         reusable = False
         if (
             self.preview_photo is not None
@@ -3099,14 +3779,15 @@ F1：显示本快捷键表""")
                 if item != self.preview_image_item:
                     self.canvas.delete(item)
             self.preview_photo.paste(image)
-            self.canvas.coords(self.preview_image_item, x0, y0)
+            self.canvas.coords(self.preview_image_item, draw_x, draw_y)
         else:
             self.canvas.delete("all")
             self.preview_photo = ImageTk.PhotoImage(image)
             self.preview_image_item = self.canvas.create_image(
-                x0, y0, anchor="nw", image=self.preview_photo, tags=("preview_image",)
+                draw_x, draw_y, anchor="nw", image=self.preview_photo, tags=("preview_image",)
             )
             self.preview_display_size = (dw, dh)
+        self.canvas_zoom_label.set(f"{self.canvas_zoom * 100:.0f}%")
         self.context_highlight = None
         self.hover_candidate_items = []
         self.hover_candidate_index = None
@@ -3251,6 +3932,16 @@ F1：显示本快捷键表""")
         if self.active_points:
             self._clear_candidate_hover()
             return
+        now = time.monotonic()
+        previous = self.last_candidate_hover_position
+        if (
+            previous is not None
+            and now - self.last_candidate_hover_time < 0.03
+            and np.hypot(event.x - previous[0], event.y - previous[1]) < 5.0
+        ):
+            return
+        self.last_candidate_hover_time = now
+        self.last_candidate_hover_position = (float(event.x), float(event.y))
         self._update_candidate_hover(event.x, event.y)
 
     def _cursor_leave(self, _event=None) -> None:
@@ -3523,6 +4214,7 @@ F1：显示本快捷键表""")
                 self.selected_override_enabled.set(False)
                 self._set_selected_controls_state(False)
                 self.reset_selected_button.configure(state="disabled")
+                self.selected_source_mode.set("自动对齐素材")
                 return
             key, index = self.selected_object
             image_values = {**self.adjustment_defaults, **self.image_adjustments.get(key, {})}
@@ -3536,7 +4228,11 @@ F1：显示本快捷键表""")
                 if not item.erase and item.points
             )
             transform_suffix = " · 已人工变换" if stroke_is_transformed(stroke) else ""
-            self.selected_object_summary.set(f"{Path(key).stem} · 流星 {ordinal}{transform_suffix}")
+            source_suffix = " · 原始素材" if normalized_source_mode(stroke) == "original" else " · 自动对齐素材"
+            self.selected_object_summary.set(f"{Path(key).stem} · 流星 {ordinal}{source_suffix}{transform_suffix}")
+            self.selected_source_mode.set(
+                "原始素材" if normalized_source_mode(stroke) == "original" else "自动对齐素材"
+            )
             if not stroke.auto_blend_enabled:
                 self.selected_auto_summary.set("自动参数：已关闭（使用原始/手动融合）")
             elif stroke.auto_black_point is None:
@@ -3577,6 +4273,38 @@ F1：显示本快捷键表""")
             self._set_selected_controls_state(True, independent)
         finally:
             self.loading_selected_adjustments = False
+
+    def _selected_source_mode_changed(self, _event=None) -> None:
+        if self.loading_selected_adjustments:
+            return
+        mode = "original" if self.selected_source_mode.get() == "原始素材" else "aligned"
+        self._set_selected_source_mode(mode)
+
+    def _set_selected_source_mode(self, mode: str) -> None:
+        stroke = self._selected_stroke()
+        if stroke is None or self.selected_object is None:
+            return
+        key, index = self.selected_object
+        mode = "original" if mode == "original" else "aligned"
+        if mode == "original" and key not in self.original_sources:
+            self.status.set("这张图片没有独立的原始素材；当前图层本身就是原始状态")
+            self.loading_selected_adjustments = True
+            self.selected_source_mode.set("自动对齐素材")
+            self.loading_selected_adjustments = False
+            return
+        if normalized_source_mode(stroke) == mode:
+            return
+        before = replace(stroke, points=stroke.points.copy())
+        stroke.source_mode = mode
+        after = replace(stroke, points=stroke.points.copy())
+        self._record_edit(key, ("transform", index, (before, after)))
+        self._invalidate_global_preview()
+        self._update_tree_status_for_key(key)
+        self._load_selected_object_adjustments()
+        self._render_preview()
+        self._schedule_autosave()
+        label = "原始素材" if mode == "original" else "自动对齐素材"
+        self.status.set(f"当前流星已切换为{label}；其他流星保持原来的来源不变")
 
     def _selected_override_changed(self, *_args) -> None:
         if self.loading_selected_adjustments:
@@ -3752,6 +4480,8 @@ F1：显示本快捷键表""")
             self.status.set("单击一颗流星即可选中；选中后可拖动或使用变换手柄")
             return "break"
         self.selected_object = reference
+        if hasattr(self, "control_notebook"):
+            self.control_notebook.select(self.selected_tools_tab)
         stroke = self._selected_stroke()
         self._draw_selected_object_overlay()
         if stroke is None:
@@ -3776,6 +4506,7 @@ F1：显示本快捷键表""")
             stroke.auto_blend_enabled, stroke.auto_strength, stroke.auto_black_point,
             stroke.auto_cleanup, stroke.auto_brightness,
             (None if stroke.auto_feather is None else max(1, int(round(stroke.auto_feather * scale)))),
+            source_mode=stroke.source_mode,
         )
 
     def _object_composite_settings(self, key: str) -> tuple:
@@ -3797,18 +4528,41 @@ F1：显示本快捷键表""")
             return
         key, selected_index = reference
         try:
+            selected_mode = normalized_source_mode(original)
             if self.current_path is not None and key == str(self.current_path):
-                source_preview = self.preview_source.copy()
+                selected_preview = (
+                    self.preview_original_source if selected_mode == "original"
+                    else self.preview_aligned_source
+                )
+                source_preview = (
+                    selected_preview.copy() if selected_preview is not None
+                    else self.preview_source.copy()
+                )
+                aligned_preview = (
+                    self.preview_aligned_source if self.preview_aligned_source is not None
+                    else self.preview_source
+                )
+                original_preview = (
+                    self.preview_original_source if self.preview_original_source is not None
+                    else self.preview_source
+                )
                 full_width = self.current_dims[0]
             else:
-                source_full = read_image(self._effective_source_path(Path(key)))
+                aligned_full = read_image(Path(key))
+                original_full = read_image(self.original_sources.get(key, Path(key)))
+                source_full = original_full if selected_mode == "original" else aligned_full
                 full_width = source_full.shape[1]
-                source16 = to_uint16(source_full)
-                resized = cv2.resize(
-                    source16, (self.preview_base.shape[1], self.preview_base.shape[0]),
+                preview_size = (self.preview_base.shape[1], self.preview_base.shape[0])
+                source_preview = np.right_shift(cv2.resize(
+                    to_uint16(source_full), preview_size,
                     interpolation=cv2.INTER_AREA,
-                )
-                source_preview = np.right_shift(resized, 8).astype(np.uint8)
+                ), 8).astype(np.uint8)
+                aligned_preview = np.right_shift(cv2.resize(
+                    to_uint16(aligned_full), preview_size, interpolation=cv2.INTER_AREA,
+                ), 8).astype(np.uint8)
+                original_preview = np.right_shift(cv2.resize(
+                    to_uint16(original_full), preview_size, interpolation=cv2.INTER_AREA,
+                ), 8).astype(np.uint8)
             settings = self._object_composite_settings(key)
             if self._uses_shared_base():
                 cached = self.global_preview_rgb
@@ -3833,8 +4587,8 @@ F1：显示本快捷键表""")
                     for index, item in enumerate(self.strokes.get(key, []))
                     if index != selected_index
                 ]
-                background, _mask = compose_meteor_objects(
-                    source_preview, self.preview_base, others, *settings
+                background, _mask = compose_meteor_sources(
+                    aligned_preview, original_preview, self.preview_base, others, *settings
                 )
             self.object_drag_live_source = source_preview
             self.object_drag_live_background = background
@@ -3982,21 +4736,32 @@ F1：显示本快捷键表""")
             replacement = self.preview_base.copy()
             for other_key, other_width, relevant in intersecting:
                 if self.current_path is not None and other_key == str(self.current_path):
-                    source_preview = self.preview_source
-                else:
-                    source_full = read_image(self._effective_source_path(Path(other_key)))
-                    source16 = to_uint16(source_full)
-                    resized = cv2.resize(
-                        source16, (preview_w, preview_h), interpolation=cv2.INTER_AREA
+                    aligned_preview = (
+                        self.preview_aligned_source if self.preview_aligned_source is not None
+                        else self.preview_source
                     )
-                    source_preview = np.right_shift(resized, 8).astype(np.uint8)
-                if source_preview is None:
+                    original_preview = (
+                        self.preview_original_source if self.preview_original_source is not None
+                        else self.preview_source
+                    )
+                else:
+                    aligned_full = to_uint16(read_image(Path(other_key)))
+                    original_full = to_uint16(read_image(
+                        self.original_sources.get(other_key, Path(other_key))
+                    ))
+                    aligned_preview = np.right_shift(cv2.resize(
+                        aligned_full, (preview_w, preview_h), interpolation=cv2.INTER_AREA
+                    ), 8).astype(np.uint8)
+                    original_preview = np.right_shift(cv2.resize(
+                        original_full, (preview_w, preview_h), interpolation=cv2.INTER_AREA
+                    ), 8).astype(np.uint8)
+                if aligned_preview is None or original_preview is None:
                     return None
                 scaled_relevant = [
                     self._preview_clone(item, other_width) for item in relevant
                 ]
-                replacement, _mask = compose_meteor_objects(
-                    source_preview, replacement, scaled_relevant,
+                replacement, _mask = compose_meteor_sources(
+                    aligned_preview, original_preview, replacement, scaled_relevant,
                     *self._object_composite_settings(other_key),
                 )
             affected = affected_full[y0:y1, x0:x1]
@@ -4116,6 +4881,7 @@ F1：显示本快捷键表""")
         candidate.auto_cleanup = stroke.auto_cleanup
         candidate.auto_brightness = stroke.auto_brightness
         candidate.auto_feather = stroke.auto_feather
+        candidate.source_mode = stroke.source_mode
 
     def _invalidate_global_preview(self) -> None:
         self.global_preview_signature = None
@@ -4532,6 +5298,8 @@ F1：显示本快捷键表""")
     def _stroke_start(self, event) -> None:
         if not self.current_path:
             return
+        if getattr(self, "space_pan_held", False):
+            return self._canvas_pan_start_event(event, with_left=True)
         if self.view_mode.get() in {"blend", "labeled"}:
             return self._object_pointer_start(event)
         if self.view_mode.get() != "source":
@@ -4577,6 +5345,7 @@ F1：显示本快捷键表""")
             self.live_erase_stroke = Stroke(
                 self.active_points.copy(), self.active_tool_width,
                 self.active_tool_feather, True,
+                source_mode=self._current_source_mode(),
             )
             self._refresh_live_mask(force=True)
         else:
@@ -4598,36 +5367,55 @@ F1：显示本快捷键表""")
         coords = []
         for x, y in self.active_points:
             coords.extend((x0 + x * (x1 - x0), y0 + y * (y1 - y0)))
-        if self.active_canvas_line:
-            self.canvas.delete(self.active_canvas_line)
         color = "#64d2ff" if self.active_tool_mode == "erase" else "#ff3b30"
         active_width = self.active_tool_width or self._tool_width()
         shown_width = max(3, int(active_width * (x1 - x0) / max(1, self.current_dims[0])))
         if len(coords) == 2:
             radius = shown_width / 2.0
-            self.active_canvas_line = self.canvas.create_oval(
+            oval_coords = (
                 coords[0] - radius, coords[1] - radius,
                 coords[0] + radius, coords[1] + radius,
-                fill=color, outline="",
             )
+            if self.active_canvas_line and self.canvas.type(self.active_canvas_line) == "oval":
+                self.canvas.coords(self.active_canvas_line, *oval_coords)
+                self.canvas.itemconfigure(self.active_canvas_line, fill=color)
+            else:
+                if self.active_canvas_line:
+                    self.canvas.delete(self.active_canvas_line)
+                self.active_canvas_line = self.canvas.create_oval(
+                    *oval_coords, fill=color, outline="",
+                )
         else:
-            self.active_canvas_line = self.canvas.create_line(
-                *coords, fill=color, width=shown_width,
-                capstyle="round", joinstyle="round",
-            )
+            if self.active_canvas_line and self.canvas.type(self.active_canvas_line) == "line":
+                self.canvas.coords(self.active_canvas_line, *coords)
+                self.canvas.itemconfigure(
+                    self.active_canvas_line, fill=color, width=shown_width
+                )
+            else:
+                if self.active_canvas_line:
+                    self.canvas.delete(self.active_canvas_line)
+                self.active_canvas_line = self.canvas.create_line(
+                    *coords, fill=color, width=shown_width,
+                    capstyle="round", joinstyle="round",
+                )
 
     def _refresh_live_mask(self, force: bool = False) -> None:
         if self.live_erase_stroke is None:
             return
         now = time.monotonic()
-        if force or now - self.last_live_render >= 0.04:
+        if force or now - self.last_live_render >= 0.012:
             self.last_live_render = now
-            self._render_preview()
+            # Erasing uses the same lightweight foreground trace as painting.
+            # Rebuilding the feathered full-frame mask on every pointer event made
+            # the brush visibly lag; the actual local mask is committed on release.
+            self._draw_active_stroke()
 
     def _tool_width(self) -> int:
         return int(self.eraser_width.get() if self.edit_mode.get() == "erase" else self.brush_width.get())
 
     def _stroke_move(self, event) -> None:
+        if getattr(self, "canvas_pan_with_left", False):
+            return self._canvas_pan_move_event(event)
         if self.object_drag_mode is not None:
             return self._object_pointer_move(event)
         if not self.active_points:
@@ -4639,6 +5427,14 @@ F1：显示本快捷键表""")
         if self.active_shift_line:
             self.active_points[-1] = point
         else:
+            x0, y0, x1, y1 = self.display_box
+            last = self.active_points[-1]
+            screen_distance = np.hypot(
+                (point[0] - last[0]) * (x1 - x0),
+                (point[1] - last[1]) * (y1 - y0),
+            )
+            if screen_distance < 1.5:
+                return "break"
             self.active_points.append(point)
         if self.live_erase_stroke is not None:
             self.live_erase_stroke.points = self.active_points.copy()
@@ -4648,6 +5444,8 @@ F1：显示本快捷键表""")
         return "break"
 
     def _stroke_end(self, event) -> None:
+        if getattr(self, "canvas_pan_with_left", False):
+            return self._canvas_pan_end_event(event)
         if self.object_drag_mode is not None:
             return self._object_pointer_end(event)
         if not self.active_points or not self.current_path:
@@ -4663,7 +5461,8 @@ F1：显示本快捷键表""")
 
     def _global_pointer_release(self, event) -> None:
         """Finish a canvas gesture even when mouse-up lands outside the canvas."""
-        if not self.active_points and self.object_drag_mode is None:
+        if (not self.active_points and self.object_drag_mode is None
+                and not getattr(self, "canvas_pan_with_left", False)):
             return
         proxy = type("CanvasReleaseEvent", (), {})()
         proxy.x = int(event.x_root - self.canvas.winfo_rootx())
@@ -4683,7 +5482,8 @@ F1：显示本快捷键表""")
         else:
             stroke = Stroke(
                 self.active_points.copy(), self.active_tool_width or self._tool_width(),
-                self.active_tool_feather, False
+                self.active_tool_feather, False,
+                source_mode=self._current_source_mode(),
             )
             values = self.strokes.setdefault(str(self.current_path), [])
             self.active_action_index = len(values)
@@ -4926,8 +5726,17 @@ F1：显示本快捷键表""")
     def _update_tree_status_for_key(self, key: str) -> None:
         for index, path in enumerate(self.files):
             if str(path) == key and self.tree.exists(str(index)):
-                count = len(self.strokes.get(key, []))
-                self.tree.set(str(index), "status", count or "—")
+                meteors = [
+                    item for item in self.strokes.get(key, [])
+                    if not item.erase and item.points
+                ]
+                original = sum(normalized_source_mode(item) == "original" for item in meteors)
+                aligned = len(meteors) - original
+                detail = (
+                    f"{len(meteors)}（对{aligned}/原{original}）"
+                    if meteors and original else (str(len(meteors)) if meteors else "—")
+                )
+                self.tree.set(str(index), "status", detail)
 
     def _setup_autosave(self) -> None:
         variables = (
@@ -5062,7 +5871,7 @@ F1：显示本快捷键表""")
                 str(key): str(value) for key, value in data.get("alignment_statuses", {}).items()
             }
 
-            def decode_strokes(values):
+            def decode_strokes(values, default_source_mode="aligned"):
                 return [Stroke(
                     points=[tuple(p) for p in item["points"]], width=item["width"],
                     feather=item["feather"], erase=bool(item.get("erase", False)),
@@ -5102,13 +5911,21 @@ F1：显示本快捷键表""")
                     auto_feather=(
                         None if item.get("auto_feather") is None else int(item["auto_feather"])
                     ),
+                    source_mode=(
+                        "original" if item.get("source_mode", default_source_mode) == "original"
+                        else "aligned"
+                    ),
                 ) for item in values]
 
             self.candidates = {
-                key: decode_strokes(values) for key, values in data.get("candidates", {}).items()
+                key: decode_strokes(
+                    values, "original" if key in self.use_original_sources else "aligned"
+                ) for key, values in data.get("candidates", {}).items()
             }
             self.strokes = {
-                key: decode_strokes(values) for key, values in data.get("strokes", {}).items()
+                key: decode_strokes(
+                    values, "original" if key in self.use_original_sources else "aligned"
+                ) for key, values in data.get("strokes", {}).items()
             }
             self.edit_history.clear()
             self.edit_redo.clear()
@@ -5171,6 +5988,13 @@ F1：显示本快捷键表""")
         self.status.set(f"项目已载入：{path}")
 
     def export(self) -> None:
+        if (
+            self.pairing_signature != self._base_selection_signature()
+            or not self.pairs
+        ):
+            self.status.set("底图选择已变化，正在重新建立导出配对…")
+            if not self.scan_inputs(reload_current=True):
+                return
         marked = {
             Path(key): [Stroke(
                 item.points.copy(), item.width, item.feather, item.erase, item.locked, item.auto_score,
@@ -5181,8 +6005,10 @@ F1：显示本快捷键表""")
                 item.match_exposure_override, item.blend_mode_override,
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness, item.auto_feather,
+                source_mode=item.source_mode,
             ) for item in value]
-            for key, value in self.strokes.items() if value
+            for key, value in self.strokes.items()
+            if key in self.pairs and value
         }
         if not marked:
             messagebox.showwarning(APP_NAME, "还没有检测或标记任何流星蒙版")
@@ -5221,7 +6047,7 @@ F1：显示本快捷键表""")
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(),
             bool(self.export_tiff.get()), bool(learning_choice), self.blend_mode.get(),
-            {str(path): self._effective_source_path(path) for path in marked},
+            {str(path): self.original_sources.get(str(path), path) for path in marked},
             self.output_mode.get(), self.base_exposure_tenths.get() / 10.0,
         )
 
@@ -5229,7 +6055,7 @@ F1：显示本快捷键表""")
         self, output_dir: Path, marked: dict[Path, list[Stroke]], pairs: dict[str, Path],
         adjustments: dict[str, dict], adjustment_defaults: dict,
         export_tiff: bool, learn_after_export: bool, blend_mode: str,
-        read_paths: dict[str, Path], output_mode: str, base_exposure_ev: float = 0.0,
+        original_paths: dict[str, Path], output_mode: str, base_exposure_ev: float = 0.0,
     ):
         output_dir.mkdir(parents=True, exist_ok=True)
         run_dir = unique_path(output_dir / ("meteor_restore_" + datetime.now().strftime("%Y%m%d_%H%M%S")))
@@ -5266,14 +6092,15 @@ F1：显示本快捷键表""")
                     combined_base_path = base_path
                     combined_clean_base = base.copy()
             height, width = base.shape[:2]
-            actual_source_path = read_paths.get(str(source_path), source_path)
-            original_state = Path(actual_source_path) != Path(source_path)
-            source = read_image(actual_source_path)
-            if source.shape[:2] != (height, width):
+            aligned_source = read_image(source_path)
+            original_path = original_paths.get(str(source_path), source_path)
+            original_source = read_image(original_path)
+            if aligned_source.shape[:2] != (height, width) or original_source.shape[:2] != (height, width):
                 raise ValueError(f"尺寸不一致：{source_path.name}")
-            source16 = to_uint16(source)
-            result, mask_float = compose_meteor_objects(
-                source16, base, strokes, match, curve_enabled,
+            aligned16 = to_uint16(aligned_source)
+            original16 = to_uint16(original_source)
+            result, mask_float = compose_meteor_sources(
+                aligned16, original16, base, strokes, match, curve_enabled,
                 curve_shadows, curve_highlights, blend_mode,
                 bool(adjustment.get("preserve_brightness", True)),
                 float(adjustment.get("meteor_brightness", 100)),
@@ -5285,7 +6112,7 @@ F1：显示本快捷键表""")
             source_boxes = meteor_mask_boxes(mask_float)
             item_annotations = meteor_source_annotations(
                 source_path.stem, strokes, width, height,
-                original_state, mask_float,
+                False, mask_float,
             )
             if combined:
                 combined_annotations.extend(item_annotations)
@@ -5313,8 +6140,15 @@ F1：显示本快捷键表""")
                     atomic_write_tiff(tif_path, result)
                     outputs.append(str(tif_path))
             report.append({
-                "source_tiff": str(actual_source_path), "workspace_layer": str(source_path),
-                "original_state": original_state,
+                "source_tiff": str(source_path), "original_tiff": str(original_path),
+                "workspace_layer": str(source_path),
+                "original_state": all(
+                    normalized_source_mode(item) == "original"
+                    for item in strokes if not item.erase
+                ),
+                "mixed_source_modes": sorted({
+                    normalized_source_mode(item) for item in strokes if not item.erase
+                }),
                 "clean_jpg": str(base_path),
                 "strokes": len(strokes), "mask": str(mask_path),
                 "local_match": match, "meteor_curve": curve_enabled,
@@ -5334,6 +6168,7 @@ F1：显示本快捷键表""")
                         "match_exposure": stroke.match_exposure_override,
                         "blend_mode": stroke.blend_mode_override,
                         "feather": stroke.feather,
+                        "source_mode": normalized_source_mode(stroke),
                         "auto_blend": {
                             "enabled": stroke.auto_blend_enabled,
                             "strength": stroke.auto_strength,
@@ -5358,7 +6193,7 @@ F1：显示本快捷键表""")
                 "source_regions": [list(box) for box in source_boxes],
                 "outputs": outputs,
             })
-            del source, source16, mask_full
+            del aligned_source, original_source, aligned16, original16, mask_full
             if not combined:
                 del base, result
             self.work_queue.put(("progress", index / total * 90, f"正在合成 {index}/{total}：{source_path.name}"))
@@ -5396,7 +6231,7 @@ F1：显示本快捷键表""")
             "items": report,
         }
         (run_dir / "processing_report.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        return "exported", run_dir, len(report), learn_after_export, marked, pairs, read_paths, output_mode
+        return "exported", run_dir, len(report), learn_after_export, marked, pairs, original_paths, output_mode
 
     def _learn_worker(self, marked: dict[Path, list[Stroke]], pairs: dict[str, Path]):
         try:
@@ -5438,10 +6273,33 @@ F1：显示本快捷键表""")
             while True:
                 item = self.work_queue.get_nowait()
                 kind = item[0]
-                if kind == "preview":
-                    _, path, source_preview, base_preview, dims = item
+                if kind == "shared_base_preview":
+                    _, base_preview, dims, base_path, pairing_signature = item
+                    if self.shared_base_loading_signature == pairing_signature:
+                        self.shared_base_loading_signature = None
+                    if (
+                        pairing_signature != self.pairing_signature
+                        or base_path not in self.pairs.values()
+                    ):
+                        continue
+                    self.preview_base = base_preview
+                    self.current_dims = dims
+                    if self.view_mode.get() in {"blend", "labeled"} and self._uses_shared_base():
+                        self._render_preview()
+                elif kind == "preview":
+                    (
+                        _, path, source_preview, aligned_preview, original_preview,
+                        base_preview, dims, base_path, pairing_signature,
+                    ) = item
+                    if (
+                        pairing_signature != self.pairing_signature
+                        or self.pairs.get(str(path)) != base_path
+                    ):
+                        continue
                     self.current_path = path
                     self.preview_source = source_preview
+                    self.preview_aligned_source = aligned_preview
+                    self.preview_original_source = original_preview
                     self.preview_base = base_preview
                     self.preview_rgb = source_preview
                     self.current_dims = dims
@@ -5472,12 +6330,17 @@ F1：显示本快捷键表""")
                         # for the newest state instead of starting overlapping jobs.
                         self.after_idle(self._render_preview)
                 elif kind == "exact_preview":
-                    _, signature, image, labeled_image, included, full_dims = item
+                    (
+                        _, signature, image, labeled_image,
+                        full_image, full_labeled_image, included, full_dims,
+                    ) = item
                     if self.exact_preview_loading_signature == signature:
                         self.exact_preview_loading_signature = None
                     if signature == self._exact_preview_state_signature():
                         self.exact_preview_rgb = image
                         self.exact_labeled_preview_rgb = labeled_image
+                        self.exact_preview_full_rgb = full_image
+                        self.exact_labeled_preview_full_rgb = full_labeled_image
                         self.exact_preview_signature = signature
                         self.progress["value"] = 100
                         self.exact_preview_status.set(
@@ -5488,6 +6351,7 @@ F1：显示本快捷键表""")
                         )
                         self.view_mode.set("blend")
                         self._render_preview()
+                        self.open_exact_preview()
                     else:
                         self.exact_preview_status.set("导出级预览：生成期间参数已变化，请重试")
                 elif kind == "blend_optimized":
@@ -5521,18 +6385,26 @@ F1：显示本快捷键表""")
                     self.progress["value"] = value
                     self.status.set(text)
                 elif kind == "autodetected":
-                    _, found, plane_count = item
-                    locked = {
-                        key: [stroke for stroke in values if stroke.locked]
-                        for key, values in self.strokes.items() if any(stroke.locked for stroke in values)
+                    _, found, plane_count, detected_modes = item
+                    updated: dict[str, list[Stroke]] = {
+                        key: values.copy() for key, values in self.strokes.items()
                     }
-                    self.strokes = found
-                    for key, values in locked.items():
-                        destination = self.strokes.setdefault(key, [])
-                        destination.extend(
-                            stroke for stroke in values
-                            if not any(existing.points == stroke.points for existing in destination)
-                        )
+                    for key in {str(path) for path in self.files}:
+                        mode = detected_modes.get(key, "aligned")
+                        preserved = [
+                            stroke for stroke in updated.get(key, [])
+                            if normalized_source_mode(stroke) != mode or stroke.locked
+                        ]
+                        detected = found.get(key, [])
+                        updated[key] = detected + [
+                            stroke for stroke in preserved
+                            if not any(
+                                existing.points == stroke.points
+                                and normalized_source_mode(existing) == normalized_source_mode(stroke)
+                                for existing in detected
+                            )
+                        ]
+                    self.strokes = updated
                     self.edit_history.clear()
                     self.edit_redo.clear()
                     self._schedule_autosave()
@@ -5553,9 +6425,13 @@ F1：显示本快捷键表""")
                     else:
                         messagebox.showinfo(APP_NAME, "没有检测到可靠的流星候选。可调整素材或用画笔补充。")
                 elif kind == "candidates":
-                    _, path, candidates, plane_count = item
+                    _, path, candidates, plane_count, analyzed_mode = item
                     key = str(path)
-                    self.candidates[key] = candidates
+                    retained_candidates = [
+                        stroke for stroke in self.candidates.get(key, [])
+                        if normalized_source_mode(stroke) != analyzed_mode
+                    ]
+                    self.candidates[key] = retained_candidates + candidates
                     self.candidate_thresholds.setdefault(key, int(self.candidate_threshold.get()))
                     self.edit_history.pop(key, None)
                     self.edit_redo.pop(key, None)
@@ -5573,7 +6449,7 @@ F1：显示本快捷键表""")
                         "拖动分数阈值筛选，确认后右键锁定。"
                     )
                 elif kind == "exported":
-                    _, run_dir, count, learn_after_export, marked, pairs, read_paths, output_mode = item
+                    _, run_dir, count, learn_after_export, marked, pairs, original_paths, output_mode = item
                     self.progress["value"] = 100
                     self.status.set(f"导出完成：{run_dir}")
                     result_summary = (
@@ -5588,12 +6464,22 @@ F1：显示本快捷键表""")
                         )
                         self.progress["value"] = 0
                         self.status.set("正在从本次最终蒙版学习…")
-                        learning_marked = {
-                            read_paths.get(str(path), path): strokes for path, strokes in marked.items()
-                        }
-                        learning_pairs = {
-                            str(read_paths.get(str(path), path)): pairs[str(path)] for path in marked
-                        }
+                        learning_marked: dict[Path, list[Stroke]] = {}
+                        learning_pairs: dict[str, Path] = {}
+                        for path, strokes in marked.items():
+                            for mode in ("aligned", "original"):
+                                selected = [
+                                    stroke for stroke in strokes
+                                    if normalized_source_mode(stroke) == mode
+                                ]
+                                if not any(not stroke.erase for stroke in selected):
+                                    continue
+                                actual = (
+                                    original_paths.get(str(path), path)
+                                    if mode == "original" else path
+                                )
+                                learning_marked.setdefault(actual, []).extend(selected)
+                                learning_pairs[str(actual)] = pairs[str(path)]
                         self._run_worker(self._learn_worker, learning_marked, learning_pairs)
                     else:
                         messagebox.showinfo(APP_NAME, f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}")
@@ -5632,6 +6518,7 @@ F1：显示本快捷键表""")
                     print(details)
                 elif kind == "error":
                     _, text, details = item
+                    self.shared_base_loading_signature = None
                     if self.exact_preview_loading_signature is not None:
                         self.exact_preview_loading_signature = None
                         self.exact_preview_status.set("导出级预览：生成失败")

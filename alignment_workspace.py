@@ -13,6 +13,7 @@ from ptgui_pipeline import (
     default_ptgui_path,
     default_siril_path,
     list_images,
+    read_lens_info,
     run_alignment_pipeline,
 )
 
@@ -31,8 +32,7 @@ class AlignmentWorkspace(tk.Toplevel):
         self.siril_path = tk.StringVar(value=str(default_siril_path() or ""))
         self.focal_length = tk.DoubleVar(value=14.0)
         self.sensor_diagonal = tk.DoubleVar(value=43.2666)
-        self.sky_fraction = tk.DoubleVar(value=60.4)
-        self.status = tk.StringVar(value="选择底图、流星原图文件夹和独立输出位置。")
+        self.status = tk.StringVar(value="选择底图和流星原图文件夹；输出文件夹会自动创建，也可以手动更改。")
         self.items = []
         self.worker_queue: queue.Queue = queue.Queue()
         self.running = False
@@ -55,25 +55,23 @@ class AlignmentWorkspace(tk.Toplevel):
         paths.pack(fill="x")
         self._path_row(paths, 0, "干净底图", self.base_path, self._choose_base, "选择文件…")
         self._path_row(paths, 1, "完整流星原图文件夹", self.meteor_dir, self._choose_meteors, "选择文件夹…")
-        self._path_row(paths, 2, "独立输出文件夹", self.output_dir, self._choose_output, "选择文件夹…")
+        self._path_row(paths, 2, "输出文件夹（可选）", self.output_dir, self._choose_output, "另选文件夹…")
         self._path_row(paths, 3, "PTGui程序", self.ptgui_path, self._choose_ptgui, "选择程序…")
         self._path_row(paths, 4, "Siril CLI程序", self.siril_path, self._choose_siril, "选择程序…")
         paths.columnconfigure(1, weight=1)
 
         settings = ttk.LabelFrame(root, text="镜头与星空区域", padding=8)
         settings.pack(fill="x", pady=(8, 0))
-        ttk.Label(settings, text="镜头焦距(mm)").grid(row=0, column=0, sticky="w")
+        ttk.Label(settings, text="EXIF缺失时兜底焦距(mm)").grid(row=0, column=0, sticky="w")
         ttk.Spinbox(settings, from_=1, to=1000, increment=0.1, textvariable=self.focal_length, width=9).grid(row=0, column=1, padx=(5, 18))
         ttk.Label(settings, text="传感器对角线(mm)").grid(row=0, column=2, sticky="w")
         ttk.Spinbox(settings, from_=1, to=100, increment=0.1, textvariable=self.sensor_diagonal, width=9).grid(row=0, column=3, padx=(5, 18))
-        ttk.Label(settings, text="画面顶部作为星空区域").grid(row=0, column=4, sticky="w")
-        ttk.Scale(settings, from_=35, to=100, variable=self.sky_fraction, orient="horizontal").grid(row=0, column=5, sticky="ew", padx=5)
-        ttk.Label(settings, textvariable=self.sky_fraction, width=5).grid(row=0, column=6)
-        ttk.Label(settings, text="%", width=2).grid(row=0, column=7)
+        ttk.Label(settings, text="星空区域").grid(row=0, column=4, sticky="w")
+        ttk.Label(settings, text="逐张自动识别并生成星点蒙版").grid(row=0, column=5, columnspan=3, sticky="w", padx=5)
         settings.columnconfigure(5, weight=1)
         ttk.Label(
             settings,
-            text="全画幅默认对角线43.27mm。星空区域应避开地景；本组素材已验证约60.4%。",
+            text="优先读取每张图片的EXIF焦距；焦段变化时使用独立镜头模型。传感器和焦距输入只在EXIF缺失时兜底。",
         ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(5, 0))
 
         actions = ttk.Frame(root)
@@ -89,14 +87,18 @@ class AlignmentWorkspace(tk.Toplevel):
         self.discard_button = ttk.Button(actions, text="丢弃选中失败项", command=self.mark_discarded, state="disabled")
         self.discard_button.pack(side="right", padx=6)
 
-        self.tree = ttk.Treeview(root, columns=("status", "cp", "error", "message"), show="tree headings", selectmode="extended")
+        self.tree = ttk.Treeview(root, columns=("status", "focal", "sky", "cp", "error", "message"), show="tree headings", selectmode="extended")
         self.tree.heading("#0", text="流星原图")
         self.tree.heading("status", text="状态")
+        self.tree.heading("focal", text="焦距")
+        self.tree.heading("sky", text="星点有效区")
         self.tree.heading("cp", text="控制点")
         self.tree.heading("error", text="匹配误差")
         self.tree.heading("message", text="说明")
         self.tree.column("#0", width=260)
         self.tree.column("status", width=90, anchor="center")
+        self.tree.column("focal", width=105, anchor="center")
+        self.tree.column("sky", width=90, anchor="center")
         self.tree.column("cp", width=70, anchor="center")
         self.tree.column("error", width=90, anchor="center")
         self.tree.column("message", width=390)
@@ -119,12 +121,17 @@ class AlignmentWorkspace(tk.Toplevel):
             self.base_path.set(path)
 
     def _choose_meteors(self) -> None:
+        previous_dir = self.meteor_dir.get().strip()
+        previous_default = str(Path(previous_dir) / "MeteorStudio_Output") if previous_dir else ""
         path = filedialog.askdirectory(title="选择完整流星原图文件夹")
         if path:
+            current_output = self.output_dir.get().strip()
             self.meteor_dir.set(path)
+            if not current_output or current_output == previous_default:
+                self.output_dir.set(str(Path(path) / "MeteorStudio_Output"))
 
     def _choose_output(self) -> None:
-        path = filedialog.askdirectory(title="选择独立输出文件夹")
+        path = filedialog.askdirectory(title="选择输出文件夹（可与输入目录相同或位于其中）")
         if path:
             self.output_dir.set(path)
 
@@ -139,16 +146,22 @@ class AlignmentWorkspace(tk.Toplevel):
             self.siril_path.set(path)
 
     def _validated_paths(self) -> tuple[Path, Path, Path, Path, Path]:
-        base, meteor_dir, output = Path(self.base_path.get()), Path(self.meteor_dir.get()), Path(self.output_dir.get())
+        base, meteor_dir = Path(self.base_path.get()), Path(self.meteor_dir.get())
         ptgui, siril = Path(self.ptgui_path.get()), Path(self.siril_path.get())
         if not base.is_file():
             raise ValueError("请选择有效的干净底图")
         if not meteor_dir.is_dir():
             raise ValueError("请选择有效的流星原图文件夹")
-        if not output.is_dir():
-            raise ValueError("请选择已经存在的独立输出文件夹")
-        if output.resolve() == meteor_dir.resolve() or output.resolve() == base.parent.resolve():
-            raise ValueError("输出文件夹不能与任一输入位置相同")
+        output_text = self.output_dir.get().strip()
+        output = Path(output_text) if output_text else meteor_dir / "MeteorStudio_Output"
+        if not output_text:
+            self.output_dir.set(str(output))
+        if output.exists() and not output.is_dir():
+            raise ValueError("输出路径是一个文件，请选择文件夹")
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ValueError(f"无法创建输出文件夹：{exc}") from exc
         if not ptgui.is_file() or not siril.is_file():
             raise ValueError("找不到PTGui或Siril CLI程序")
         return base, meteor_dir, output, ptgui, siril
@@ -162,7 +175,11 @@ class AlignmentWorkspace(tk.Toplevel):
             for item in self.tree.get_children():
                 self.tree.delete(item)
             for index, path in enumerate(self.items):
-                self.tree.insert("", "end", iid=str(index), text=path.name, values=("等待", "—", "—", ""))
+                lens = read_lens_info(path, float(self.focal_length.get()), float(self.sensor_diagonal.get()))
+                self.tree.insert(
+                    "", "end", iid=str(index), text=path.name,
+                    values=("等待", f"{lens.focal_length:.1f}mm", "运行时判断", "—", "—", lens.source),
+                )
             self.run_button.configure(state="normal")
             self.status.set(f"只读扫描完成：{len(self.items)}张完整流星原图")
         except Exception as exc:
@@ -175,9 +192,8 @@ class AlignmentWorkspace(tk.Toplevel):
             base, _folder, output, ptgui, siril = self._validated_paths()
             focal = float(self.focal_length.get())
             diagonal = float(self.sensor_diagonal.get())
-            sky = float(self.sky_fraction.get()) / 100.0
-            if not (focal > 0 and diagonal > 0 and 0.35 <= sky <= 1.0):
-                raise ValueError("镜头或星空区域参数无效")
+            if not (focal > 0 and diagonal > 0):
+                raise ValueError("EXIF缺失时使用的兜底镜头参数无效")
         except Exception as exc:
             messagebox.showerror("星空对齐", str(exc), parent=self)
             return
@@ -194,7 +210,7 @@ class AlignmentWorkspace(tk.Toplevel):
             try:
                 result = run_alignment_pipeline(
                     base, self.items.copy(), output, ptgui, siril, report,
-                    sky_fraction=sky, focal_length=focal, sensor_diagonal=diagonal,
+                    sky_fraction=None, focal_length=focal, sensor_diagonal=diagonal,
                     export_layers=True,
                 )
                 self.worker_queue.put(("done", result))
@@ -237,7 +253,9 @@ class AlignmentWorkspace(tk.Toplevel):
             if item is None:
                 continue
             error = "—" if item.median_error is None else f"{item.median_error:.2f}px"
-            self.tree.item(str(index), values=(item.status, item.control_points or "—", error, item.message))
+            focal = "—" if item.focal_length is None else f"{item.focal_length:.1f}mm"
+            sky = "—" if item.sky_coverage is None else f"{item.sky_coverage * 100:.1f}%"
+            self.tree.item(str(index), values=(item.status, focal, sky, item.control_points or "—", error, item.message))
 
     def load_result(self) -> None:
         if self.last_result is None:

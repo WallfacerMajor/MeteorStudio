@@ -12,10 +12,12 @@ import tifffile
 from meteor_composer import (
     MeteorComposer, Stroke, content_distance_map, line_inside_valid_content,
     normalize_lsd_lines, point_in_padded_bbox, compose_meteor_objects,
+    compose_meteor_sources,
     remove_local_background_cast, annotate_meteor_sources,
     meteor_source_annotations, stroke_is_transformed, reset_stroke_geometry,
     adjust_composite_base_exposure,
     analyze_meteor_blend_parameters,
+    active_stroke_keys,
 )
 
 
@@ -114,6 +116,124 @@ class ExposureScopeTests(unittest.TestCase):
         MeteorComposer._load_image_adjustments(fake, "a.tif")
         self.assertFalse(fake.brightness_override.get())
         self.assertEqual(fake.meteor_brightness.get(), 118)
+
+
+class BaseSelectionInvalidationTests(unittest.TestCase):
+    def test_old_autosave_masks_do_not_enter_current_export_batch(self):
+        current = "C:/new_batch/DSC06569.tif"
+        stale = "C:/old_batch/DSC04890.tif"
+        strokes = {
+            current: [Stroke([(0.1, 0.2), (0.8, 0.7)], 20, 8)],
+            stale: [Stroke([(0.2, 0.3), (0.7, 0.6)], 20, 8)],
+        }
+        pairs = {current: Path("C:/bases/current.tif")}
+        self.assertEqual(active_stroke_keys(strokes, pairs), [current])
+
+    def test_signature_changes_when_clean_base_changes(self):
+        fake = SimpleNamespace(
+            output_mode=FakeVar("combined"),
+            base_dir=FakeVar("D:/bases/old.jpg"),
+            selected_base_files=[Path("D:/bases/old.jpg")],
+        )
+        old_signature = MeteorComposer._base_selection_signature(fake)
+        fake.base_dir.set("D:/bases/new.jpg")
+        fake.selected_base_files = [Path("D:/bases/new.jpg")]
+        self.assertNotEqual(old_signature, MeteorComposer._base_selection_signature(fake))
+
+    def test_invalidating_base_clears_export_pairs_and_all_preview_caches(self):
+        fake = SimpleNamespace(
+            pairs={"source.tif": Path("old.jpg")}, pairing_signature="old",
+            preview_base=np.ones((2, 2, 3), dtype=np.uint8),
+            global_preview_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            global_labeled_preview_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            global_preview_signature="old", global_preview_pending_signature="old",
+            exact_preview_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            exact_labeled_preview_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            exact_preview_full_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            exact_labeled_preview_full_rgb=np.ones((2, 2, 3), dtype=np.uint8),
+            exact_preview_signature="old", exact_preview_status=FakeVar(),
+            global_preview_request_after_id=None, exact_preview_window=None,
+        )
+        MeteorComposer._invalidate_base_dependent_state(fake)
+        self.assertEqual(fake.pairs, {})
+        self.assertIsNone(fake.pairing_signature)
+        self.assertIsNone(fake.preview_base)
+        self.assertIsNone(fake.global_preview_rgb)
+        self.assertIsNone(fake.exact_preview_full_rgb)
+        self.assertIn("底图已变化", fake.exact_preview_status.get())
+
+    def test_rescan_replaces_old_pair_and_reloads_current_image(self):
+        class FakeTree:
+            def __init__(self):
+                self.children = []
+                self.selected = None
+
+            def get_children(self):
+                return tuple(self.children)
+
+            def delete(self, *_items):
+                self.children.clear()
+
+            def insert(self, _parent, _where, iid, **_kwargs):
+                self.children.append(iid)
+
+            def selection_set(self, iid):
+                self.selected = iid
+
+            def see(self, _iid):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source_dir = root / "sources"
+            old_dir = root / "old_bases"
+            new_dir = root / "new_bases"
+            output_dir = root / "outputs"
+            for directory in (source_dir, old_dir, new_dir, output_dir):
+                directory.mkdir()
+            source = source_dir / "shot.tif"
+            old_base = old_dir / "shot.jpg"
+            new_base = new_dir / "shot.jpg"
+            image = np.zeros((24, 32, 3), dtype=np.uint16)
+            tifffile.imwrite(source, image, photometric="rgb")
+            cv2.imencode(".jpg", np.zeros((24, 32, 3), dtype=np.uint8))[1].tofile(old_base)
+            cv2.imencode(".jpg", np.full((24, 32, 3), 180, dtype=np.uint8))[1].tofile(new_base)
+            fake = SimpleNamespace(
+                current_path=source, source_dir=FakeVar(str(source_dir)),
+                base_dir=FakeVar(str(new_base)), output_dir=FakeVar(str(output_dir)),
+                output_mode=FakeVar("combined"), selected_base_files=[new_base],
+                pairs={str(source): old_base}, pairing_signature="old",
+                files=[source], strokes={}, use_original_sources=set(), tree=FakeTree(),
+                status=FakeVar(), preview_source=np.ones((1, 1, 3)), preview_base=np.ones((1, 1, 3)),
+                view_mode=FakeVar("source"),
+            )
+            fake._clear_object_selection = lambda: None
+            fake._update_blend_preview_label = lambda: None
+            fake._set_paths_panel_visible = lambda _visible: None
+            fake.after_idle = lambda callback: callback()
+            fake._request_shared_base_preview = lambda: None
+            fake._base_selection_signature = lambda: MeteorComposer._base_selection_signature(fake)
+            reloads = []
+            fake.load_selected = lambda: reloads.append(True)
+            self.assertTrue(MeteorComposer.scan_inputs(fake, reload_current=True))
+            self.assertEqual(fake.pairs[str(source)], new_base)
+            self.assertEqual(fake.tree.selected, "0")
+            self.assertEqual(reloads, [True])
+
+
+class LiveBrushPerformanceTests(unittest.TestCase):
+    def test_live_eraser_draws_overlay_without_full_frame_render(self):
+        calls = []
+        fake = SimpleNamespace(
+            live_erase_stroke=Stroke([(0.1, 0.1)], 20, 5, True),
+            last_live_render=0.0,
+            _draw_active_stroke=lambda: calls.append("overlay"),
+            _render_preview=lambda: (_ for _ in ()).throw(
+                AssertionError("live eraser triggered a full-frame render")
+            ),
+        )
+        MeteorComposer._refresh_live_mask(fake, force=True)
+        self.assertEqual(calls, ["overlay"])
 
 
 class CandidateButtonGeometryTests(unittest.TestCase):
@@ -434,6 +554,21 @@ class CandidateThresholdOrderingTests(unittest.TestCase):
         MeteorComposer._apply_candidate_threshold(fake, key)
         self.assertEqual(fake.strokes[key], [first, erased, restored])
 
+    def test_threshold_keeps_candidates_from_both_pixel_sources(self):
+        key = "image.tif"
+        aligned = Stroke([(0.1, 0.2), (0.4, 0.2)], 14, 3, auto_score=80)
+        original = Stroke(
+            [(0.6, 0.7), (0.9, 0.7)], 14, 3, auto_score=75,
+            source_mode="original",
+        )
+        fake = SimpleNamespace(
+            candidate_thresholds={key: 55}, candidate_threshold=FakeVar(55),
+            strokes={key: []}, candidates={key: [aligned, original]},
+            current_path=Path(key), _update_candidate_summary=lambda _key: None,
+        )
+        MeteorComposer._apply_candidate_threshold(fake, key)
+        self.assertEqual(fake.strokes[key], [aligned, original])
+
 
 class SourceAnnotationTests(unittest.TestCase):
     def test_original_state_uses_explicit_warning_label(self):
@@ -481,6 +616,28 @@ class ExportModeTests(unittest.TestCase):
     def write_tiff(path: Path, image: np.ndarray):
         tifffile.imwrite(path, image, photometric="rgb")
 
+    def test_one_frame_can_mix_aligned_and_original_meteors(self):
+        base = np.zeros((80, 140, 3), dtype=np.uint16)
+        aligned = base.copy()
+        original = base.copy()
+        aligned[18:24, 12:55] = 52000
+        original[54:60, 82:128] = 50000
+        strokes = [
+            Stroke([(12 / 139, 21 / 79), (55 / 139, 21 / 79)], 10, 0),
+            Stroke(
+                [(82 / 139, 57 / 79), (128 / 139, 57 / 79)], 10, 0,
+                source_mode="original",
+            ),
+        ]
+        result, mask = compose_meteor_sources(
+            aligned, original, base, strokes,
+            False, False, 0, 0, "普通粘贴", True, 100, 0, False,
+        )
+        self.assertGreater(int(result[21, 30].max()), 20000)
+        self.assertGreater(int(result[57, 105].max()), 20000)
+        self.assertGreater(float(mask[21, 30]), 0.5)
+        self.assertGreater(float(mask[57, 105]), 0.5)
+
     def test_combined_mode_accumulates_sources_into_one_output(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -495,7 +652,10 @@ class ExportModeTests(unittest.TestCase):
             original_first = root / "first_original.tif"
             self.write_tiff(original_first, source1)
             marked = {
-                first: [Stroke([(0.08, 0.25), (0.42, 0.25)], 14, 0)],
+                first: [Stroke(
+                    [(0.08, 0.25), (0.42, 0.25)], 14, 0,
+                    source_mode="original",
+                )],
                 second: [Stroke([(0.58, 0.70), (0.92, 0.70)], 14, 0)],
             }
             fake = SimpleNamespace(work_queue=queue.Queue())

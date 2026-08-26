@@ -11,7 +11,9 @@ import numpy as np
 
 
 def run_smoke(app) -> dict:
-    from meteor_composer import Stroke, compose_meteor_objects, transformed_stroke_points
+    from meteor_composer import (
+        ExactPreviewViewer, Stroke, compose_meteor_objects, transformed_stroke_points,
+    )
 
     app.geometry("1280x820+10000+10000")
     app.update_idletasks()
@@ -19,6 +21,53 @@ def run_smoke(app) -> dict:
         app.after_cancel(after_id)
     app._schedule_autosave = lambda: None
     app.autosave_suspended = True
+
+    tab_names = [
+        app.control_notebook.tab(index, "text")
+        for index in range(app.control_notebook.index("end"))
+    ]
+    if tab_names != ["3  蒙版与候选", "4  融合与底图", "5  所选流星"]:
+        raise AssertionError(f"Unexpected workspace tabs: {tab_names}")
+    required_controls = {
+        "B ✎ 画笔", "E ▱ 橡皮擦", "AI分析当前单张候选", "自动检测全部",
+        "保存项目", "载入项目", "自动优化当前流星", "自动优化全部流星",
+        "重置底图曝光", "恢复自动值", "恢复原始融合", "导出合成结果",
+        "生成并打开导出级精确预览", "打开已生成预览",
+    }
+    available_controls = set()
+    pending = [app]
+    while pending:
+        widget = pending.pop()
+        pending.extend(widget.winfo_children())
+        try:
+            text = widget.cget("text")
+        except Exception:
+            continue
+        if text:
+            available_controls.add(str(text))
+    missing_controls = required_controls - available_controls
+    if missing_controls:
+        raise AssertionError(f"UI reorganization hid controls: {sorted(missing_controls)}")
+    app._toggle_paths_panel()
+    app.update_idletasks()
+    if app.paths_panel.winfo_manager():
+        raise AssertionError("Material panel did not collapse")
+    app._toggle_paths_panel()
+    app.update_idletasks()
+    if not app.paths_panel.winfo_manager():
+        raise AssertionError("Material panel could not be restored")
+    # Editing normally happens with the completed material setup collapsed,
+    # which leaves enough canvas room for precise object interaction.
+    app._toggle_paths_panel()
+    app.update_idletasks()
+    app.view_mode.set("source")
+    app._view_mode_changed()
+    if app.control_notebook.select() != str(app.mask_tools_tab):
+        raise AssertionError("Source view did not expose mask controls")
+    app.view_mode.set("base")
+    app._view_mode_changed()
+    if app.control_notebook.select() != str(app.blend_tools_tab):
+        raise AssertionError("Base view did not expose blend controls")
 
     width, height = 1200, 800
     base = np.zeros((height, width, 3), dtype=np.uint8)
@@ -606,6 +655,38 @@ def run_smoke(app) -> dict:
     if len(app.strokes[key]) != count or len(app.candidates[key]) != 1:
         raise AssertionError("Undo did not restore object and candidate metadata")
 
+    app.view_mode.set("source")
+    app._render_preview()
+    app.update()
+    app._canvas_fit()
+    main_fit_zoom = app.canvas_zoom
+    main_center = (app.canvas_center_x, app.canvas_center_y)
+    app._canvas_zoom_by(1.25, (app.canvas.winfo_width() // 3, app.canvas.winfo_height() // 3))
+    if app.canvas_zoom <= main_fit_zoom or app.preview_photo is None:
+        raise AssertionError("Main mask canvas did not zoom without recompositing")
+    pan_event = type("PanEvent", (), {"x": 300, "y": 260})()
+    app._canvas_pan_start_event(pan_event)
+    pan_event.x, pan_event.y = 350, 290
+    app._canvas_pan_move_event(pan_event)
+    app._canvas_pan_end_event(pan_event)
+    if (app.canvas_center_x, app.canvas_center_y) == main_center:
+        raise AssertionError("Main mask canvas did not pan")
+    app._canvas_actual_size()
+
+    exact_viewer = ExactPreviewViewer(app, source, source.copy(), "blend")
+    exact_viewer.geometry("900x620+10000+10000")
+    exact_viewer.update()
+    exact_viewer.fit()
+    fit_zoom = exact_viewer.zoom
+    exact_viewer.actual_size()
+    exact_viewer._zoom_by(1.25)
+    exact_viewer.mode.set("labeled")
+    exact_viewer._render()
+    exact_viewer.update()
+    if fit_zoom >= 1.0 or exact_viewer.zoom <= 1.0 or exact_viewer.photo is None:
+        raise AssertionError("Full-resolution viewer did not fit, zoom, and render")
+    exact_viewer.destroy()
+
     app.open_video_workspace()
     app.update()
     if app.state() != "withdrawn" or app.video_window is None:
@@ -649,6 +730,11 @@ def run_smoke(app) -> dict:
         "instant_isolated_delete": "passed",
         "no_render_loop": "passed",
         "single_workspace_navigation": "passed",
+        "exact_preview_viewer": "passed",
+        "main_canvas_zoom_pan": "passed",
+        "workspace_tabs": "passed",
+        "all_controls_reachable": "passed",
+        "collapsible_material_panel": "passed",
     }
 
 

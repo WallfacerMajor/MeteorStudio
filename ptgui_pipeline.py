@@ -29,6 +29,17 @@ class AlignmentItem:
     message: str = ""
     layer_index: int | None = None
     output_layer: str | None = None
+    focal_length: float | None = None
+    focal_source: str = ""
+    sky_coverage: float | None = None
+
+
+@dataclass(frozen=True)
+class ImageLensInfo:
+    focal_length: float
+    sensor_diagonal: float
+    equivalent_35mm: float | None
+    source: str
 
 
 @dataclass
@@ -99,12 +110,78 @@ def _read_rgb8(path: Path) -> np.ndarray:
         return np.asarray(ImageOps.exif_transpose(image).convert("RGB"))
 
 
-def make_sky_proxy(source: Path, destination: Path, scale: float = 0.25, sky_fraction: float = 0.68) -> tuple[int, int]:
+def _exif_number(value) -> float | None:
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        try:
+            denominator = float(value[1])
+            number = float(value[0]) / denominator
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+        return number if math.isfinite(number) and number > 0 else None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        try:
+            number = float(value.numerator) / float(value.denominator)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            return None
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def read_lens_info(
+    path: Path,
+    fallback_focal: float = 14.0,
+    fallback_sensor_diagonal: float = 43.2666,
+) -> ImageLensInfo:
+    """Read per-image focal data without assuming the batch used one zoom setting."""
+    focal = None
+    equivalent = None
+    try:
+        with Image.open(path) as image:
+            exif = image.getexif()
+            focal = _exif_number(exif.get(37386))  # FocalLength
+            equivalent = _exif_number(exif.get(41989))  # FocalLengthIn35mmFilm
+    except (OSError, ValueError, TypeError):
+        pass
+    # Lightroom/Photoshop TIFFs commonly retain camera EXIF in tag 34665 while
+    # exposing only IFD0 through Pillow. tifffile resolves that child IFD into
+    # a dictionary, so read it before declaring the metadata missing.
+    if path.suffix.lower() in {".tif", ".tiff"} and (focal is None or equivalent is None):
+        try:
+            with tifffile.TiffFile(path) as tif:
+                tag = tif.pages[0].tags.get("ExifTag")
+                nested = tag.value if tag is not None and isinstance(tag.value, dict) else {}
+                focal = focal or _exif_number(nested.get("FocalLength"))
+                equivalent = equivalent or _exif_number(nested.get("FocalLengthIn35mmFilm"))
+        except (OSError, ValueError, TypeError, KeyError, tifffile.TiffFileError):
+            pass
+    sensor = float(fallback_sensor_diagonal)
+    if focal is not None and equivalent is not None:
+        # EXIF's 35 mm equivalent provides a crop-factor estimate for this
+        # particular file and is more useful than a batch-wide sensor guess.
+        sensor = 43.2666 * focal / equivalent
+    if focal is not None:
+        return ImageLensInfo(float(focal), float(sensor), equivalent, "EXIF")
+    if equivalent is not None:
+        inferred = equivalent * sensor / 43.2666
+        return ImageLensInfo(float(inferred), float(sensor), equivalent, "EXIF 35mm等效")
+    return ImageLensInfo(float(fallback_focal), float(sensor), None, "兜底值（EXIF缺失）")
+
+
+def make_sky_proxy(
+    source: Path,
+    destination: Path,
+    scale: float = 0.25,
+    sky_fraction: float | None = None,
+) -> tuple[int, int]:
     rgb = _read_rgb8(source).copy()
     height, width = rgb.shape[:2]
     proxy = cv2.resize(rgb, (max(32, round(width * scale)), max(32, round(height * scale))), interpolation=cv2.INTER_AREA)
-    sky_bottom = int(proxy.shape[0] * float(np.clip(sky_fraction, 0.35, 1.0)))
-    if sky_bottom < proxy.shape[0]:
+    # ``sky_fraction`` is retained only as a legacy/fallback safety cap. The
+    # normal pipeline passes None and builds a different star-driven mask for
+    # every image after Siril has measured its PSF catalogue.
+    if sky_fraction is not None:
+        sky_bottom = int(proxy.shape[0] * float(np.clip(sky_fraction, 0.35, 1.0)))
         fade = max(8, round(proxy.shape[0] * 0.025))
         start = max(0, sky_bottom - fade)
         weights = np.linspace(1.0, 0.0, sky_bottom - start, dtype=np.float32)[:, None, None]
@@ -122,12 +199,70 @@ def make_sky_proxy(source: Path, destination: Path, scale: float = 0.25, sky_fra
     return width, height
 
 
-def make_ptgui_sky_proxy(source: Path, destination: Path, sky_fraction: float = 0.604) -> None:
+def filter_sky_stars(stars: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """Keep the dense astronomical field and reject isolated ground/lamp PSFs."""
+    if len(stars) < 6:
+        return stars
+    height, width = shape
+    columns, rows = 20, 14
+    cell_x = np.clip((stars[:, 0] / max(1, width) * columns).astype(int), 0, columns - 1)
+    cell_y = np.clip((stars[:, 1] / max(1, height) * rows).astype(int), 0, rows - 1)
+    counts = np.zeros((rows, columns), dtype=np.float32)
+    np.add.at(counts, (cell_y, cell_x), 1)
+    density = cv2.boxFilter(counts, -1, (3, 3), normalize=False, borderType=cv2.BORDER_CONSTANT)
+    positive = density[density > 0]
+    threshold = max(3.0, float(np.percentile(positive, 28.0))) if positive.size else 3.0
+    cells = (density >= threshold).astype(np.uint8)
+    cells = cv2.morphologyEx(cells, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    component_count, labels, stats, centroids = cv2.connectedComponentsWithStats(cells, 8)
+    best = None
+    best_score = -1.0
+    for label in range(1, component_count):
+        area = float(stats[label, cv2.CC_STAT_AREA])
+        center_y = float(centroids[label][1]) / max(1, rows - 1)
+        score = area * (1.25 if center_y < 0.72 else 0.65)
+        if score > best_score:
+            best, best_score = label, score
+    if best is None:
+        return stars
+    accepted_cells = cv2.dilate((labels == best).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=1)
+    keep = accepted_cells[cell_y, cell_x] > 0
+    filtered = stars[keep]
+    # Never let an aggressive density estimate destroy an otherwise usable
+    # sparse frame. The geometric matcher remains the final acceptance gate.
+    return filtered if len(filtered) >= 6 else stars
+
+
+def make_star_sky_mask(shape: tuple[int, int], stars: np.ndarray, radius: int | None = None) -> np.ndarray:
+    height, width = shape
+    radius = radius or max(14, round(min(width, height) / 55))
+    mask = _star_mask(shape, stars, radius=radius)
+    # Join nearby star islands but retain large holes around foreground objects.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(5, radius // 2 * 2 + 1),) * 2)
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+
+def make_ptgui_sky_proxy(
+    source: Path,
+    destination: Path,
+    proxy_mask: np.ndarray,
+) -> None:
     rgb = _read_rgb8(source).copy()
-    bottom = int(rgb.shape[0] * float(np.clip(sky_fraction, 0.35, 1.0)))
-    rgb[bottom:] = 0
+    mask = cv2.resize(proxy_mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
+    feather = cv2.GaussianBlur(mask, (0, 0), max(2.0, min(rgb.shape[:2]) / 900.0)).astype(np.float32) / 255.0
+    rgb = np.clip(rgb.astype(np.float32) * feather[:, :, None], 0, 255).astype(np.uint8)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(rgb, "RGB").save(destination, quality=90, subsampling=0)
+    exif_bytes = None
+    try:
+        with Image.open(source) as image:
+            exif = image.getexif()
+            exif_bytes = exif.tobytes() if len(exif) else None
+    except (OSError, ValueError, TypeError):
+        pass
+    save_options = {"quality": 90, "subsampling": 0}
+    if exif_bytes:
+        save_options["exif"] = exif_bytes
+    Image.fromarray(rgb, "RGB").save(destination, **save_options)
 
 
 def _script_path_text(path: Path) -> str:
@@ -165,6 +300,10 @@ def siril_find_stars(siril: Path, proxy: Path, work_dir: Path, name: str, max_st
     star_file = work_dir / list_name
     if not star_file.is_file():
         raise RuntimeError(f"Siril没有生成星表：{proxy.name}")
+    proxy_image = cv2.imdecode(np.fromfile(proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if proxy_image is None:
+        raise RuntimeError(f"无法读取Siril星点代理：{proxy.name}")
+    proxy_height = proxy_image.shape[0]
     rows = []
     for line in star_file.read_text(encoding="utf-8", errors="replace").splitlines():
         if not line or line.startswith("#"):
@@ -184,7 +323,10 @@ def siril_find_stars(siril: Path, proxy: Path, work_dir: Path, name: str, max_st
         # remain the actual acceptance gate.
         if saturated or not (0.5 <= fwhm_x <= 18 and 0.5 <= fwhm_y <= 18) or rmse > 40.0:
             continue
-        rows.append((x, y))
+        # Siril/FITS uses a lower-left Y origin while OpenCV and PTGui image
+        # coordinates use an upper-left origin. Normalize at the boundary so
+        # masks, SIFT support checks, and PTGui control points agree.
+        rows.append((x, proxy_height - 1.0 - y))
     # Three PSF-confirmed stars are sufficient to prove that the sky region is
     # usable.  The actual transform still requires at least six independent
     # RANSAC-filtered SIFT correspondences below, so this does not weaken the
@@ -233,8 +375,10 @@ def match_star_pairs(
 
     meteor_features, base_features = prepare(meteor), prepare(base)
     sift = cv2.SIFT_create(nfeatures=16000, contrastThreshold=0.006, edgeThreshold=15, sigma=1.2)
-    mk, md = sift.detectAndCompute(meteor_features, None)
-    bk, bd = sift.detectAndCompute(base_features, None)
+    meteor_feature_mask = make_star_sky_mask(meteor.shape, meteor_stars, radius=max(12, round(min(meteor.shape) / 70)))
+    base_feature_mask = make_star_sky_mask(base.shape, base_stars, radius=max(12, round(min(base.shape) / 70)))
+    mk, md = sift.detectAndCompute(meteor_features, meteor_feature_mask)
+    bk, bd = sift.detectAndCompute(base_features, base_feature_mask)
     if md is None or bd is None:
         raise RuntimeError("Siril星区内没有足够的可匹配特征")
     candidates = cv2.BFMatcher(cv2.NORM_L2).knnMatch(md, bd, k=2)
@@ -262,8 +406,15 @@ def match_star_pairs(
             result = np.minimum(result, np.sqrt(((points[:, None, :] - block[None, :, :]) ** 2).sum(axis=2)).min(axis=1))
         return result
 
-    supported = (nearest_distance(source, meteor_stars) <= 16) & (nearest_distance(target, base_stars) <= 16)
-    if int(supported.sum()) >= 8:
+    support_radius = max(10.0, min(base.shape) / 80.0)
+    supported = (
+        (nearest_distance(source, meteor_stars) <= support_radius)
+        & (nearest_distance(target, base_stars) <= support_radius)
+    )
+    # Siril is a sky/PSF validator, not the sole correspondence detector. Two
+    # differently processed frames may expose different subsets of faint stars;
+    # in that case retain the already mask-limited, MAGSAC-consistent matches.
+    if int(supported.sum()) >= 6:
         source, target = source[supported], target[supported]
     projected = cv2.perspectiveTransform(source[:, None, :], transform)[:, 0, :]
     errors = np.linalg.norm(projected - target, axis=1)
@@ -417,7 +568,10 @@ def transfer_proxy_solution(
 def configure_single_star_project(
     project_file: Path,
     pairs: list[tuple[np.ndarray, np.ndarray]],
-    calibration_project: Path,
+    base_lens: ImageLensInfo,
+    meteor_lens: ImageLensInfo,
+    image_width: int,
+    image_height: int,
     initial_position: dict[str, float] | None = None,
 ) -> None:
     """Configure one base + one meteor project using sky-only control points."""
@@ -425,9 +579,13 @@ def configure_single_star_project(
     project = data["project"]
     if len(project["imagegroups"]) != 2:
         raise RuntimeError("单张PTGui工程必须包含底图和一张流星图")
-    calibrated = json.loads(calibration_project.read_text(encoding="utf-8"))["project"]
-    project["globallenses"] = json.loads(json.dumps(calibrated["globallenses"][:1]))
-    _link_all_to_first_lens(project)
+    _set_independent_lenses(
+        project,
+        [base_lens, meteor_lens],
+        image_width,
+        image_height,
+        optimize_distortion=len(pairs) >= 16,
+    )
     for index, group in enumerate(project["imagegroups"]):
         movable = index == 1
         group["position"]["optimizerflags"].update({"yaw": movable, "pitch": movable, "roll": movable})
@@ -476,9 +634,9 @@ def transfer_single_solution(full_project_file: Path, proxy_project_file: Path) 
     full = full_data["project"]
     if len(full["imagegroups"]) != 2 or len(proxy["imagegroups"]) != 2:
         raise RuntimeError("单张代理工程与原图工程结构不一致")
-    full["globallenses"] = json.loads(json.dumps(proxy["globallenses"][:1]))
-    _link_all_to_first_lens(full)
+    full["globallenses"] = json.loads(json.dumps(proxy["globallenses"]))
     for index, group in enumerate(full["imagegroups"]):
+        group["globallens"] = int(proxy["imagegroups"][index].get("globallens", index))
         solved = proxy["imagegroups"][index]["position"]["params"]
         for target in (group["position"]["params"], group["linkable"]["position"]["params"]):
             target.update({key: solved[key] for key in ("yaw", "pitch", "roll")})
@@ -505,6 +663,67 @@ def configure_layer_export(project_file: Path, output_base: Path) -> None:
     project_file.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
 
 
+def _set_independent_lenses(
+    project: dict,
+    lens_infos: list[ImageLensInfo],
+    image_width: int,
+    image_height: int,
+    optimize_distortion: bool = False,
+) -> None:
+    if len(project.get("imagegroups", [])) != len(lens_infos):
+        raise RuntimeError("镜头信息数量与PTGui图层数量不一致")
+    existing = project.get("globallenses") or []
+    if not existing:
+        raise RuntimeError("PTGui工程缺少镜头模型")
+    templates = []
+    for index, info in enumerate(lens_infos):
+        source = existing[min(index, len(existing) - 1)]
+        lens_group = json.loads(json.dumps(source))
+        params = lens_group["lens"]["params"]
+        params.update(
+            {
+                "projection": "rectilinear",
+                "focallength": float(info.focal_length),
+                "sensordiagonal": float(info.sensor_diagonal),
+            }
+        )
+        flags = lens_group["lens"]["optimizerflags"]
+        flags.update(
+            {
+                "fov": False,
+                "a": bool(optimize_distortion and index > 0),
+                "b": bool(optimize_distortion and index > 0),
+                "c": bool(optimize_distortion and index > 0),
+                "fisheyefactor": False,
+            }
+        )
+        lens_group["shift"]["optimizerflags"].update({"longside": False, "shortside": False})
+        lens_group["shear"]["optimizerflags"].update({"hshear": False, "vshear": False})
+        templates.append(lens_group)
+        project["imagegroups"][index]["globallens"] = index
+    project["globallenses"] = templates
+    base_lens = lens_infos[0]
+    aspect = image_width / max(1, image_height)
+    sensor_height = base_lens.sensor_diagonal / math.sqrt(aspect * aspect + 1.0)
+    sensor_width = sensor_height * aspect
+    hfov = math.degrees(2.0 * math.atan(sensor_width / (2.0 * base_lens.focal_length)))
+    vfov = math.degrees(2.0 * math.atan(sensor_height / (2.0 * base_lens.focal_length)))
+    project["panoramaparams"].update({"projection": "rectilinear", "hfov": hfov, "vfov": vfov, "outputcrop": [0, 0, 1, 1]})
+    project["outputsize"].update({"mode": "relative", "fractionofoptimumsize": 1})
+
+
+def configure_input_lenses(
+    project_file: Path,
+    lens_infos: list[ImageLensInfo],
+    image_width: int,
+    image_height: int,
+) -> None:
+    data = json.loads(project_file.read_text(encoding="utf-8"))
+    project = data["project"]
+    _set_independent_lenses(project, lens_infos, image_width, image_height, optimize_distortion=False)
+    project_file.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
+
+
 def configure_input_lens(
     project_file: Path,
     focal_length: float,
@@ -512,19 +731,11 @@ def configure_input_lens(
     image_width: int,
     image_height: int,
 ) -> None:
+    """Backward-compatible wrapper; new code should pass per-image lens data."""
     data = json.loads(project_file.read_text(encoding="utf-8"))
-    project = data["project"]
-    _link_all_to_first_lens(project)
-    lens = project["globallenses"][0]["lens"]["params"]
-    lens.update({"projection": "rectilinear", "focallength": float(focal_length), "sensordiagonal": float(sensor_diagonal)})
-    aspect = image_width / max(1, image_height)
-    sensor_height = sensor_diagonal / math.sqrt(aspect * aspect + 1.0)
-    sensor_width = sensor_height * aspect
-    hfov = math.degrees(2.0 * math.atan(sensor_width / (2.0 * focal_length)))
-    vfov = math.degrees(2.0 * math.atan(sensor_height / (2.0 * focal_length)))
-    project["panoramaparams"].update({"projection": "rectilinear", "hfov": hfov, "vfov": vfov, "outputcrop": [0, 0, 1, 1]})
-    project["outputsize"].update({"mode": "relative", "fractionofoptimumsize": 1})
-    project_file.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
+    count = len(data["project"].get("imagegroups", []))
+    info = ImageLensInfo(float(focal_length), float(sensor_diagonal), None, "兼容参数")
+    configure_input_lenses(project_file, [info] * count, image_width, image_height)
 
 
 def _distributed_base_points(stars: np.ndarray, scale: float, width: int, height: int) -> list[tuple[float, float]]:
@@ -540,7 +751,7 @@ def run_alignment_pipeline(
     ptgui: Path,
     siril: Path,
     progress: Progress | None = None,
-    sky_fraction: float = 0.604,
+    sky_fraction: float | None = None,
     focal_length: float = 14.0,
     sensor_diagonal: float = 43.2666,
     export_layers: bool = True,
@@ -557,37 +768,61 @@ def run_alignment_pipeline(
         task_dir = output_root / f"MeteorStudio_PTGui_v{counter}"
         counter += 1
     proxy_dir = task_dir / "cache" / "sky_proxies"
+    mask_dir = task_dir / "cache" / "sky_masks"
     ptgui_proxy_dir = task_dir / "cache" / "ptgui_full_proxies"
     siril_dir = task_dir / "cache" / "siril_stars"
     layer_dir = task_dir / "aligned_layers"
     reference_dir = task_dir / "aligned_reference"
     project_dir = task_dir / "ptgui_project"
-    for folder in (proxy_dir, ptgui_proxy_dir, siril_dir, layer_dir, reference_dir, project_dir):
+    for folder in (proxy_dir, mask_dir, ptgui_proxy_dir, siril_dir, layer_dir, reference_dir, project_dir):
         folder.mkdir(parents=True, exist_ok=True)
     log_file = task_dir / "pipeline.log"
     manifest_file = task_dir / "alignment_manifest.json"
     scale = 0.25
     notify = progress or (lambda _value, _text: None)
-    notify(1, "生成底图星点代理…")
+    base_lens = read_lens_info(base, focal_length, sensor_diagonal)
+    notify(1, f"生成底图星点代理（{base_lens.focal_length:.1f}mm，{base_lens.source}）…")
     base_proxy = proxy_dir / "base_sky.png"
+    # Automatic mode always examines the full frame. A non-None value remains
+    # available only for callers explicitly requesting the legacy safety cap.
     base_width, base_height = make_sky_proxy(base, base_proxy, scale, sky_fraction)
-    base_ptgui_proxy = ptgui_proxy_dir / "base_sky_full.jpg"
-    make_ptgui_sky_proxy(base, base_ptgui_proxy, sky_fraction)
     base_stars, siril_log = siril_find_stars(siril, base_proxy, siril_dir, "base")
+    base_proxy_image = cv2.imdecode(np.fromfile(base_proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if base_proxy_image is None:
+        raise RuntimeError("无法读取底图星点代理")
+    base_stars = filter_sky_stars(base_stars, base_proxy_image.shape)
+    base_sky_mask = make_star_sky_mask(base_proxy_image.shape, base_stars)
+    cv2.imencode(".png", base_sky_mask)[1].tofile(mask_dir / "base_sky_mask.png")
+    base_ptgui_proxy = ptgui_proxy_dir / "base_sky_full.jpg"
+    make_ptgui_sky_proxy(base, base_ptgui_proxy, base_sky_mask)
     items: list[AlignmentItem] = []
     matched: list[tuple[int, list[tuple[np.ndarray, np.ndarray]]]] = []
     accepted: list[Path] = []
     accepted_proxies: list[Path] = []
+    accepted_lenses: list[ImageLensInfo] = []
     for sequence, source in enumerate(meteor_files, start=1):
         item = AlignmentItem(str(source))
         try:
-            notify(4 + sequence / len(meteor_files) * 45, f"Siril寻找星点 {sequence}/{len(meteor_files)}：{source.name}")
+            lens_info = read_lens_info(source, focal_length, sensor_diagonal)
+            item.focal_length = lens_info.focal_length
+            item.focal_source = lens_info.source
+            notify(
+                4 + sequence / len(meteor_files) * 45,
+                f"Siril寻找星点 {sequence}/{len(meteor_files)}：{source.name}（{lens_info.focal_length:.1f}mm）",
+            )
             proxy = proxy_dir / f"{source.stem}_sky.png"
             width, height = make_sky_proxy(source, proxy, scale, sky_fraction)
             if (width, height) != (base_width, base_height):
                 raise ValueError(f"尺寸{width}×{height}与底图{base_width}×{base_height}不同")
             stars, star_log = siril_find_stars(siril, proxy, siril_dir, source.stem)
             siril_log += "\n" + star_log
+            proxy_image = cv2.imdecode(np.fromfile(proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if proxy_image is None:
+                raise RuntimeError("无法读取当前星点代理")
+            stars = filter_sky_stars(stars, proxy_image.shape)
+            sky_mask = make_star_sky_mask(proxy_image.shape, stars)
+            item.sky_coverage = float(np.count_nonzero(sky_mask) / sky_mask.size)
+            cv2.imencode(".png", sky_mask)[1].tofile(mask_dir / f"{source.stem}_sky_mask.png")
             pairs, median_error = match_star_pairs(proxy, base_proxy, stars, base_stars, scale)
             item.control_points = len(pairs)
             item.median_error = median_error
@@ -602,11 +837,14 @@ def run_alignment_pipeline(
                 item.message = f"已保留基础对齐；星点误差 {median_error:.2f}px，建议100%检查后微调"
             else:
                 item.status = "可对齐"
+            lens_note = f"焦距 {lens_info.focal_length:.1f}mm（{lens_info.source}），自动星点有效区 {item.sky_coverage * 100:.1f}%"
+            item.message = f"{item.message}；{lens_note}" if item.message else lens_note
             item.layer_index = len(accepted) + 2
             accepted.append(source)
             ptgui_proxy = ptgui_proxy_dir / f"{source.stem}_sky_full.jpg"
-            make_ptgui_sky_proxy(source, ptgui_proxy, sky_fraction)
+            make_ptgui_sky_proxy(source, ptgui_proxy, sky_mask)
             accepted_proxies.append(ptgui_proxy)
+            accepted_lenses.append(lens_info)
             matched.append((item.layer_index, pairs))
         except Exception as exc:
             item.status = "需处理"
@@ -626,37 +864,7 @@ def run_alignment_pipeline(
         manifest_file.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
         notify(100, "无可靠对齐；已输出全部原始状态")
         return result
-    notify(52, "创建共享镜头标定…")
-    lens_seed = project_dir / "lens_seed.pts"
-    _run([str(ptgui), "-createproject", str(base), str(accepted[0]), "-output", str(lens_seed)], project_dir, log_file)
-    configure_input_lens(lens_seed, focal_length, sensor_diagonal, base_width, base_height)
-    base_points = _distributed_base_points(base_stars, scale, base_width, base_height)
-    # Calibrate lens distortion from a small, evenly-spaced subset.  Using the
-    # entire time span can let a few imperfect correspondences pull PTGui into
-    # a degenerate lens solution; five samples retain the useful parallax-free
-    # sky coverage while keeping the fit stable.
-    lens_source = lens_seed
-    if len(accepted_proxies) >= 3:
-        sample_count = min(5, len(accepted_proxies))
-        sample_positions = sorted({int(round(value)) for value in np.linspace(0, len(accepted_proxies) - 1, sample_count)})
-        calibration_proxies = [accepted_proxies[index] for index in sample_positions]
-        calibration_matched = [(sample_index + 2, matched[source_index][1]) for sample_index, source_index in enumerate(sample_positions)]
-        calibration_project = project_dir / "meteor_lens_calibration.pts"
-        _run(
-            [str(ptgui), "-createproject", str(base_ptgui_proxy), str(base_ptgui_proxy), *(str(p) for p in calibration_proxies), "-output", str(calibration_project)],
-            project_dir,
-            log_file,
-        )
-        configure_blog_project(
-            calibration_project, base_points, calibration_matched,
-            calibration_project=lens_seed, coordinate_scale=1.0, optimize_lens=True,
-        )
-        notify(55, f"PTGui自动标定镜头（{len(calibration_proxies)}张样本）…")
-        _run([str(ptgui), "-stitchnogui", str(calibration_project)], project_dir, log_file)
-        calibrated = json.loads(calibration_project.read_text(encoding="utf-8"))["project"]
-        if not calibrated.get("hasbeenoptimized"):
-            raise RuntimeError("PTGui没有完成镜头标定")
-        lens_source = calibration_project
+    notify(52, "按每张EXIF焦距创建独立镜头模型…")
     sky_projects = project_dir / "sky_projects"
     ready_projects = project_dir / "ready_projects"
     sky_projects.mkdir(exist_ok=True)
@@ -666,7 +874,9 @@ def run_alignment_pipeline(
     first_ready_project: Path | None = None
     previous_position: dict[str, float] | None = None
     by_source = {item.source: item for item in items}
-    for index, (source, proxy, (_old_layer_index, pairs)) in enumerate(zip(accepted, accepted_proxies, matched), start=1):
+    for index, (source, proxy, source_lens, (_old_layer_index, pairs)) in enumerate(
+        zip(accepted, accepted_proxies, accepted_lenses, matched), start=1
+    ):
         item = by_source[str(source)]
         needs_review = item.status == "需复查"
         try:
@@ -674,7 +884,7 @@ def run_alignment_pipeline(
             sky_project = sky_projects / f"{source.stem}_sky.pts"
             _run([str(ptgui), "-createproject", str(base_ptgui_proxy), str(proxy), "-output", str(sky_project)], project_dir, log_file)
             configure_single_star_project(
-                sky_project, pairs, lens_source,
+                sky_project, pairs, base_lens, source_lens, base_width, base_height,
                 initial_position=previous_position if needs_review else None,
             )
             _run([str(ptgui), "-stitchnogui", str(sky_project)], project_dir, log_file)
@@ -685,7 +895,7 @@ def run_alignment_pipeline(
             previous_position = {key: float(solved_position[key]) for key in ("yaw", "pitch", "roll")}
             ready_project = ready_projects / f"{source.stem}_READY.pts"
             _run([str(ptgui), "-createproject", str(base), str(source), "-output", str(ready_project)], project_dir, log_file)
-            configure_input_lens(ready_project, focal_length, sensor_diagonal, base_width, base_height)
+            configure_input_lenses(ready_project, [base_lens, source_lens], base_width, base_height)
             transfer_single_solution(ready_project, sky_project)
             first_ready_project = first_ready_project or ready_project
             if export_layers:
@@ -709,7 +919,7 @@ def run_alignment_pipeline(
         except Exception as exc:
             item.status = "需处理"
             item.message = str(exc)
-    project_file = first_ready_project or lens_source
+    project_file = first_ready_project or project_dir
     # A per-image failure must not remove the photograph from the workflow.
     # Keep the read-only original as the editable fallback; successfully
     # aligned items still retain the same original path for the Studio reset.

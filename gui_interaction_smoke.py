@@ -32,7 +32,7 @@ def run_smoke(app, project_path: Path) -> dict:
         raise RuntimeError(f"Candidate image was not scanned: {path}")
     source, base, dims = None, None, None
     result = app._load_preview_worker(path, app._effective_source_path(path), app.pairs[candidate_key])
-    _, loaded_path, source, base, dims = result
+    _, loaded_path, source, base, dims, _base_path, _pairing_signature = result
     app.current_path = loaded_path
     app.preview_source = source
     app.preview_base = base
@@ -76,9 +76,9 @@ def run_smoke(app, project_path: Path) -> dict:
     output_dir = Path(output_dir_text) if output_dir_text else None
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(app.preview_rgb).save(output_dir / "DSC04890_01_candidate_selected.png")
+        Image.fromarray(app.preview_rgb).save(output_dir / "sample_01_candidate_selected.png")
         Image.fromarray(np.clip(selected_mask * 255, 0, 255).astype(np.uint8)).save(
-            output_dir / "DSC04890_01_candidate_mask.png"
+            output_dir / "sample_01_candidate_mask.png"
         )
 
     # Draw through the actual ButtonPress/B1-Motion/ButtonRelease bindings.
@@ -104,11 +104,11 @@ def run_smoke(app, project_path: Path) -> dict:
     if np.count_nonzero(manual_mask > 0.05) <= np.count_nonzero(selected_mask > 0.05):
         raise AssertionError("Manual brush did not add visible mask pixels")
     if output_dir is not None:
-        Image.fromarray(app.preview_rgb).save(output_dir / "DSC04890_02_manual_added.png")
+        Image.fromarray(app.preview_rgb).save(output_dir / "sample_02_manual_added.png")
         Image.fromarray(np.clip(manual_mask * 255, 0, 255).astype(np.uint8)).save(
-            output_dir / "DSC04890_02_combined_mask.png"
+            output_dir / "sample_02_combined_mask.png"
         )
-        (output_dir / "DSC04890_interaction_demo.json").write_text(
+        (output_dir / "sample_interaction_demo.json").write_text(
             json.dumps(app._project_data(), ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
