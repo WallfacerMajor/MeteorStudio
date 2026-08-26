@@ -43,7 +43,10 @@ class AlignmentWorkspace(tk.Toplevel):
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
-        ttk.Label(root, text="星空对齐与分层导出", font=("TkDefaultFont", 15, "bold")).pack(anchor="w")
+        header = ttk.Frame(root)
+        header.pack(fill="x")
+        ttk.Label(header, text="星空对齐与分层导出", font=("TkDefaultFont", 15, "bold")).pack(side="left")
+        ttk.Button(header, text="返回图片合成工作区", command=self.destroy).pack(side="right")
         ttk.Label(
             root,
             text="Siril只辅助寻找星点；PTGui按双底图锁定流程优化并原生导出。流星在返回主工作区后再抠。",

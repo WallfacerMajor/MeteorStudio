@@ -842,6 +842,7 @@ class VideoMeteorWindow(tk.Toplevel):
             header,
             text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
         ).pack(side="left", padx=14)
+        ttk.Button(header, text="返回图片合成工作区", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
 
