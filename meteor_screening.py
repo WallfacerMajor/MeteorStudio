@@ -21,6 +21,8 @@ import tifffile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageOps, ImageTk
+from platform_utils import open_folder
+from error_dialog import show_copyable_error, show_runtime_log
 
 
 RAW_SUFFIXES = {".arw", ".nef", ".nrw", ".cr2", ".cr3", ".crw"}
@@ -443,6 +445,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Label(header, text="流星批量筛选", font=("TkDefaultFont", 15, "bold")).pack(side="left")
         ttk.Label(header, text="与流星合成共用同一AI · 支持主流RAW/TIFF/JPG/PNG · 原图只读").pack(side="left", padx=12)
         ttk.Button(header, text="返回流星合成功能", command=self._return_to_composer).pack(side="right")
+        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(0, 6))
 
         settings = ttk.LabelFrame(root, text="筛选设置", padding=8)
         settings.pack(fill="x")
@@ -463,6 +466,9 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Label(settings, text="最近实际导出位置").grid(row=3, column=0, sticky="w", pady=(7, 0))
         ttk.Entry(settings, textvariable=self.last_export_dir, state="readonly").grid(
             row=3, column=1, columnspan=3, sticky="ew", padx=6, pady=(7, 0),
+        )
+        ttk.Button(settings, text="打开文件夹", command=self._open_export_folder).grid(
+            row=3, column=4, padx=(10, 0), pady=(7, 0), sticky="ew",
         )
         settings.columnconfigure(1, weight=1)
 
@@ -699,6 +705,8 @@ class MeteorScreeningWindow(tk.Toplevel):
         value = filedialog.askdirectory(title="选择连续拍摄照片文件夹", parent=self)
         if value:
             self.source_dir.set(value)
+            if not self.output_dir.get().strip():
+                self.output_dir.set(str(Path(value) / "MeteorStudio_Output"))
 
     def _browse_output(self) -> None:
         value = filedialog.askdirectory(title="选择筛选结果保存位置", parent=self)
@@ -708,14 +716,14 @@ class MeteorScreeningWindow(tk.Toplevel):
     def analyze(self) -> None:
         source = Path(self.source_dir.get().strip()).expanduser()
         if not source.is_dir():
-            messagebox.showerror("流星批量筛选", "请选择有效的照片文件夹", parent=self)
+            show_copyable_error("流星批量筛选", "请选择有效的照片文件夹", parent=self)
             return
         files = sorted(
             (path for path in source.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES),
             key=capture_sort_key,
         )
         if len(files) < 3:
-            messagebox.showerror("流星批量筛选", "至少需要 3 张连续照片；推荐 5 张以上", parent=self)
+            show_copyable_error("流星批量筛选", "至少需要 3 张连续照片；推荐 5 张以上", parent=self)
             return
         self.files = files
         self.results = []
@@ -1341,17 +1349,18 @@ class MeteorScreeningWindow(tk.Toplevel):
         if not self.results:
             messagebox.showwarning("流星批量筛选", "请先完成分析", parent=self)
             return
-        output = Path(self.output_dir.get().strip()).expanduser()
         source = Path(self.source_dir.get().strip()).expanduser()
+        output_text = self.output_dir.get().strip()
+        output = (
+            Path(output_text).expanduser()
+            if output_text else source / "MeteorStudio_Output"
+        )
+        if not output_text:
+            self.output_dir.set(str(output))
+        output.mkdir(parents=True, exist_ok=True)
         if not output.is_dir():
-            messagebox.showerror("流星批量筛选", "请选择有效的筛选结果保存位置", parent=self)
+            show_copyable_error("流星批量筛选", "请选择有效的筛选结果保存位置", parent=self)
             return
-        try:
-            output.resolve().relative_to(source.resolve())
-            messagebox.showerror("流星批量筛选", "输出文件夹不能位于原图文件夹内部", parent=self)
-            return
-        except ValueError:
-            pass
         selected = [item for item in self.results if self._effective_decision(item)]
         if not selected:
             messagebox.showwarning("流星批量筛选", "当前没有保留的照片", parent=self)
@@ -1414,12 +1423,20 @@ class MeteorScreeningWindow(tk.Toplevel):
         self._save_autosave()
         feedback_note = f"；保存 {len(explicit_feedback)} 条候选级AI反馈" if explicit_feedback else ""
         self.status.set(f"已导出 {len(selected)} 张；实际导出位置：{run_dir}{feedback_note}")
-        messagebox.showinfo(
+        if messagebox.askyesno(
             "流星批量筛选",
             f"已导出 {len(selected)} 张流星照片。{feedback_note}\n\n"
             f"实际导出位置：\n{run_dir}\n\n"
-            "返回流星合成功能时会自动填入这个文件夹。", parent=self
-        )
+            "返回流星合成功能时会自动填入这个文件夹。\n\n是否现在打开？", parent=self
+        ):
+            self._open_export_folder()
+
+    def _open_export_folder(self) -> None:
+        path = self.last_export_dir.get().strip() or self.output_dir.get().strip()
+        try:
+            open_folder(path)
+        except Exception as exc:
+            show_copyable_error("打开文件夹", str(exc), parent=self)
 
     def _poll_queue(self) -> None:
         try:
@@ -1463,7 +1480,9 @@ class MeteorScreeningWindow(tk.Toplevel):
                 elif item[0] == "error":
                     _, message, details = item
                     self.status.set("分析失败：" + message)
-                    messagebox.showerror("流星批量筛选", message + "\n\n" + details[-1800:], parent=self)
+                    show_copyable_error(
+                        "流星批量筛选", message, parent=self, details=details
+                    )
         except queue.Empty:
             pass
         if self.winfo_exists():

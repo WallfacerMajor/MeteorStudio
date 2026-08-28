@@ -2,6 +2,8 @@ import unittest
 import tempfile
 import json
 import queue
+import threading
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,12 +15,16 @@ from meteor_composer import (
     MeteorComposer, Stroke, content_distance_map, line_inside_valid_content,
     normalize_lsd_lines, point_in_padded_bbox, compose_meteor_objects,
     compose_meteor_sources,
-    remove_local_background_cast, annotate_meteor_sources,
+    remove_local_background_cast, annotate_meteor_sources, meteor_mask_boxes,
     meteor_source_annotations, stroke_is_transformed, reset_stroke_geometry,
     adjust_composite_base_exposure,
     analyze_meteor_blend_parameters,
     active_stroke_keys,
     merge_collinear_candidates,
+    transformed_mask_crop, transformed_stroke_points, stroke_for_image_crop,
+    strokes_for_composite_crop, preview_memory_budgets,
+    estimate_trail_mask_geometry,
+    to_uint16,
 )
 
 
@@ -31,6 +37,90 @@ class FakeVar:
 
     def set(self, value):
         self.value = value
+
+
+class FloatTiffDisplayTests(unittest.TestCase):
+    def test_normalized_float_uses_linear_to_srgb_transfer(self):
+        image = np.full((2, 2, 3), 0.05, dtype=np.float32)
+        converted = to_uint16(image)
+        self.assertGreater(int(converted[0, 0, 0]), 15000)
+        self.assertLess(int(converted[0, 0, 0]), 17000)
+
+    def test_integer_tiff_values_are_not_regamma_encoded(self):
+        image = np.full((2, 2, 3), 12345, dtype=np.uint16)
+        np.testing.assert_array_equal(to_uint16(image), image)
+
+
+class FullResolutionPreviewTests(unittest.TestCase):
+    def test_memory_budgets_are_bounded(self):
+        display, precision, viewport = preview_memory_budgets()
+        self.assertGreaterEqual(display, 512 << 20)
+        self.assertLessEqual(display, 1536 << 20)
+        self.assertGreaterEqual(precision, 384 << 20)
+        self.assertLessEqual(viewport, 256 << 20)
+
+    def test_full_image_cache_preserves_dimensions_and_reuses_array(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "full.tif"
+            image = np.arange(40 * 60 * 3, dtype=np.uint16).reshape(40, 60, 3)
+            tifffile.imwrite(path, image, photometric="rgb")
+            fake = SimpleNamespace(
+                preview_cache_lock=threading.Lock(),
+                full_display_cache=OrderedDict(), full_precision_cache=OrderedDict(),
+                full_display_cache_bytes=0, full_precision_cache_bytes=0,
+                full_display_cache_budget=512 << 20, full_precision_cache_budget=384 << 20,
+                full_cache_inflight={}, full_cache_pinned_paths=set(), pairs={}, current_path=None,
+            )
+            first = MeteorComposer._cached_full_image(fake, path, False)
+            second = MeteorComposer._cached_full_image(fake, path, False)
+            self.assertEqual(first.shape, (40, 60, 3))
+            self.assertIs(first, second)
+
+    def test_transformed_mask_is_limited_to_affected_crop(self):
+        source = np.zeros((600, 900, 3), dtype=np.uint8)
+        stroke = Stroke([(0.3, 0.4), (0.55, 0.5)], 20, 8, rotation=12, offset_x=30)
+        built = transformed_mask_crop(source, [stroke])
+        self.assertIsNotNone(built)
+        mask, box = built
+        self.assertLess(mask.size, source.shape[0] * source.shape[1] // 3)
+        self.assertGreater(float(mask.max()), 0.5)
+        self.assertGreater(box[2], box[0])
+
+    def test_crop_geometry_keeps_pixel_position(self):
+        stroke = Stroke([(0.25, 0.4), (0.75, 0.6)], 18, 6, offset_x=12, rotation=7)
+        cropped = stroke_for_image_crop(stroke, 1001, 801, 100, 80, 701, 601)
+        full_points = np.asarray(transformed_stroke_points(stroke, 1001, 801))
+        crop_points = np.asarray(transformed_stroke_points(cropped, 701, 601))
+        full_pixels = full_points * np.asarray((1000, 800))
+        crop_pixels = crop_points * np.asarray((700, 600)) + np.asarray((100, 80))
+        np.testing.assert_allclose(full_pixels, crop_pixels, atol=1e-3)
+
+    def test_roi_composite_matches_full_frame_for_transformed_meteor(self):
+        base = np.full((160, 240, 3), 18, dtype=np.uint8)
+        source = base.copy()
+        cv2.line(source, (50, 90), (125, 60), (220, 235, 250), 5, cv2.LINE_AA)
+        stroke = Stroke(
+            [(50 / 239, 90 / 159), (125 / 239, 60 / 159)],
+            18, 7, offset_x=34, offset_y=-12, rotation=9, length_scale=1.12,
+        )
+        full, full_mask = compose_meteor_sources(
+            source, source, base, [stroke], False, False, 0, 0,
+            "自然融合", True, 100, 70, True,
+        )
+        cropped_strokes, (x0, y0, x1, y1) = strokes_for_composite_crop(
+            [stroke], 240, 160, True
+        )
+        crop_result, crop_mask = compose_meteor_sources(
+            source[y0:y1, x0:x1], source[y0:y1, x0:x1],
+            base[y0:y1, x0:x1], cropped_strokes,
+            False, False, 0, 0, "自然融合", True, 100, 70, True,
+        )
+        rebuilt = base.copy()
+        rebuilt[y0:y1, x0:x1] = crop_result
+        rebuilt_mask = np.zeros_like(full_mask)
+        rebuilt_mask[y0:y1, x0:x1] = crop_mask
+        np.testing.assert_array_equal(rebuilt, full)
+        np.testing.assert_allclose(rebuilt_mask, full_mask, atol=2e-3)
 
 
 class NormalizeLsdLinesTests(unittest.TestCase):
@@ -173,6 +263,56 @@ class BaseSelectionInvalidationTests(unittest.TestCase):
         }
         pairs = {current: Path("C:/bases/current.tif")}
         self.assertEqual(active_stroke_keys(strokes, pairs), [current])
+
+    def test_old_autosave_masks_are_not_editable_in_current_batch(self):
+        current, stale = "C:/new/current.tif", "C:/old/DSC06611.tif"
+        fake = SimpleNamespace(
+            strokes={
+                current: [Stroke([(0.1, 0.2), (0.8, 0.7)], 20, 8)],
+                stale: [Stroke([(0.2, 0.3), (0.7, 0.6)], 20, 8)],
+            },
+            pairs={current: Path("C:/base.tif")}, current_path=None,
+            _uses_shared_base=lambda: True,
+        )
+        self.assertEqual(MeteorComposer._editable_object_refs(fake), [(current, 0)])
+
+    def test_old_autosave_masks_are_not_in_preview_signature(self):
+        current, stale = "C:/new/current.tif", "C:/old/DSC06611.tif"
+        fake = SimpleNamespace(
+            strokes={
+                current: [Stroke([(0.1, 0.2), (0.8, 0.7)], 20, 8)],
+                stale: [Stroke([(0.2, 0.3), (0.7, 0.6)], 20, 8)],
+            },
+            pairs={current: Path("C:/base.tif")}, base_dir=FakeVar("C:/base.tif"),
+            blend_mode=FakeVar("自然融合"), image_adjustments={stale: {"x": 1}},
+            adjustment_defaults={}, preview_base=np.zeros((2, 2, 3), dtype=np.uint8),
+        )
+        signature = MeteorComposer._global_preview_state_signature(fake)
+        self.assertIn("current.tif", signature)
+        self.assertNotIn("DSC06611", signature)
+
+    def test_successful_scan_removes_other_batch_state_from_project(self):
+        current, stale = "C:/new/current.tif", "C:/old/DSC06611.tif"
+        fake = SimpleNamespace(
+            strokes={current: [object()], stale: [object()]},
+            candidates={current: [object()], stale: [object()]},
+            candidate_thresholds={current: 60, stale: 70},
+            image_adjustments={current: {"x": 1}, stale: {"x": 2}},
+            original_sources={current: Path("C:/raw/current.arw"), stale: Path("C:/raw/old.arw")},
+            alignment_statuses={current: "完成", stale: "完成"},
+            use_original_sources={current, stale},
+            edit_history={current: [], stale: []}, edit_redo={current: [], stale: []},
+            shift_anchors={current: (0.1, 0.2), stale: (0.3, 0.4)},
+            selected_object=None, _clear_object_selection=lambda: None,
+        )
+        MeteorComposer._restrict_project_to_active_keys(fake, {current})
+        for name in (
+            "strokes", "candidates", "candidate_thresholds", "image_adjustments",
+            "original_sources", "alignment_statuses", "edit_history", "edit_redo",
+            "shift_anchors",
+        ):
+            self.assertEqual(set(getattr(fake, name)), {current})
+        self.assertEqual(fake.use_original_sources, {current})
 
     def test_signature_changes_when_clean_base_changes(self):
         fake = SimpleNamespace(
@@ -395,6 +535,32 @@ class CandidateButtonGeometryTests(unittest.TestCase):
 
 
 class MeteorBrightnessTests(unittest.TestCase):
+    def test_intelligent_mask_width_measures_cross_section_not_trail_length(self):
+        base = np.full((220, 420, 3), 24, dtype=np.uint8)
+        thin = base.copy()
+        thick = base.copy()
+        cv2.line(thin, (40, 112), (380, 98), (220, 230, 245), 3, cv2.LINE_AA)
+        cv2.line(thick, (40, 112), (380, 98), (220, 230, 245), 13, cv2.LINE_AA)
+        thin_width, thin_feather = estimate_trail_mask_geometry(
+            thin, base, (45, 112), (375, 98), 1.0
+        )
+        thick_width, thick_feather = estimate_trail_mask_geometry(
+            thick, base, (45, 112), (375, 98), 1.0
+        )
+        self.assertGreater(thick_width, thin_width + 4)
+        self.assertGreaterEqual(thick_feather, thin_feather)
+        self.assertLessEqual(thin_width, 16)
+
+    def test_long_thin_trail_does_not_get_length_proportional_width(self):
+        base = np.full((220, 520, 3), 20, dtype=np.uint8)
+        source = base.copy()
+        cv2.line(source, (20, 110), (500, 103), (230, 235, 245), 3, cv2.LINE_AA)
+        width, feather = estimate_trail_mask_geometry(
+            source, base, (25, 110), (495, 103), 1.0
+        )
+        self.assertLessEqual(width, 16)
+        self.assertLessEqual(feather, 9)
+
     def test_per_meteor_analyzer_derives_full_resolution_parameters(self):
         base = np.full((180, 320, 3), (7000, 8200, 9800), dtype=np.uint16)
         source = base.copy()
@@ -485,6 +651,34 @@ class MeteorBrightnessTests(unittest.TestCase):
         plain_error = np.abs(source.astype(np.int16) - base.astype(np.int16))[sky].mean()
         cleaned_error = np.abs(cleaned - base.astype(np.float32))[sky].mean()
         self.assertLess(cleaned_error, plain_error * 0.45)
+
+    def test_auto_optimize_falls_back_before_erasing_moved_meteor(self):
+        height, width = 400, 600
+        yy, xx = np.mgrid[:height, :width]
+        base = np.empty((height, width, 3), dtype=np.uint16)
+        for channel, level in enumerate((2600, 3000, 3800)):
+            base[..., channel] = np.clip(level + xx * 3 + yy * 2, 0, 65535)
+        source = np.clip(
+            base.astype(np.int32)
+            + np.stack((xx * 5 + 900, yy * 3 + 500, xx * 2 + yy * 2 + 700), axis=2),
+            0, 65535,
+        ).astype(np.uint16)
+        cv2.line(source, (390, 38), (430, 2), (42000, 47000, 55000), 4, cv2.LINE_AA)
+        stroke = Stroke(
+            [(390 / (width - 1), 38 / (height - 1)),
+             (430 / (width - 1), 2 / (height - 1))],
+            22, 18, offset_x=55, offset_y=100, rotation=-12,
+            auto_cleanup=80, auto_black_point=1.252,
+            auto_brightness=100.7, auto_feather=20,
+        )
+        result, mask = compose_meteor_objects(
+            source, base, [stroke], True, True, 15, 100,
+            "自然融合", True, 100, 88, True,
+        )
+        positive = np.maximum(result.astype(np.float32) - base, 0.0).mean(axis=2)
+        active = (positive > 64.0) & (mask > 0.001)
+        self.assertGreater(int(active.sum()), 100)
+        self.assertGreater(float(positive.max()), 10000.0)
 
     def test_levels_style_cleanup_rejects_weak_colored_blocks(self):
         base = np.full((110, 200, 3), (32, 38, 48), dtype=np.uint8)
@@ -616,6 +810,17 @@ class CandidateThresholdOrderingTests(unittest.TestCase):
 
 
 class SourceAnnotationTests(unittest.TestCase):
+    def test_large_float16_export_mask_can_be_resized_for_boxes(self):
+        mask = np.zeros((180, 2400), dtype=np.float16)
+        mask[60:120, 350:2100] = np.float16(0.8)
+        boxes = meteor_mask_boxes(mask, preview_limit=2000)
+        self.assertTrue(boxes)
+        x0, y0, x1, y1 = boxes[0]
+        self.assertLessEqual(x0, 355)
+        self.assertGreaterEqual(x1, 2095)
+        self.assertLessEqual(y0, 65)
+        self.assertGreaterEqual(y1, 115)
+
     def test_original_state_uses_explicit_warning_label(self):
         image = np.zeros((180, 320, 3), dtype=np.uint16)
         annotated, records = annotate_meteor_sources(image, [{
@@ -763,7 +968,7 @@ class ExportModeTests(unittest.TestCase):
             self.write_tiff(source, image)
             fake = SimpleNamespace(work_queue=queue.Queue())
             result = MeteorComposer._global_preview_worker(
-                fake, "signature", np.zeros((80, 120, 3), dtype=np.uint8),
+                fake, "signature", 1, np.zeros((80, 120, 3), dtype=np.uint8),
                 {source: [Stroke([(0.15, 0.45), (0.82, 0.45)], 14, 2)]}, {},
                 {"match_exposure": False, "curve_enabled": False,
                  "curve_shadows": 15, "curve_highlights": 25},
@@ -772,6 +977,21 @@ class ExportModeTests(unittest.TestCase):
             kind, signature, clean, labeled, included = result
             self.assertEqual((kind, signature, included), ("global_preview", "signature", 1))
             self.assertFalse(np.array_equal(clean, labeled))
+            queued = []
+            while not fake.work_queue.empty():
+                queued.append(fake.work_queue.get_nowait()[0])
+            self.assertIn("global_preview_partial", queued)
+
+    def test_stale_global_preview_stops_before_recomposing_sources(self):
+        fake = SimpleNamespace(work_queue=queue.Queue(), global_preview_generation=2)
+        result = MeteorComposer._global_preview_worker(
+            fake, "old-signature", 1, np.zeros((20, 30, 3), dtype=np.uint8),
+            {Path("must-not-be-read.tif"): [Stroke([(0.1, 0.1), (0.8, 0.8)], 5, 1)]},
+            {}, {"match_exposure": False, "curve_enabled": False,
+                 "curve_shadows": 15, "curve_highlights": 25},
+            "普通粘贴", {},
+        )
+        self.assertEqual(result, ("global_preview_cancelled", "old-signature"))
 
 
 

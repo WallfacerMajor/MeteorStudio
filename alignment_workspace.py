@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import traceback
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -16,6 +17,21 @@ from ptgui_pipeline import (
     read_lens_info,
     run_alignment_pipeline,
 )
+from platform_utils import open_folder
+from error_dialog import show_copyable_error, show_runtime_log
+
+
+LAB_PROJECTIONS = {
+    "透视（保持直线）": "rectilinear",
+    "墨卡托（宽幅弧线）": "mercator",
+    "等距柱状（天球展开）": "equirectangular",
+    "立体投影（强化辐射感）": "stereographic",
+}
+LAB_CANVASES = {
+    "参考图画布 100%": 1.0,
+    "扩展公共天空 135%": 1.35,
+    "大幅扩展天空 170%": 1.70,
+}
 
 
 class AlignmentWorkspace(tk.Toplevel):
@@ -32,12 +48,16 @@ class AlignmentWorkspace(tk.Toplevel):
         self.siril_path = tk.StringVar(value=str(default_siril_path() or ""))
         self.focal_length = tk.DoubleVar(value=14.0)
         self.sensor_diagonal = tk.DoubleVar(value=43.2666)
-        self.status = tk.StringVar(value="选择底图和流星原图文件夹；输出文件夹会自动创建，也可以手动更改。")
+        self.laboratory_mode = tk.BooleanVar(value=False)
+        self.lab_projection = tk.StringVar(value="墨卡托（宽幅弧线）")
+        self.lab_canvas = tk.StringVar(value="扩展公共天空 135%")
+        self.status = tk.StringVar(value="选择对齐参考图和流星原图文件夹；输出文件夹会自动创建，也可以手动更改。")
         self.items = []
         self.worker_queue: queue.Queue = queue.Queue()
         self.running = False
         self.last_result: AlignmentResult | None = None
         self._build_ui()
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.after(120, self._poll_queue)
 
     def _build_ui(self) -> None:
@@ -46,14 +66,14 @@ class AlignmentWorkspace(tk.Toplevel):
         header = ttk.Frame(root)
         header.pack(fill="x")
         ttk.Label(header, text="星空对齐与分层导出", font=("TkDefaultFont", 15, "bold")).pack(side="left")
-        ttk.Button(header, text="返回图片合成工作区", command=self.destroy).pack(side="right")
+        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right")
         ttk.Label(
             root,
-            text="Siril只辅助寻找星点；PTGui按双底图锁定流程优化并原生导出。流星在返回主工作区后再抠。",
+            text="Siril只辅助寻找星点；PTGui以对齐参考图建立星空控制点并原生导出图层。流星在返回主工作区后再抠。",
         ).pack(anchor="w", pady=(2, 10))
         paths = ttk.LabelFrame(root, text="输入、工具与输出（源素材只读）", padding=8)
         paths.pack(fill="x")
-        self._path_row(paths, 0, "干净底图", self.base_path, self._choose_base, "选择文件…")
+        self._path_row(paths, 0, "对齐参考图", self.base_path, self._choose_base, "选择文件…")
         self._path_row(paths, 1, "完整流星原图文件夹", self.meteor_dir, self._choose_meteors, "选择文件夹…")
         self._path_row(paths, 2, "输出文件夹（可选）", self.output_dir, self._choose_output, "另选文件夹…")
         self._path_row(paths, 3, "PTGui程序", self.ptgui_path, self._choose_ptgui, "选择程序…")
@@ -74,14 +94,43 @@ class AlignmentWorkspace(tk.Toplevel):
             text="优先读取每张图片的EXIF焦距；焦段变化时使用独立镜头模型。传感器和焦距输入只在EXIF缺失时兜底。",
         ).grid(row=1, column=0, columnspan=8, sticky="w", pady=(5, 0))
 
+        laboratory = ttk.LabelFrame(root, text="对齐实验室（每次独立输出，不覆盖正式结果）", padding=8)
+        laboratory.pack(fill="x", pady=(8, 0))
+        ttk.Checkbutton(
+            laboratory, text="启用实验室模式", variable=self.laboratory_mode,
+            command=self._laboratory_changed,
+        ).pack(side="left")
+        ttk.Label(laboratory, text="输出投影").pack(side="left", padx=(18, 5))
+        self.lab_projection_box = ttk.Combobox(
+            laboratory, textvariable=self.lab_projection,
+            values=list(LAB_PROJECTIONS), state="disabled", width=24,
+        )
+        self.lab_projection_box.pack(side="left")
+        ttk.Label(laboratory, text="公共画布").pack(side="left", padx=(18, 5))
+        self.lab_canvas_box = ttk.Combobox(
+            laboratory, textvariable=self.lab_canvas,
+            values=list(LAB_CANVASES), state="disabled", width=22,
+        )
+        self.lab_canvas_box.pack(side="left")
+        ttk.Label(
+            laboratory, text="参考图和全部流星层会一起重投影",
+        ).pack(side="left", padx=(16, 0))
+
         actions = ttk.Frame(root)
         actions.pack(fill="x", pady=8)
         self.scan_button = ttk.Button(actions, text="1. 扫描素材", command=self.scan)
         self.scan_button.pack(side="left")
         self.run_button = ttk.Button(actions, text="2. 对齐并导出16位图层", command=self.run, state="disabled")
         self.run_button.pack(side="left", padx=8)
-        self.load_button = ttk.Button(actions, text="3. 返回主工作区抠流星", command=self.load_result, state="disabled")
+        self.load_button = ttk.Button(
+            actions, text="3. 使用对齐结果并返回流星合成",
+            command=self.load_result, state="disabled",
+        )
         self.load_button.pack(side="left")
+        self.open_output_button = ttk.Button(
+            actions, text="打开导出文件夹", command=self._open_output_folder, state="disabled",
+        )
+        self.open_output_button.pack(side="left", padx=(8, 0))
         self.creative_button = ttk.Button(actions, text="选中失败项→创意放置", command=self.mark_creative, state="disabled")
         self.creative_button.pack(side="right")
         self.discard_button = ttk.Button(actions, text="丢弃选中失败项", command=self.mark_discarded, state="disabled")
@@ -116,9 +165,20 @@ class AlignmentWorkspace(tk.Toplevel):
         ttk.Button(parent, text=button_text, command=callback).grid(row=row, column=2, pady=2)
 
     def _choose_base(self) -> None:
-        path = filedialog.askopenfilename(title="选择干净底图", filetypes=[("图像", "*.tif *.tiff *.jpg *.jpeg *.png")])
+        path = filedialog.askopenfilename(title="选择对齐参考图", filetypes=[("图像", "*.tif *.tiff *.jpg *.jpeg *.png")])
         if path:
             self.base_path.set(path)
+
+    def _laboratory_changed(self) -> None:
+        state = "readonly" if self.laboratory_mode.get() else "disabled"
+        self.lab_projection_box.configure(state=state)
+        self.lab_canvas_box.configure(state=state)
+        self.run_button.configure(
+            text="2. 实验对齐并导出16位图层"
+            if self.laboratory_mode.get() else "2. 对齐并导出16位图层"
+        )
+        if self.laboratory_mode.get():
+            self.status.set("实验室已启用：将创建独立Lab任务；不同投影可能使直线流星呈弧线")
 
     def _choose_meteors(self) -> None:
         previous_dir = self.meteor_dir.get().strip()
@@ -149,7 +209,7 @@ class AlignmentWorkspace(tk.Toplevel):
         base, meteor_dir = Path(self.base_path.get()), Path(self.meteor_dir.get())
         ptgui, siril = Path(self.ptgui_path.get()), Path(self.siril_path.get())
         if not base.is_file():
-            raise ValueError("请选择有效的干净底图")
+            raise ValueError("请选择有效的对齐参考图")
         if not meteor_dir.is_dir():
             raise ValueError("请选择有效的流星原图文件夹")
         output_text = self.output_dir.get().strip()
@@ -183,7 +243,7 @@ class AlignmentWorkspace(tk.Toplevel):
             self.run_button.configure(state="normal")
             self.status.set(f"只读扫描完成：{len(self.items)}张完整流星原图")
         except Exception as exc:
-            messagebox.showerror("星空对齐", str(exc), parent=self)
+            show_copyable_error("星空对齐", str(exc), parent=self)
 
     def run(self) -> None:
         if self.running:
@@ -192,10 +252,13 @@ class AlignmentWorkspace(tk.Toplevel):
             base, _folder, output, ptgui, siril = self._validated_paths()
             focal = float(self.focal_length.get())
             diagonal = float(self.sensor_diagonal.get())
+            laboratory = bool(self.laboratory_mode.get())
+            projection = LAB_PROJECTIONS.get(self.lab_projection.get(), "rectilinear") if laboratory else "rectilinear"
+            canvas_scale = LAB_CANVASES.get(self.lab_canvas.get(), 1.0) if laboratory else 1.0
             if not (focal > 0 and diagonal > 0):
                 raise ValueError("EXIF缺失时使用的兜底镜头参数无效")
         except Exception as exc:
-            messagebox.showerror("星空对齐", str(exc), parent=self)
+            show_copyable_error("星空对齐", str(exc), parent=self)
             return
         self.running = True
         self.last_result = None
@@ -211,11 +274,12 @@ class AlignmentWorkspace(tk.Toplevel):
                 result = run_alignment_pipeline(
                     base, self.items.copy(), output, ptgui, siril, report,
                     sky_fraction=None, focal_length=focal, sensor_diagonal=diagonal,
-                    export_layers=True,
+                    export_layers=True, laboratory=laboratory,
+                    panorama_projection=projection, canvas_scale=canvas_scale,
                 )
                 self.worker_queue.put(("done", result))
             except Exception as exc:
-                self.worker_queue.put(("error", str(exc)))
+                self.worker_queue.put(("error", str(exc), traceback.format_exc()))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -233,14 +297,28 @@ class AlignmentWorkspace(tk.Toplevel):
                     self._show_result(self.last_result)
                     self.run_button.configure(state="normal")
                     self.load_button.configure(state="normal")
+                    self.open_output_button.configure(state="normal")
                     self.creative_button.configure(state="normal")
                     self.discard_button.configure(state="normal")
-                    self.status.set(f"完成：{self.last_result.project_dir}")
+                    mode = (
+                        f"实验完成：{self.last_result.projection} · 画布 {self.last_result.canvas_scale:.0%}"
+                        if self.last_result.laboratory else "正式对齐完成"
+                    )
+                    self.status.set(f"{mode}：{self.last_result.project_dir}")
+                    if messagebox.askyesno(
+                        "星空对齐与分层导出",
+                        f"{mode}。\n\n输出位置：\n{self.last_result.project_dir}\n\n是否打开文件夹？",
+                        parent=self,
+                    ):
+                        self._open_output_folder()
                 elif item[0] == "error":
                     self.running = False
                     self.run_button.configure(state="normal")
                     self.status.set("对齐失败")
-                    messagebox.showerror("星空对齐", item[1], parent=self)
+                    show_copyable_error(
+                        "星空对齐", item[1], parent=self,
+                        details=item[2] if len(item) > 2 else None,
+                    )
         except queue.Empty:
             pass
         if self.winfo_exists():
@@ -261,6 +339,31 @@ class AlignmentWorkspace(tk.Toplevel):
         if self.last_result is None:
             return
         self.on_ready(self.last_result)
+        self.destroy()
+
+    def _open_output_folder(self) -> None:
+        path = self.last_result.project_dir if self.last_result is not None else self.output_dir.get()
+        try:
+            open_folder(path)
+        except Exception as exc:
+            show_copyable_error("打开文件夹", str(exc), parent=self)
+
+    def _request_close(self) -> None:
+        if self.running:
+            if not messagebox.askyesno(
+                "星空对齐正在运行",
+                "对齐任务还没有完成，确定要关闭吗？",
+                parent=self,
+            ):
+                return
+        elif self.last_result is not None:
+            if messagebox.askyesno(
+                "使用已经完成的对齐结果",
+                "对齐和分层导出已经完成。\n\n是否使用该结果并返回流星合成功能？",
+                parent=self,
+            ):
+                self.load_result()
+                return
         self.destroy()
 
     def _selected_result_items(self):

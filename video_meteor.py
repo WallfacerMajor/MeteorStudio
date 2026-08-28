@@ -20,6 +20,8 @@ import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk
+from platform_utils import open_folder
+from error_dialog import show_copyable_error, show_runtime_log
 
 
 VIDEO_PROJECT_VERSION = 3
@@ -843,6 +845,7 @@ class VideoMeteorWindow(tk.Toplevel):
             text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
         ).pack(side="left", padx=14)
         ttk.Button(header, text="返回图片合成工作区", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
 
@@ -861,9 +864,10 @@ class VideoMeteorWindow(tk.Toplevel):
         self.clean_entry.grid(row=2, column=1, columnspan=3, sticky="ew", padx=6)
         self.clean_button = ttk.Button(paths, text="选择…", command=self._browse_clean_video)
         self.clean_button.grid(row=2, column=4)
-        ttk.Label(paths, text="独立输出文件夹").grid(row=3, column=0, sticky="w")
+        ttk.Label(paths, text="输出文件夹（可留空）").grid(row=3, column=0, sticky="w")
         ttk.Entry(paths, textvariable=self.output_dir).grid(row=3, column=1, columnspan=3, sticky="ew", padx=6)
         ttk.Button(paths, text="选择…", command=self._browse_output).grid(row=3, column=4)
+        ttk.Button(paths, text="打开文件夹", command=self._open_output_folder).grid(row=3, column=5, padx=(6, 0))
         ttk.Button(paths, text="自动分析视频", command=self.analyze).grid(row=0, column=4, rowspan=1, padx=(8, 0))
         paths.columnconfigure(3, weight=1)
         self._mode_changed()
@@ -1075,7 +1079,7 @@ class VideoMeteorWindow(tk.Toplevel):
         if path:
             self.video_path.set(path)
             if not self.output_dir.get():
-                self.output_dir.set(str(Path(path).parent))
+                self.output_dir.set(str(Path(path).parent / "MeteorStudio_Output"))
 
     def _browse_clean_video(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("视频", "*.mp4 *.mov *.m4v *.avi *.mkv"), ("所有文件", "*.*")])
@@ -1100,8 +1104,10 @@ class VideoMeteorWindow(tk.Toplevel):
                 raise ValueError("流星视频和干净参考视频不能是同一个文件")
         output_text = self.output_dir.get().strip()
         if not output_text:
-            raise ValueError("请选择独立输出文件夹")
-        output = Path(output_text).expanduser()
+            output = video.parent / "MeteorStudio_Output"
+            self.output_dir.set(str(output))
+        else:
+            output = Path(output_text).expanduser()
         output.mkdir(parents=True, exist_ok=True)
         return video, clean, output
 
@@ -1126,7 +1132,7 @@ class VideoMeteorWindow(tk.Toplevel):
             video, clean, _output = self._validate_paths()
             ignore_bottom = float(self.ignore_bottom.get())
         except Exception as exc:
-            messagebox.showerror(self.title(), str(exc))
+            show_copyable_error(self.title(), str(exc), parent=self)
             return
 
         def worker() -> tuple:
@@ -1793,7 +1799,7 @@ class VideoMeteorWindow(tk.Toplevel):
         try:
             self._apply_project_data(json.loads(Path(path).read_text(encoding="utf-8")))
         except Exception as exc:
-            messagebox.showerror(self.title(), f"载入失败：{exc}")
+            show_copyable_error(self.title(), f"载入失败：{exc}", parent=self)
 
     def export(self) -> None:
         try:
@@ -1812,7 +1818,7 @@ class VideoMeteorWindow(tk.Toplevel):
             encoding_quality = self.encoding_quality.get()
             events_snapshot = [VideoEvent(**json.loads(json.dumps(asdict(event)))) for event in self.events]
         except Exception as exc:
-            messagebox.showerror(self.title(), str(exc))
+            show_copyable_error(self.title(), str(exc), parent=self)
             return
         output_path = output_dir / f"{video.stem}_meteor_dynamic_{datetime.now():%Y%m%d_%H%M%S}.mp4"
 
@@ -1856,17 +1862,30 @@ class VideoMeteorWindow(tk.Toplevel):
                     self.busy = False
                     self.progress["value"] = 100
                     self.status.set(f"导出完成：{result}")
-                    messagebox.showinfo(self.title(), f"已导出 {count} 个流星事件：\n{result}")
+                    if messagebox.askyesno(
+                        self.title(),
+                        f"已导出 {count} 个流星事件：\n{result}\n\n是否打开所在文件夹？",
+                        parent=self,
+                    ):
+                        self._open_output_folder(result)
                 elif kind == "error":
                     _, text, details = item
                     self.busy = False
                     self.status.set("处理失败")
-                    messagebox.showerror(self.title(), f"{text}\n\n详细信息已打印到终端。")
-                    print(details)
+                    show_copyable_error(
+                        self.title(), text, parent=self, details=details
+                    )
         except queue.Empty:
             pass
         if self.winfo_exists():
             self.after(150, self._poll_queue)
+
+    def _open_output_folder(self, path: str | Path | None = None) -> None:
+        target = path or self.output_dir.get().strip()
+        try:
+            open_folder(target)
+        except Exception as exc:
+            show_copyable_error(self.title(), str(exc), parent=self)
 
 
 def open_video_workspace(master: tk.Misc) -> VideoMeteorWindow:

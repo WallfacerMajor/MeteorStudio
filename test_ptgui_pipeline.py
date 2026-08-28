@@ -8,10 +8,31 @@ from PIL import Image, TiffImagePlugin
 from ptgui_pipeline import (
     ImageLensInfo,
     _set_independent_lenses,
+    alignment_solution_quality,
     filter_sky_stars,
     make_star_sky_mask,
     read_lens_info,
 )
+
+
+class AlignmentSolutionQualityTests(unittest.TestCase):
+    def test_five_control_points_continue_as_review(self):
+        accepted, review, message = alignment_solution_quality(5, 1.2)
+        self.assertTrue(accepted)
+        self.assertTrue(review)
+        self.assertIn("5组", message)
+
+    def test_three_control_points_are_not_enough_for_homography(self):
+        accepted, review, message = alignment_solution_quality(3, 1.0)
+        self.assertFalse(accepted)
+        self.assertTrue(review)
+        self.assertIn("至少需要4组", message)
+
+    def test_six_accurate_control_points_are_normal(self):
+        accepted, review, message = alignment_solution_quality(6, 1.0)
+        self.assertTrue(accepted)
+        self.assertFalse(review)
+        self.assertEqual(message, "")
 
 
 class LensMetadataTests(unittest.TestCase):
@@ -60,6 +81,32 @@ class LensMetadataTests(unittest.TestCase):
         self.assertEqual([lens["lens"]["params"]["focallength"] for lens in project["globallenses"]], [14.0, 24.0])
         self.assertFalse(project["globallenses"][0]["lens"]["optimizerflags"]["a"])
         self.assertTrue(project["globallenses"][1]["lens"]["optimizerflags"]["a"])
+
+    def test_lab_projection_changes_panorama_but_not_input_lens_type(self):
+        lens_template = {
+            "lens": {
+                "params": {"projection": "rectilinear", "focallength": 14.0, "sensordiagonal": 43.2666},
+                "optimizerflags": {"fov": False, "a": False, "b": False, "c": False, "fisheyefactor": False},
+            },
+            "shift": {"params": {}, "optimizerflags": {"longside": False, "shortside": False}},
+            "shear": {"params": {}, "optimizerflags": {"hshear": False, "vshear": False}},
+        }
+        project = {
+            "globallenses": [lens_template],
+            "imagegroups": [{"globallens": 0}, {"globallens": 0}],
+            "panoramaparams": {}, "outputsize": {},
+        }
+        infos = [ImageLensInfo(14.0, 43.2666, 14.0, "EXIF")] * 2
+        _set_independent_lenses(
+            project, infos, 6000, 4000,
+            panorama_projection="mercator", canvas_scale=1.35,
+        )
+        self.assertEqual(project["panoramaparams"]["projection"], "mercator")
+        self.assertGreater(project["panoramaparams"]["hfov"], 100.0)
+        self.assertTrue(all(
+            lens["lens"]["params"]["projection"] == "rectilinear"
+            for lens in project["globallenses"]
+        ))
 
 
 class AutomaticSkyMaskTests(unittest.TestCase):

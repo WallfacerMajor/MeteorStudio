@@ -12,7 +12,8 @@ import numpy as np
 
 def run_smoke(app) -> dict:
     from meteor_composer import (
-        ExactPreviewViewer, Stroke, compose_meteor_objects, transformed_stroke_points,
+        ExactPreviewViewer, Stroke, adjust_composite_base_exposure,
+        compose_meteor_objects, transformed_stroke_points,
     )
 
     app.geometry("1280x820+10000+10000")
@@ -32,7 +33,6 @@ def run_smoke(app) -> dict:
         "B ✎ 画笔", "E ▱ 橡皮擦", "AI分析当前单张候选", "自动检测全部",
         "保存项目", "载入项目", "自动优化当前流星", "自动优化全部流星",
         "重置底图曝光", "恢复自动值", "恢复原始融合", "导出合成结果",
-        "生成并打开导出级精确预览", "打开已生成预览",
     }
     available_controls = set()
     pending = [app]
@@ -48,6 +48,11 @@ def run_smoke(app) -> dict:
     missing_controls = required_controls - available_controls
     if missing_controls:
         raise AssertionError(f"UI reorganization hid controls: {sorted(missing_controls)}")
+    removed_exact_controls = {
+        "生成并打开导出级精确预览", "打开已生成预览",
+    } & available_controls
+    if removed_exact_controls:
+        raise AssertionError(f"Obsolete exact-preview controls remain: {sorted(removed_exact_controls)}")
     app._toggle_paths_panel()
     app.update_idletasks()
     if app.paths_panel.winfo_manager():
@@ -87,6 +92,10 @@ def run_smoke(app) -> dict:
     )
     app.strokes = {key: [meteor]}
     app.candidates = {key: [replace(meteor, points=meteor.points.copy())]}
+    # The production editor only exposes objects belonging to the active
+    # source/base pairing.  Keep the smoke fixture equivalent to a scanned
+    # current batch so stale autosave masks cannot accidentally pass it.
+    app.pairs = {key: Path("synthetic_base.tif")}
     app.output_mode.set("separate")
     app.canvas.configure(width=900, height=560)
     app.update_idletasks()
@@ -288,6 +297,13 @@ def run_smoke(app) -> dict:
         raise AssertionError("Object geometry missing")
     center = geometry["center"]
     before = replace(app.strokes[key][0], points=app.strokes[key][0].points.copy())
+    separate_drag_global_calls = 0
+    real_separate_drag_invalidate = app._invalidate_global_preview
+    def count_separate_drag_global():
+        nonlocal separate_drag_global_calls
+        separate_drag_global_calls += 1
+        return real_separate_drag_invalidate()
+    app._invalidate_global_preview = count_separate_drag_global
     app.canvas.event_generate("<ButtonPress-1>", x=int(center[0]), y=int(center[1]))
     app.canvas.event_generate("<B1-Motion>", x=int(center[0] + 42), y=int(center[1] + 21), state=0x0100)
     app.update()
@@ -306,6 +322,9 @@ def run_smoke(app) -> dict:
         )
     app.canvas.event_generate("<ButtonRelease-1>", x=int(center[0] + 42), y=int(center[1] + 21))
     app.update()
+    app._invalidate_global_preview = real_separate_drag_invalidate
+    if separate_drag_global_calls:
+        raise AssertionError("Single-image drag unnecessarily invalidated the full composite")
     moved = app.strokes[key][0]
     if moved.offset_x == before.offset_x and moved.offset_y == before.offset_y:
         raise AssertionError("Move did not update offsets")
@@ -377,6 +396,30 @@ def run_smoke(app) -> dict:
         raise AssertionError("Undo after dragging did not restore the same mask geometry")
     app.redo_stroke()
     app.selected_object = selected
+
+    # Every operation that changes only the selected meteor must keep the local
+    # composite cache.  These used to invalidate the whole project and launch a
+    # second exact pass even though the one-object compositor already had enough
+    # information to update the affected footprint.
+    selected_global_calls = 0
+    real_selected_invalidate = app._invalidate_global_preview
+    def count_selected_global():
+        nonlocal selected_global_calls
+        selected_global_calls += 1
+        return real_selected_invalidate()
+    app._invalidate_global_preview = count_selected_global
+    app.restore_selected_original_blend()
+    app.restore_selected_auto()
+    app.original_sources[key] = Path(key)
+    app.preview_aligned_source = source
+    app.preview_original_source = source
+    app._set_selected_source_mode("original")
+    app._set_selected_source_mode("aligned")
+    app._invalidate_global_preview = real_selected_invalidate
+    if selected_global_calls:
+        raise AssertionError(
+            f"Selected-meteor restore/source operations invalidated globally {selected_global_calls} times"
+        )
     app._reset_selected_object()
     app.undo_stroke()
     app._invalidate_global_preview = real_transform_invalidate
@@ -432,6 +475,34 @@ def run_smoke(app) -> dict:
     if app.global_preview_signature != app._global_preview_state_signature():
         raise AssertionError("Manual mask addition discarded the combined preview cache")
 
+    # A locally committed brush stroke is already pixel-exact.  Even with a
+    # non-zero clean-base exposure, mouse-up must update only that ROI and mark
+    # the exact state current rather than scheduling a duplicate full pass.
+    app.base_exposure_tenths.set(5)
+    app.exact_preview_full_rgb = adjust_composite_base_exposure(
+        app.global_preview_rgb, app.preview_base, 0.5
+    )
+    app.exact_preview_rgb = app.exact_preview_full_rgb
+    app.exact_preview_signature = app._exact_preview_state_signature()
+    exact_schedule_calls = 0
+    real_exact_schedule = app._schedule_automatic_exact_preview
+    def count_exact_schedule():
+        nonlocal exact_schedule_calls
+        exact_schedule_calls += 1
+    app._schedule_automatic_exact_preview = count_exact_schedule
+    exposure_start = (int(x0 + (x1 - x0) * 0.08), int(y0 + (y1 - y0) * 0.11))
+    exposure_end = (exposure_start[0] + 34, exposure_start[1] + 13)
+    app.canvas.event_generate("<ButtonPress-1>", x=exposure_start[0], y=exposure_start[1])
+    app.canvas.event_generate("<B1-Motion>", x=exposure_end[0], y=exposure_end[1], state=0x0100)
+    app.canvas.event_generate("<ButtonRelease-1>", x=exposure_end[0], y=exposure_end[1])
+    app.update()
+    app._schedule_automatic_exact_preview = real_exact_schedule
+    if exact_schedule_calls:
+        raise AssertionError("Manual stroke scheduled a duplicate exact-preview pass")
+    if app.exact_preview_signature != app._exact_preview_state_signature():
+        raise AssertionError("Manual stroke did not promote its local result to exact state")
+    app.base_exposure_tenths.set(0)
+
     candidate = Stroke([(0.74, 0.12), (0.80, 0.15)], 24, 9, auto_score=73)
     app.candidates[key].append(candidate)
     app.hover_candidate_index = len(app.candidates[key]) - 1
@@ -447,7 +518,10 @@ def run_smoke(app) -> dict:
             f"validation={mask_add_validation_calls}"
         )
     if app.global_preview_signature != app._global_preview_state_signature():
-        raise AssertionError("Candidate mask addition did not retain exact local cache")
+        raise AssertionError(
+            "Candidate mask addition did not retain exact local cache: "
+            + str(getattr(app, "last_incremental_delete_error", None))
+        )
     app.strokes[key] = [item for item in app.strokes[key] if item is not candidate]
     app.candidates[key] = [item for item in app.candidates[key] if item is not candidate]
     app.global_preview_rgb, _candidate_cleanup_mask = compose_meteor_objects(
@@ -510,14 +584,82 @@ def run_smoke(app) -> dict:
 
     app.selected_object = selected
     app._load_selected_object_adjustments()
+    # Toggling one meteor's independent controls must remain an ROI update. It
+    # must not launch a fast full rebuild followed by a second exact rebuild.
+    app.exact_preview_full_rgb = app.global_preview_rgb.copy()
+    app.exact_labeled_preview_full_rgb = app.global_preview_rgb.copy()
+    app.exact_preview_signature = app._exact_preview_state_signature()
+    full_override_rebuilds = []
+    real_request_override_global = app._request_global_preview
+    real_begin_override_exact = app._begin_exact_preview
+    app._request_global_preview = lambda signature: full_override_rebuilds.append(("global", signature))
+    app._begin_exact_preview = lambda signature, open_when_ready=False: full_override_rebuilds.append(("exact", signature))
     app.selected_override_enabled.set(True)
     app._selected_override_changed()
+    app.update()
+    if full_override_rebuilds:
+        raise AssertionError(
+            f"Per-meteor override launched full rebuilds: {len(full_override_rebuilds)}; "
+            f"incremental_error={app.last_incremental_delete_error}"
+        )
+    if app.exact_preview_signature != app._exact_preview_state_signature():
+        raise AssertionError("Per-meteor override did not commit the local exact-view state")
+    app._request_global_preview = real_request_override_global
+    app._begin_exact_preview = real_begin_override_exact
+    # Reproduce a busy total composite containing an overlapping source whose
+    # layer cache is unavailable. Per-meteor sliders must still use the selected
+    # object's before/after pixel delta and never rebuild every source.
+    overlap_key = str(Path("evicted_overlapping_source.tif"))
+    app.output_mode.set("combined")
+    app.view_mode.set("blend")
+    app._render_preview()
+    app.update()
+    slider_canvas_item = app.preview_image_item
+    app.pairs[overlap_key] = Path("evicted_overlapping_base.tif")
+    app.strokes[overlap_key] = [replace(app.strokes[key][0], points=app.strokes[key][0].points.copy())]
+    slider_full_rebuilds = []
+    slider_invalidations = 0
+    real_slider_request = app._request_global_preview
+    real_slider_exact = app._begin_exact_preview
+    real_slider_invalidate = app._invalidate_global_preview
+    real_slider_render = app._render_preview
+    slider_render_calls = 0
+    def count_slider_invalidate():
+        nonlocal slider_invalidations
+        slider_invalidations += 1
+        return real_slider_invalidate()
+    def count_slider_render():
+        nonlocal slider_render_calls
+        slider_render_calls += 1
+        return real_slider_render()
+    app._request_global_preview = lambda signature: slider_full_rebuilds.append(("global", signature))
+    app._begin_exact_preview = lambda signature, open_when_ready=False: slider_full_rebuilds.append(("exact", signature))
+    app._invalidate_global_preview = count_slider_invalidate
+    app._render_preview = count_slider_render
     app.selected_brightness.set(137)
     app.selected_cleanup.set(84)
     app.selected_saturation.set(112)
     app.selected_match.set(True)
     app.selected_feather.set(19)
     app._selected_adjustment_changed()
+    app.update()
+    app._request_global_preview = real_slider_request
+    app._begin_exact_preview = real_slider_exact
+    app._invalidate_global_preview = real_slider_invalidate
+    app._render_preview = real_slider_render
+    app.pairs.pop(overlap_key, None)
+    app.strokes.pop(overlap_key, None)
+    app.output_mode.set("separate")
+    if slider_invalidations or slider_full_rebuilds:
+        raise AssertionError(
+            f"Per-meteor slider rebuilt the composite: invalidations={slider_invalidations}, "
+            f"workers={slider_full_rebuilds}"
+        )
+    if slider_render_calls or app.preview_image_item != slider_canvas_item:
+        raise AssertionError(
+            f"Per-meteor slider redrew the viewport instead of pasting its ROI: "
+            f"renders={slider_render_calls}"
+        )
     adjusted = app.strokes[key][0]
     if (
         adjusted.brightness_override != 137
@@ -655,11 +797,63 @@ def run_smoke(app) -> dict:
     if len(app.strokes[key]) != count or len(app.candidates[key]) != 1:
         raise AssertionError("Undo did not restore object and candidate metadata")
 
+    # Deletion must also remain local when the fast global cache was evicted but
+    # the exact canvas currently visible to the user is still available.
+    app.selected_object = selected
+    app.global_preview_rgb = None
+    app.exact_preview_full_rgb = delete_cached.copy()
+    exact_cache_delete_global_calls = 0
+    real_exact_cache_invalidate = app._invalidate_global_preview
+    def count_exact_cache_delete_global():
+        nonlocal exact_cache_delete_global_calls
+        exact_cache_delete_global_calls += 1
+        return real_exact_cache_invalidate()
+    app._invalidate_global_preview = count_exact_cache_delete_global
+    app._delete_selected_object()
+    app._invalidate_global_preview = real_exact_cache_invalidate
+    if exact_cache_delete_global_calls:
+        raise AssertionError("Delete ignored the visible exact cache and rebuilt the full composite")
+    app.undo_stroke()
+
     app.view_mode.set("source")
     app._render_preview()
     app.update()
     app._canvas_fit()
     main_fit_zoom = app.canvas_zoom
+    app.control_notebook.select(app.selected_tools_tab)
+    app.update()
+    if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
+        raise AssertionError("Clicking a non-image panel changed fit-view zoom")
+    app.control_notebook.select(app.mask_tools_tab)
+    app.update()
+    if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
+        raise AssertionError("Returning to a non-image panel changed fit-view zoom")
+    blank_x = max(1, app.mask_tools_tab.winfo_width() - 3)
+    blank_y = max(1, app.mask_tools_tab.winfo_height() - 3)
+    app.mask_tools_tab.event_generate("<ButtonPress-1>", x=blank_x, y=blank_y)
+    app.mask_tools_tab.event_generate("<ButtonRelease-1>", x=blank_x, y=blank_y)
+    app.update()
+    if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
+        raise AssertionError("Clicking blank space inside the bottom panel changed zoom")
+    x0, y0, x1, y1 = app.display_box
+    canvas_w, canvas_h = app.canvas.winfo_width(), app.canvas.winfo_height()
+    blank_canvas_points = [
+        (2, 2), (max(2, canvas_w - 3), 2),
+        (2, max(2, canvas_h - 3)), (max(2, canvas_w - 3), max(2, canvas_h - 3)),
+    ]
+    outside = next(
+        ((x, y) for x, y in blank_canvas_points if not (x0 <= x <= x1 and y0 <= y <= y1)),
+        None,
+    )
+    if outside is not None:
+        app.canvas.event_generate("<ButtonPress-1>", x=outside[0], y=outside[1])
+        app.canvas.event_generate("<ButtonRelease-1>", x=outside[0], y=outside[1])
+        app.status.set("空白区域点击不应改变图像缩放")
+        app.update()
+        app._canvas_configure()
+        app._canvas_configure()
+        if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
+            raise AssertionError("Clicking outside the displayed photograph changed zoom")
     main_center = (app.canvas_center_x, app.canvas_center_y)
     app._canvas_zoom_by(1.25, (app.canvas.winfo_width() // 3, app.canvas.winfo_height() // 3))
     if app.canvas_zoom <= main_fit_zoom or app.preview_photo is None:
@@ -671,6 +865,21 @@ def run_smoke(app) -> dict:
     app._canvas_pan_end_event(pan_event)
     if (app.canvas_center_x, app.canvas_center_y) == main_center:
         raise AssertionError("Main mask canvas did not pan")
+    switched_zoom = app.canvas_zoom
+    switched_center = (app.canvas_center_x, app.canvas_center_y)
+    for mode in ("base", "blend", "labeled", "source"):
+        app.view_mode.set(mode)
+        app._render_preview()
+        app.update()
+        if abs(app.canvas_zoom - switched_zoom) > 1e-9:
+            raise AssertionError(f"View switch changed canvas zoom in {mode} mode")
+        if any(
+            abs(current - expected) > 1e-6
+            for current, expected in zip(
+                (app.canvas_center_x, app.canvas_center_y), switched_center
+            )
+        ):
+            raise AssertionError(f"View switch changed canvas center in {mode} mode")
     app._canvas_actual_size()
 
     exact_viewer = ExactPreviewViewer(app, source, source.copy(), "blend")
@@ -721,17 +930,27 @@ def run_smoke(app) -> dict:
         "drag_undo_preserves_mask": "passed",
         "empty_undo_preserves_mask": "passed",
         "instant_mask_add": "passed",
+        "manual_stroke_needs_no_exact_rebuild": "passed",
         "instant_candidate_add": "passed",
         "stable_canvas_image": "passed",
         "source_transform_reference": "passed",
         "one_click_geometry_restore": "passed",
         "rotate": "passed", "per_meteor_adjustments": "passed",
+        "per_meteor_override_is_local": "passed",
+        "per_meteor_slider_is_realtime": "passed",
+        "selected_restore_and_source_are_local": "passed",
+        "separate_drag_is_local": "passed",
         "project_roundtrip": "passed", "delete_undo": "passed",
         "instant_isolated_delete": "passed",
+        "delete_uses_visible_exact_cache": "passed",
         "no_render_loop": "passed",
         "single_workspace_navigation": "passed",
         "exact_preview_viewer": "passed",
         "main_canvas_zoom_pan": "passed",
+        "view_switch_preserves_zoom": "passed",
+        "panel_click_preserves_zoom": "passed",
+        "blank_panel_click_preserves_zoom": "passed",
+        "outside_image_click_preserves_zoom": "passed",
         "workspace_tabs": "passed",
         "all_controls_reachable": "passed",
         "collapsible_material_panel": "passed",

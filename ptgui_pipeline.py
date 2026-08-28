@@ -18,6 +18,7 @@ from PIL import Image, ImageOps
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 Progress = Callable[[float, str], None]
+PANORAMA_PROJECTIONS = {"rectilinear", "mercator", "equirectangular", "stereographic"}
 
 
 @dataclass
@@ -53,6 +54,9 @@ class AlignmentResult:
     siril_version: str
     ptgui_path: str
     siril_path: str
+    laboratory: bool = False
+    projection: str = "rectilinear"
+    canvas_scale: float = 1.0
 
 
 def default_ptgui_path() -> Path | None:
@@ -383,7 +387,7 @@ def match_star_pairs(
         raise RuntimeError("Siril星区内没有足够的可匹配特征")
     candidates = cv2.BFMatcher(cv2.NORM_L2).knnMatch(md, bd, k=2)
     good = [first for first, second in candidates if first.distance < 0.78 * second.distance]
-    if len(good) < 8:
+    if len(good) < 4:
         raise RuntimeError(f"仅找到{len(good)}组候选星点")
     source = np.float32([mk[m.queryIdx].pt for m in good])
     target = np.float32([bk[m.trainIdx].pt for m in good])
@@ -392,7 +396,7 @@ def match_star_pairs(
         raise RuntimeError("无法建立可靠星空变换")
     keep = inliers.ravel().astype(bool)
     source, target = source[keep], target[keep]
-    if len(source) < 6:
+    if len(source) < 4:
         raise RuntimeError(f"稳健筛选后仅剩{len(source)}组星点")
     # Prefer matches supported by Siril's PSF star catalogue. It is a
     # validator, not the sole matcher: very faint stars may be absent from the
@@ -414,13 +418,29 @@ def match_star_pairs(
     # Siril is a sky/PSF validator, not the sole correspondence detector. Two
     # differently processed frames may expose different subsets of faint stars;
     # in that case retain the already mask-limited, MAGSAC-consistent matches.
-    if int(supported.sum()) >= 6:
+    if int(supported.sum()) >= 4:
         source, target = source[supported], target[supported]
     projected = cv2.perspectiveTransform(source[:, None, :], transform)[:, 0, :]
     errors = np.linalg.norm(projected - target, axis=1)
     median_error = float(np.median(errors) / full_scale)
     distributed = _distributed_pairs(source, target, base.shape[1], base.shape[0])
     return [(src / full_scale, dst / full_scale) for src, dst in distributed], median_error
+
+
+def alignment_solution_quality(control_points: int, median_error: float) -> tuple[bool, bool, str]:
+    """Classify a projective star solution without discarding usable 4–5 point fits."""
+    if control_points < 4:
+        return False, True, f"控制点不足：单应性对齐至少需要4组，当前{control_points}组"
+    if median_error > 8.0:
+        return False, True, f"星点误差过大：{median_error:.2f}px，{control_points}组"
+    review = control_points < 6 or median_error > 3.0
+    reasons = []
+    if control_points < 6:
+        reasons.append(f"仅{control_points}组控制点")
+    if median_error > 3.0:
+        reasons.append(f"星点误差 {median_error:.2f}px")
+    message = "、".join(reasons)
+    return True, review, message
 
 
 def _run(command: list[str], cwd: Path, log_file: Path) -> str:
@@ -464,7 +484,7 @@ def configure_blog_project(
     data = json.loads(project_file.read_text(encoding="utf-8"))
     project = data["project"]
     if len(project["imagegroups"]) < 3:
-        raise RuntimeError("PTGui工程缺少双底图或流星图")
+        raise RuntimeError("PTGui工程缺少对齐参考图或流星图")
     _link_all_to_first_lens(project)
     if calibration_project is not None:
         calibrated = json.loads(calibration_project.read_text(encoding="utf-8"))["project"]
@@ -573,18 +593,22 @@ def configure_single_star_project(
     image_width: int,
     image_height: int,
     initial_position: dict[str, float] | None = None,
+    panorama_projection: str = "rectilinear",
+    canvas_scale: float = 1.0,
 ) -> None:
     """Configure one base + one meteor project using sky-only control points."""
     data = json.loads(project_file.read_text(encoding="utf-8"))
     project = data["project"]
     if len(project["imagegroups"]) != 2:
-        raise RuntimeError("单张PTGui工程必须包含底图和一张流星图")
+        raise RuntimeError("单张PTGui工程必须包含对齐参考图和一张流星图")
     _set_independent_lenses(
         project,
         [base_lens, meteor_lens],
         image_width,
         image_height,
         optimize_distortion=len(pairs) >= 16,
+        panorama_projection=panorama_projection,
+        canvas_scale=canvas_scale,
     )
     for index, group in enumerate(project["imagegroups"]):
         movable = index == 1
@@ -669,6 +693,8 @@ def _set_independent_lenses(
     image_width: int,
     image_height: int,
     optimize_distortion: bool = False,
+    panorama_projection: str = "rectilinear",
+    canvas_scale: float = 1.0,
 ) -> None:
     if len(project.get("imagegroups", [])) != len(lens_infos):
         raise RuntimeError("镜头信息数量与PTGui图层数量不一致")
@@ -708,7 +734,16 @@ def _set_independent_lenses(
     sensor_width = sensor_height * aspect
     hfov = math.degrees(2.0 * math.atan(sensor_width / (2.0 * base_lens.focal_length)))
     vfov = math.degrees(2.0 * math.atan(sensor_height / (2.0 * base_lens.focal_length)))
-    project["panoramaparams"].update({"projection": "rectilinear", "hfov": hfov, "vfov": vfov, "outputcrop": [0, 0, 1, 1]})
+    projection = panorama_projection if panorama_projection in PANORAMA_PROJECTIONS else "rectilinear"
+    scale = float(np.clip(canvas_scale, 1.0, 1.8))
+    maximum_hfov = 165.0 if projection == "rectilinear" else (300.0 if projection == "stereographic" else 360.0)
+    maximum_vfov = 165.0 if projection in {"rectilinear", "stereographic"} else 175.0
+    project["panoramaparams"].update({
+        "projection": projection,
+        "hfov": min(maximum_hfov, hfov * scale),
+        "vfov": min(maximum_vfov, vfov * scale),
+        "outputcrop": [0, 0, 1, 1],
+    })
     project["outputsize"].update({"mode": "relative", "fractionofoptimumsize": 1})
 
 
@@ -717,10 +752,15 @@ def configure_input_lenses(
     lens_infos: list[ImageLensInfo],
     image_width: int,
     image_height: int,
+    panorama_projection: str = "rectilinear",
+    canvas_scale: float = 1.0,
 ) -> None:
     data = json.loads(project_file.read_text(encoding="utf-8"))
     project = data["project"]
-    _set_independent_lenses(project, lens_infos, image_width, image_height, optimize_distortion=False)
+    _set_independent_lenses(
+        project, lens_infos, image_width, image_height, optimize_distortion=False,
+        panorama_projection=panorama_projection, canvas_scale=canvas_scale,
+    )
     project_file.write_text(json.dumps(data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
 
 
@@ -755,17 +795,27 @@ def run_alignment_pipeline(
     focal_length: float = 14.0,
     sensor_diagonal: float = 43.2666,
     export_layers: bool = True,
+    laboratory: bool = False,
+    panorama_projection: str = "rectilinear",
+    canvas_scale: float = 1.0,
 ) -> AlignmentResult:
     if not base.is_file() or not meteor_files:
-        raise ValueError("请选择干净底图和至少一张流星原图")
+        raise ValueError("请选择对齐参考图和至少一张流星原图")
     for executable, label in ((ptgui, "PTGui"), (siril, "Siril")):
         if not executable.is_file():
             raise FileNotFoundError(f"找不到{label}：{executable}")
+    if panorama_projection not in PANORAMA_PROJECTIONS:
+        raise ValueError(f"不支持的实验投影：{panorama_projection}")
+    canvas_scale = float(np.clip(canvas_scale, 1.0, 1.8))
     output_root.mkdir(parents=True, exist_ok=True)
-    task_dir = output_root / "MeteorStudio_PTGui"
+    task_name = (
+        f"MeteorStudio_PTGui_Lab_{panorama_projection}_{round(canvas_scale * 100)}"
+        if laboratory else "MeteorStudio_PTGui"
+    )
+    task_dir = output_root / task_name
     counter = 2
     while task_dir.exists():
-        task_dir = output_root / f"MeteorStudio_PTGui_v{counter}"
+        task_dir = output_root / f"{task_name}_v{counter}"
         counter += 1
     proxy_dir = task_dir / "cache" / "sky_proxies"
     mask_dir = task_dir / "cache" / "sky_masks"
@@ -781,7 +831,7 @@ def run_alignment_pipeline(
     scale = 0.25
     notify = progress or (lambda _value, _text: None)
     base_lens = read_lens_info(base, focal_length, sensor_diagonal)
-    notify(1, f"生成底图星点代理（{base_lens.focal_length:.1f}mm，{base_lens.source}）…")
+    notify(1, f"生成对齐参考图星点代理（{base_lens.focal_length:.1f}mm，{base_lens.source}）…")
     base_proxy = proxy_dir / "base_sky.png"
     # Automatic mode always examines the full frame. A non-None value remains
     # available only for callers explicitly requesting the legacy safety cap.
@@ -789,7 +839,7 @@ def run_alignment_pipeline(
     base_stars, siril_log = siril_find_stars(siril, base_proxy, siril_dir, "base")
     base_proxy_image = cv2.imdecode(np.fromfile(base_proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if base_proxy_image is None:
-        raise RuntimeError("无法读取底图星点代理")
+        raise RuntimeError("无法读取对齐参考图星点代理")
     base_stars = filter_sky_stars(base_stars, base_proxy_image.shape)
     base_sky_mask = make_star_sky_mask(base_proxy_image.shape, base_stars)
     cv2.imencode(".png", base_sky_mask)[1].tofile(mask_dir / "base_sky_mask.png")
@@ -813,7 +863,7 @@ def run_alignment_pipeline(
             proxy = proxy_dir / f"{source.stem}_sky.png"
             width, height = make_sky_proxy(source, proxy, scale, sky_fraction)
             if (width, height) != (base_width, base_height):
-                raise ValueError(f"尺寸{width}×{height}与底图{base_width}×{base_height}不同")
+                raise ValueError(f"尺寸{width}×{height}与对齐参考图{base_width}×{base_height}不同")
             stars, star_log = siril_find_stars(siril, proxy, siril_dir, source.stem)
             siril_log += "\n" + star_log
             proxy_image = cv2.imdecode(np.fromfile(proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -826,15 +876,18 @@ def run_alignment_pipeline(
             pairs, median_error = match_star_pairs(proxy, base_proxy, stars, base_stars, scale)
             item.control_points = len(pairs)
             item.median_error = median_error
-            if len(pairs) < 6 or median_error > 8.0:
-                raise RuntimeError(f"星点误差过大：{median_error:.2f}px，{len(pairs)}组")
+            accepted_solution, needs_review, quality_message = alignment_solution_quality(
+                len(pairs), median_error,
+            )
+            if not accepted_solution:
+                raise RuntimeError(quality_message)
             # A 3–8 px solution is still valuable as a basic placement, but it
             # should never be presented as production-ready.  Export it through
             # the same independent PTGui path and let the user fine-tune from
             # that starting point instead of beginning again from zero.
-            if median_error > 3.0:
+            if needs_review:
                 item.status = "需复查"
-                item.message = f"已保留基础对齐；星点误差 {median_error:.2f}px，建议100%检查后微调"
+                item.message = f"已保留基础对齐；{quality_message}，建议100%检查后微调"
             else:
                 item.status = "可对齐"
             lens_note = f"焦距 {lens_info.focal_length:.1f}mm（{lens_info.source}），自动星点有效区 {item.sky_coverage * 100:.1f}%"
@@ -859,7 +912,7 @@ def run_alignment_pipeline(
         result = AlignmentResult(
             str(task_dir), "", str(base), None, items, str(log_file),
             siril_log.splitlines()[1] if len(siril_log.splitlines()) > 1 else "Siril",
-            str(ptgui), str(siril),
+            str(ptgui), str(siril), laboratory, panorama_projection, canvas_scale,
         )
         manifest_file.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
         notify(100, "无可靠对齐；已输出全部原始状态")
@@ -886,6 +939,7 @@ def run_alignment_pipeline(
             configure_single_star_project(
                 sky_project, pairs, base_lens, source_lens, base_width, base_height,
                 initial_position=previous_position if needs_review else None,
+                panorama_projection=panorama_projection, canvas_scale=canvas_scale,
             )
             _run([str(ptgui), "-stitchnogui", str(sky_project)], project_dir, log_file)
             optimized = json.loads(sky_project.read_text(encoding="utf-8"))["project"]
@@ -895,7 +949,10 @@ def run_alignment_pipeline(
             previous_position = {key: float(solved_position[key]) for key in ("yaw", "pitch", "roll")}
             ready_project = ready_projects / f"{source.stem}_READY.pts"
             _run([str(ptgui), "-createproject", str(base), str(source), "-output", str(ready_project)], project_dir, log_file)
-            configure_input_lenses(ready_project, [base_lens, source_lens], base_width, base_height)
+            configure_input_lenses(
+                ready_project, [base_lens, source_lens], base_width, base_height,
+                panorama_projection=panorama_projection, canvas_scale=canvas_scale,
+            )
             transfer_single_solution(ready_project, sky_project)
             first_ready_project = first_ready_project or ready_project
             if export_layers:
@@ -907,7 +964,7 @@ def run_alignment_pipeline(
                 if not generated_base.is_file() or not generated_meteor.is_file():
                     raise RuntimeError("PTGui缺少单张导出图层")
                 if base_layer is None:
-                    base_target = reference_dir / "clean_base_aligned.tif"
+                    base_target = reference_dir / "alignment_reference.tif"
                     os.replace(generated_base, base_target)
                     base_layer = str(base_target)
                 else:
@@ -934,7 +991,7 @@ def run_alignment_pipeline(
     result = AlignmentResult(
         str(task_dir), str(project_file), base_layer, duplicate_layer, items,
         str(log_file), siril_log.splitlines()[1] if len(siril_log.splitlines()) > 1 else "Siril",
-        str(ptgui), str(siril),
+        str(ptgui), str(siril), laboratory, panorama_projection, canvas_scale,
     )
     manifest_file.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
     notify(100, "对齐图层已返回MeteorStudio")

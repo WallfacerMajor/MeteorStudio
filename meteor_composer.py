@@ -7,6 +7,9 @@ import sys
 import threading
 import time
 import traceback
+import gc
+from collections import OrderedDict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from dataclasses import dataclass, asdict, replace
 from pathlib import Path
@@ -14,6 +17,7 @@ from typing import Iterable
 
 import cv2
 import numpy as np
+import psutil
 import tifffile
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -21,12 +25,45 @@ from PIL import Image, ImageOps, ImageTk
 from alignment_workspace import open_alignment_workspace
 from meteor_screening import open_screening_workspace
 from video_meteor import open_video_workspace
+from platform_utils import open_folder
+from error_dialog import show_copyable_error, show_runtime_log
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.55-screening-export-handoff"
-PROJECT_VERSION = 27
+APP_VERSION = "0.2.0-full-resolution-preview"
+PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
+
+
+def preview_memory_budgets() -> tuple[int, int, int]:
+    """Choose bounded caches from currently available RAM, not image count."""
+    available = int(psutil.virtual_memory().available)
+    display = int(np.clip(available * 0.12, 512 << 20, 1536 << 20))
+    precision = int(np.clip(available * 0.07, 384 << 20, 1024 << 20))
+    viewport = int(np.clip(available * 0.02, 96 << 20, 256 << 20))
+    return display, precision, viewport
+
+
+def ordered_prefetch(items: Iterable, loader, workers: int = 2):
+    """Yield in source order while decoding a bounded number of future items."""
+    sequence = iter(items)
+    with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="meteor-pipeline") as pool:
+        pending = deque()
+        for _ in range(max(1, workers)):
+            try:
+                item = next(sequence)
+            except StopIteration:
+                break
+            pending.append((item, pool.submit(loader, item)))
+        while pending:
+            item, future = pending.popleft()
+            try:
+                following = next(sequence)
+            except StopIteration:
+                following = None
+            if following is not None:
+                pending.append((following, pool.submit(loader, following)))
+            yield item, future.result()
 
 
 @dataclass
@@ -85,14 +122,6 @@ def reset_stroke_geometry(stroke: Stroke) -> None:
     stroke.width_scale = 1.0
 
 
-def path_is_within(child: Path, parent: Path) -> bool:
-    try:
-        child.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
-
-
 def active_stroke_keys(
     strokes: dict[str, list[Stroke]], pairs: dict[str, Path],
 ) -> list[str]:
@@ -128,14 +157,44 @@ def to_uint16(array: np.ndarray) -> np.ndarray:
         return array.copy()
     if array.dtype == np.uint8:
         return array.astype(np.uint16) * 257
-    result = array.astype(np.float32)
-    finite = result[np.isfinite(result)]
-    if finite.size == 0:
-        raise ValueError("图像没有有效像素")
     if np.issubdtype(array.dtype, np.floating):
-        if float(np.nanmax(finite)) <= 1.5:
-            result *= 65535.0
+        maximum = float(np.nanmax(array))
+        if not np.isfinite(maximum):
+            raise ValueError("图像没有有效像素")
+        normalized_linear = maximum <= 1.5
+        output = np.empty(array.shape, dtype=np.uint16)
+        pixels_per_row = int(np.prod(array.shape[1:])) if array.ndim > 1 else 1
+        rows_per_chunk = max(1, 4_000_000 // max(1, pixels_per_row))
+        # Work in bounded row chunks: a 7952×5304 float TIFF is ~500 MB, and a
+        # whole-frame gamma expression would temporarily allocate several copies.
+        for start in range(0, array.shape[0], rows_per_chunk):
+            stop = min(array.shape[0], start + rows_per_chunk)
+            chunk = np.asarray(array[start:stop], dtype=np.float32).copy()
+            np.nan_to_num(chunk, copy=False, nan=0.0, posinf=1.0 if normalized_linear else 65535.0, neginf=0.0)
+            if normalized_linear:
+                np.clip(chunk, 0.0, 1.0, out=chunk)
+                low = chunk <= 0.0031308
+                chunk[low] *= 12.92
+                high = ~low
+                chunk[high] = 1.055 * np.power(chunk[high], 1.0 / 2.4) - 0.055
+                chunk *= 65535.0
+            else:
+                np.clip(chunk, 0.0, 65535.0, out=chunk)
+            output[start:stop] = chunk.astype(np.uint16)
+        return output
+    result = array.astype(np.float32)
     return np.nan_to_num(result, nan=0.0, posinf=65535.0, neginf=0.0).clip(0, 65535).astype(np.uint16)
+
+
+def read_uint16_pair(first: Path, second: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Decode two independent layers concurrently without decoding duplicates."""
+    if first == second:
+        image = to_uint16(read_image(first))
+        return image, image
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="meteor-decode") as pool:
+        future_first = pool.submit(lambda: to_uint16(read_image(first)))
+        future_second = pool.submit(lambda: to_uint16(read_image(second)))
+        return future_first.result(), future_second.result()
 
 
 def image_info(path: Path) -> tuple[int, int, str, int]:
@@ -183,8 +242,12 @@ def meteor_mask_boxes(mask: np.ndarray, preview_limit: int = 2000) -> list[tuple
     height, width = mask.shape[:2]
     scale = min(1.0, preview_limit / max(1, width, height))
     if scale < 1.0:
+        # OpenCV resize has no float16 implementation. Export masks are kept in
+        # float16 to limit 8K memory use, so promote only this small analysis
+        # input rather than failing on long/transformed meteor footprints.
+        resize_input = mask.astype(np.float32) if mask.dtype == np.float16 else mask
         preview = cv2.resize(
-            mask, (max(1, round(width * scale)), max(1, round(height * scale))),
+            resize_input, (max(1, round(width * scale)), max(1, round(height * scale))),
             interpolation=cv2.INTER_AREA,
         )
     else:
@@ -468,6 +531,92 @@ def expand_trail_segment(
     first_point = tuple(int(v) for v in np.rint(first))
     second_point = tuple(int(v) for v in np.rint(second))
     return first_point, second_point, length
+
+
+def estimate_trail_mask_geometry(
+    source_preview: np.ndarray, base_preview: np.ndarray,
+    start: tuple[int, int], end: tuple[int, int], source_scale: float,
+) -> tuple[int, int]:
+    """Measure a trail's transverse signal and return full-resolution width/feather.
+
+    Detection lines describe direction and length, not physical thickness.  Sample
+    many cross-sections of the positive source/base residual so a long, thin
+    meteor stays thin while a genuinely broad head or tail receives more room.
+    """
+    source = source_preview.astype(np.float32)
+    base = base_preview.astype(np.float32)
+    if source.shape != base.shape or source.ndim != 3:
+        raise ValueError("流星宽度分析要求原图与底图尺寸一致")
+    source_luma = source[..., 0] * 0.0722 + source[..., 1] * 0.7152 + source[..., 2] * 0.2126
+    base_luma = base[..., 0] * 0.0722 + base[..., 1] * 0.7152 + base[..., 2] * 0.2126
+    residual = source_luma - base_luma
+    vector = np.asarray((end[0] - start[0], end[1] - start[1]), dtype=np.float32)
+    length = float(np.hypot(*vector))
+    scale = max(0.001, float(source_scale))
+    if length < 2.0:
+        return max(12, int(round(7.0 / scale))), max(6, int(round(3.0 / scale)))
+
+    direction = vector / length
+    normal = np.asarray((-direction[1], direction[0]), dtype=np.float32)
+    half_span = int(np.clip(round(length * 0.10), 12, 42))
+    along_count = int(np.clip(round(length / 3.0), 18, 72))
+    along = np.linspace(0.08, 0.92, along_count, dtype=np.float32)
+    centers = np.asarray(start, dtype=np.float32)[None, :] + along[:, None] * vector[None, :]
+    offsets = np.arange(-half_span, half_span + 1, dtype=np.float32)
+    sample_points = centers[:, None, :] + offsets[None, :, None] * normal[None, None, :]
+    map_x = sample_points[..., 0].astype(np.float32)
+    map_y = sample_points[..., 1].astype(np.float32)
+    sampled = cv2.remap(
+        residual, map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=-1000.0,
+    )
+    valid = sampled > -999.0
+    outer = np.abs(offsets) >= half_span * 0.66
+    outer_values = sampled[:, outer]
+    outer_valid = valid[:, outer]
+    finite_outer = outer_values[outer_valid]
+    if finite_outer.size < 20:
+        fallback_width = float(np.clip(length * 0.055, 7.0, 20.0))
+        return (
+            int(np.clip(round(fallback_width / scale), 12, 160)),
+            int(np.clip(round(max(3.0, fallback_width * 0.42) / scale), 6, 80)),
+        )
+
+    background = float(np.median(finite_outer))
+    noise = max(0.35, 1.4826 * float(np.median(np.abs(finite_outer - background))))
+    normalized = sampled - background
+    normalized[~valid] = 0.0
+    profile = np.percentile(normalized, 72.0, axis=0).astype(np.float32)
+    profile = cv2.GaussianBlur(profile[None, :], (0, 0), sigmaX=1.15)[0]
+    central = np.abs(offsets) <= half_span * 0.72
+    central_indices = np.flatnonzero(central)
+    peak_index = int(central_indices[np.argmax(profile[central])])
+    peak = max(0.0, float(profile[peak_index]))
+    threshold = max(noise * 2.6, peak * 0.075, 0.8)
+    active = np.isfinite(profile) & (profile >= threshold)
+    active = cv2.morphologyEx(
+        active.astype(np.uint8)[None, :], cv2.MORPH_CLOSE, np.ones((1, 5), np.uint8)
+    )[0] > 0
+    if not active[peak_index] or peak < noise * 2.2:
+        signal_width = float(np.clip(length * 0.045, 5.0, 16.0))
+    else:
+        left = peak_index
+        right = peak_index
+        while left > 0 and active[left - 1]:
+            left -= 1
+        while right + 1 < active.size and active[right + 1]:
+            right += 1
+        signal_width = float(right - left + 1)
+
+    # A small noise-dependent guard preserves faint edge pixels without carrying
+    # the broad rectangular background used by the previous length heuristic.
+    guard = float(np.clip(2.0 + noise * 0.18, 2.0, 5.0))
+    preview_width = float(np.clip(signal_width + guard * 2.0, 7.0, 36.0))
+    preview_feather = float(np.clip(signal_width * 0.38 + guard * 0.55, 3.0, 18.0))
+    return (
+        int(np.clip(round(preview_width / scale), 12, 180)),
+        int(np.clip(round(preview_feather / scale), 6, 90)),
+    )
 
 
 def count_true_runs(values: np.ndarray) -> int:
@@ -961,6 +1110,68 @@ def transformed_stroke_points(stroke: Stroke, width: int, height: int) -> list[t
     return [(float(x / max(1, width - 1)), float(y / max(1, height - 1))) for x, y in moved]
 
 
+def stroke_for_image_crop(
+    stroke: Stroke, full_width: int, full_height: int,
+    x0: int, y0: int, crop_width: int, crop_height: int,
+) -> Stroke:
+    """Translate normalized geometry into an ROI without changing pixel transforms."""
+    converted = replace(stroke, points=[
+        (
+            (x * max(1, full_width - 1) - x0) / max(1, crop_width - 1),
+            (y * max(1, full_height - 1) - y0) / max(1, crop_height - 1),
+        )
+        for x, y in stroke.points
+    ])
+    return converted
+
+
+def strokes_for_composite_crop(
+    strokes: Iterable[Stroke], width: int, height: int, auto_enabled: bool,
+) -> tuple[list[Stroke], tuple[int, int, int, int]] | None:
+    """Limit full-resolution compositing to the union of source and destination ROIs."""
+    ordered = list(strokes)
+    positive = [item for item in ordered if not item.erase and item.points]
+    if not positive:
+        return None
+    boxes: list[tuple[int, int, int, int]] = []
+    for item in positive:
+        prepared = auto_optimized_stroke(item, auto_enabled)
+        destination = stroke_annotation_box(prepared, width, height)
+        if destination is not None:
+            boxes.append(destination)
+        original = replace(prepared, points=prepared.points.copy())
+        reset_stroke_geometry(original)
+        source_box = stroke_annotation_box(original, width, height)
+        if source_box is not None:
+            boxes.append(source_box)
+    if not boxes:
+        return None
+    margin = max(
+        auto_optimized_stroke(item, auto_enabled).width
+        + auto_optimized_stroke(item, auto_enabled).feather * 4
+        for item in positive
+    ) + 8
+    x0 = max(0, min(box[0] for box in boxes) - margin)
+    y0 = max(0, min(box[1] for box in boxes) - margin)
+    x1 = min(width, max(box[2] for box in boxes) + margin)
+    y1 = min(height, max(box[3] for box in boxes) + margin)
+    relevant: list[Stroke] = []
+    for item in ordered:
+        if not item.points:
+            continue
+        if item.erase:
+            box = stroke_annotation_box(item, width, height)
+            if box is None:
+                continue
+            ex0, ey0, ex1, ey1 = box
+            if not (ex0 < x1 and ex1 > x0 and ey0 < y1 and ey1 > y0):
+                continue
+        relevant.append(stroke_for_image_crop(
+            item, width, height, x0, y0, x1 - x0, y1 - y0
+        ))
+    return relevant, (x0, y0, x1, y1)
+
+
 def stroke_annotation_box(stroke: Stroke, width: int, height: int) -> tuple[int, int, int, int] | None:
     points = transformed_stroke_points(stroke, width, height)
     if not points:
@@ -982,6 +1193,7 @@ def stroke_annotation_box(stroke: Stroke, width: int, height: int) -> tuple[int,
 def meteor_source_annotations(
     source_name: str, strokes: Iterable[Stroke], width: int, height: int,
     original_state: bool = False, active_mask: np.ndarray | None = None,
+    active_mask_origin: tuple[int, int] = (0, 0),
 ) -> list[dict]:
     """Build per-meteor labels and original references for transformed objects."""
     annotations = []
@@ -994,8 +1206,16 @@ def meteor_source_annotations(
         if box is None:
             continue
         x0, y0, x1, y1 = box
-        if active_mask is not None and not np.any(active_mask[y0:y1, x0:x1] > 0.001):
-            continue
+        if active_mask is not None:
+            origin_x, origin_y = active_mask_origin
+            mx0 = max(0, x0 - origin_x)
+            my0 = max(0, y0 - origin_y)
+            mx1 = min(active_mask.shape[1], x1 - origin_x)
+            my1 = min(active_mask.shape[0], y1 - origin_y)
+            if mx1 <= mx0 or my1 <= my0 or not np.any(
+                active_mask[my0:my1, mx0:mx1] > 0.001
+            ):
+                continue
         transformed = stroke_is_transformed(stroke)
         original_box = None
         if transformed:
@@ -1020,8 +1240,27 @@ def meteor_source_annotations(
     return annotations
 
 
+def scale_source_annotations(
+    annotations: list[dict], scale_x: float, scale_y: float,
+) -> list[dict]:
+    """Scale source-label boxes for a progressively downsampled preview."""
+    scaled = []
+    for annotation in annotations:
+        item = dict(annotation)
+        for field in ("boxes", "original_boxes"):
+            item[field] = [
+                (
+                    int(round(box[0] * scale_x)), int(round(box[1] * scale_y)),
+                    int(round(box[2] * scale_x)), int(round(box[3] * scale_y)),
+                )
+                for box in annotation.get(field, []) if box is not None
+            ]
+        scaled.append(item)
+    return scaled
+
+
 def transformed_object_crop(
-    source: np.ndarray, stroke: Stroke
+    source: np.ndarray, stroke: Stroke, fast: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, tuple[int, int, int, int]] | None:
     height, width = source.shape[:2]
     original = Stroke(stroke.points, stroke.width, stroke.feather)
@@ -1055,7 +1294,8 @@ def transformed_object_crop(
     local[:, 2] += linear @ np.asarray([x0, y0], np.float32)
     local[:, 2] -= np.asarray([dx0, dy0], np.float32)
     warped_source = cv2.warpAffine(
-        patch, local, (dx1 - dx0, dy1 - dy0), flags=cv2.INTER_LANCZOS4,
+        patch, local, (dx1 - dx0, dy1 - dy0),
+        flags=cv2.INTER_LINEAR if fast else cv2.INTER_LANCZOS4,
         borderMode=cv2.BORDER_CONSTANT, borderValue=0,
     )
     warped_alpha = cv2.warpAffine(
@@ -1068,6 +1308,35 @@ def transformed_object_crop(
     )
     warped_alpha = np.clip(warped_alpha * float(np.clip(stroke.opacity, 0.0, 1.0)), 0.0, 1.0)
     return warped_source, warped_alpha, warped_validity, (dx0, dy0, dx1, dy1)
+
+
+def transformed_mask_crop(
+    source: np.ndarray, strokes: Iterable[Stroke],
+) -> tuple[np.ndarray, tuple[int, int, int, int]] | None:
+    """Build only the small affected mask rectangle, preserving paint order."""
+    fragments: list[tuple[Stroke, np.ndarray, tuple[int, int, int, int]]] = []
+    for stroke in strokes:
+        if not stroke.points:
+            continue
+        transformed = transformed_object_crop(source, stroke, fast=True)
+        if transformed is None:
+            continue
+        _patch, alpha, _validity, box = transformed
+        fragments.append((stroke, alpha, box))
+    if not fragments:
+        return None
+    x0 = min(box[0] for _stroke, _alpha, box in fragments)
+    y0 = min(box[1] for _stroke, _alpha, box in fragments)
+    x1 = max(box[2] for _stroke, _alpha, box in fragments)
+    y1 = max(box[3] for _stroke, _alpha, box in fragments)
+    mask = np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+    for stroke, alpha, (fx0, fy0, fx1, fy1) in fragments:
+        target = mask[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0]
+        if stroke.erase:
+            target *= 1.0 - alpha
+        else:
+            np.maximum(target, alpha, out=target)
+    return np.clip(mask, 0.0, 1.0), (x0, y0, x1, y1)
 
 
 def auto_optimized_stroke(stroke: Stroke, enabled: bool = True) -> Stroke:
@@ -1135,15 +1404,17 @@ def analyze_meteor_blend_parameters(
 ) -> dict[str, float | int | str]:
     """Measure one meteor at full resolution and derive non-destructive blend settings."""
     profiles = {
-        "保守": {"cleanup": 65.0, "feather": 0.50, "noise": 2.1, "peak_cap": 0.07},
-        "标准": {"cleanup": 80.0, "feather": 0.72, "noise": 3.0, "peak_cap": 0.12},
-        "强力": {"cleanup": 92.0, "feather": 0.95, "noise": 4.2, "peak_cap": 0.20},
+        "保守": {"cleanup": 65.0, "feather": 0.82, "noise": 2.1, "peak_cap": 0.07},
+        "标准": {"cleanup": 80.0, "feather": 1.00, "noise": 3.0, "peak_cap": 0.12},
+        "强力": {"cleanup": 92.0, "feather": 1.22, "noise": 4.2, "peak_cap": 0.20},
     }
     profile_name = strength if strength in profiles else "标准"
     profile = profiles[profile_name]
     measured = replace(stroke, points=stroke.points.copy())
     measured.auto_blend_enabled = True
-    measured.auto_feather = max(3, int(round(stroke.width * stroke.width_scale * profile["feather"])))
+    # Auto-detected strokes already carry a transverse-profile feather. Respect
+    # that measured value instead of expanding it again from total mask width.
+    measured.auto_feather = max(3, int(round(max(3, stroke.feather) * profile["feather"])))
     transformed = transformed_object_crop(source, auto_optimized_stroke(measured, True))
     if transformed is None:
         return {
@@ -1287,6 +1558,26 @@ def dominant_meteor_signal_gate(
     return np.clip(support * tonal_gate, 0.0, 1.0)
 
 
+def auto_signal_needs_fallback(
+    positive_signal: np.ndarray, alpha: np.ndarray, clip_max: float,
+) -> bool:
+    """Cheaply identify an auto-optimized mask whose useful signal collapsed."""
+    luminance = (
+        positive_signal[..., 0] * 0.0722
+        + positive_signal[..., 1] * 0.7152
+        + positive_signal[..., 2] * 0.2126
+    )
+    mask_area = int((alpha > 0.01).sum())
+    if mask_area < 24:
+        return False
+    signal_floor = 1.0 if clip_max <= 255.0 else 64.0
+    active = int(((luminance > signal_floor) & (alpha > 0.01)).sum())
+    # Normal trails occupy several percent of a painted/feathered mask.  A
+    # result below 1.5% is suspicious enough to justify the more expensive
+    # conservative extraction and retention comparison.
+    return active < max(24, int(round(mask_area * 0.015)))
+
+
 def adjust_composite_base_exposure(
     composite: np.ndarray, base: np.ndarray, exposure_ev: float,
 ) -> np.ndarray:
@@ -1315,9 +1606,11 @@ def compose_meteor_objects(
     auto_optimize: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     clip_max = 65535.0 if base.dtype == np.uint16 or source.dtype == np.uint16 else 255.0
-    result = base.astype(np.float32).copy()
+    # Keep the full frame in its native dtype. Only small meteor patches become
+    # float32, avoiding a 3–4× full-frame allocation for every source layer.
+    result = base.copy()
     height, width = base.shape[:2]
-    union = np.zeros((height, width), np.float32)
+    union = np.zeros((height, width), np.float16)
     ordered_strokes = list(strokes)
     erase_after_cache: dict[tuple[int, ...], tuple[np.ndarray, tuple[int, int, int, int]] | None] = {}
     for stroke_index, stroke in enumerate(ordered_strokes):
@@ -1416,7 +1709,7 @@ def compose_meteor_objects(
         scaled_positive *= signal_gate[..., None]
         if auto_optimize:
             # Full-resolution export reveals one-level residuals hidden by the
-            # 1800px preview downsample. Estimate a per-object black point from
+            # Fit-to-window display can hide one-level residuals. Estimate a per-object black point from
             # the corrected outer sky, then subtract it from luminance while
             # preserving meteor colour and strong core/tail structure.
             residual = np.maximum(cleaned_source - base_patch, 0.0)
@@ -1449,6 +1742,86 @@ def compose_meteor_objects(
             retained = np.maximum(isolated_luma - black_point, 0.0)
             signal_scale = retained / np.maximum(isolated_luma, 1e-6)
             scaled_positive *= signal_scale[..., None]
+        if (
+            auto_optimize and stroke.auto_blend_enabled
+            and auto_signal_needs_fallback(scaled_positive, alpha, clip_max)
+        ):
+            # Automatic cleanup is allowed to remove sky residuals, but it must
+            # never erase the meteor it was asked to protect.  This matters most
+            # after a meteor has been moved: the source sky and destination sky
+            # can differ enough that local matching plus a strong cleanup value
+            # collapses a long trail to only a few bright pixels.  Build a second,
+            # deliberately conservative extraction and use it only when the
+            # optimized result has lost nearly all of that coherent signal.
+            fallback_cleanup = min(float(object_cleanup), 45.0)
+            fallback_cleaned = remove_local_background_cast(
+                raw_source, base_patch, alpha, fallback_cleanup, validity
+            )
+            fallback_source = fallback_cleaned
+            if curve_enabled:
+                fallback_source = apply_meteor_curve(
+                    fallback_source, alpha, curve_shadows, curve_highlights, clip_max
+                )
+            fallback_processed = np.maximum(fallback_source - base_patch, 0.0)
+            if object_preserve:
+                fallback_original = np.maximum(fallback_cleaned - base_patch, 0.0)
+                fallback_positive = np.maximum(fallback_processed, fallback_original)
+            else:
+                fallback_positive = fallback_processed
+            fallback_positive *= gain
+            fallback_luma = (
+                fallback_positive[..., 0] * 0.0722
+                + fallback_positive[..., 1] * 0.7152
+                + fallback_positive[..., 2] * 0.2126
+            )[..., None]
+            fallback_positive = np.clip(
+                fallback_luma + (fallback_positive - fallback_luma) * saturation,
+                0.0, clip_max,
+            )
+            fallback_gate = dominant_meteor_signal_gate(
+                fallback_positive, alpha, stroke, fallback_cleanup
+            )
+            fallback_positive *= fallback_gate[..., None]
+            fallback_isolated = (
+                fallback_positive[..., 0] * 0.0722
+                + fallback_positive[..., 1] * 0.7152
+                + fallback_positive[..., 2] * 0.2126
+            )
+            # Keep a small noise floor even in fallback mode.  The fallback is
+            # not a raw paste; it is the conservative end of the same isolated
+            # meteor pipeline.
+            conservative_black = 0.75 if clip_max <= 255.0 else 192.0
+            fallback_retained = np.maximum(fallback_isolated - conservative_black, 0.0)
+            fallback_positive *= (
+                fallback_retained / np.maximum(fallback_isolated, 1e-6)
+            )[..., None]
+
+            optimized_luma = (
+                scaled_positive[..., 0] * 0.0722
+                + scaled_positive[..., 1] * 0.7152
+                + scaled_positive[..., 2] * 0.2126
+            )
+            fallback_luma = (
+                fallback_positive[..., 0] * 0.0722
+                + fallback_positive[..., 1] * 0.7152
+                + fallback_positive[..., 2] * 0.2126
+            )
+            signal_floor = 1.0 if clip_max <= 255.0 else 64.0
+            fallback_active = (fallback_luma > signal_floor) & (alpha > 0.01)
+            optimized_active = (optimized_luma > signal_floor) & (alpha > 0.01)
+            fallback_count = int(fallback_active.sum())
+            optimized_count = int(optimized_active.sum())
+            fallback_energy = float(fallback_luma[fallback_active].sum()) if fallback_count else 0.0
+            optimized_energy = float(optimized_luma[optimized_active].sum()) if optimized_count else 0.0
+            severe_signal_loss = (
+                fallback_count >= 24
+                and (
+                    optimized_count < max(12, int(round(fallback_count * 0.12)))
+                    or optimized_energy < fallback_energy * 0.10
+                )
+            )
+            if severe_signal_loss:
+                scaled_positive = fallback_positive
         # Never paste the source sky itself. Only the isolated positive meteor
         # residual is allowed into the clean base, preventing stars, trees and
         # projection seams inside a broad feather from appearing in the result.
@@ -1480,9 +1853,12 @@ def compose_meteor_objects(
                 # faint tail smooth. This compensates for alpha and resampling loss.
                 effective_alpha = alpha + (1.0 - alpha) * highlight
         a = effective_alpha[..., None]
-        result[y0:y1, x0:x1] = base_patch * (1.0 - a) + candidate * a
-        union[y0:y1, x0:x1] = np.maximum(union[y0:y1, x0:x1], alpha)
-    return np.clip(result, 0, clip_max).astype(base.dtype), union
+        blended = base_patch * (1.0 - a) + candidate * a
+        result[y0:y1, x0:x1] = np.clip(blended, 0, clip_max).astype(base.dtype)
+        union[y0:y1, x0:x1] = np.maximum(
+            union[y0:y1, x0:x1], alpha.astype(np.float16, copy=False)
+        )
+    return result, union
 
 
 def compose_meteor_sources(
@@ -1501,7 +1877,7 @@ def compose_meteor_sources(
     """
     ordered = list(strokes)
     result = base.copy()
-    union = np.zeros(base.shape[:2], dtype=np.float32)
+    union = np.zeros(base.shape[:2], dtype=np.float16)
     sources = {"aligned": aligned_source, "original": original_source}
     for mode in ("aligned", "original"):
         selected = [item for item in ordered if normalized_source_mode(item) == mode]
@@ -1734,8 +2110,8 @@ class MeteorComposer(tk.Tk):
         self.selected_auto_summary = tk.StringVar(value="自动参数：尚未分析")
         self.base_exposure_tenths = tk.IntVar(value=0)
         self.base_exposure_label = tk.StringVar(value="+0.0 EV")
-        self.exact_preview_status = tk.StringVar(value="导出级预览：未生成")
-        self.preview_quality_status = tk.StringVar(value="当前画布：快速预览")
+        self.exact_preview_status = tk.StringVar(value="精准预览：自动")
+        self.preview_quality_status = tk.StringVar(value="当前画布：原始像素")
         self.selected_object_summary = tk.StringVar(value="尚未选择流星")
         self.selected_override_enabled = tk.BooleanVar(value=False)
         self.selected_brightness = tk.IntVar(value=100)
@@ -1754,12 +2130,15 @@ class MeteorComposer(tk.Tk):
         self.export_tiff = tk.BooleanVar(value=False)
         self.blend_mode = tk.StringVar(value="自然融合")
         self.edit_mode = tk.StringVar(value="paint")
-        self.view_mode = tk.StringVar(value="source")
+        # A restored/opened project should immediately show its result, not an
+        # empty source canvas that requires the user to discover view button 3.
+        self.view_mode = tk.StringVar(value="blend")
+        self.source_state_label = tk.StringVar(value="当前素材：自动对齐图")
         self.blend_preview_label = tk.StringVar(value="3 融合预览")
         self.source_preview_label = tk.StringVar(value="4 来源标注")
         self.show_mask = tk.BooleanVar(value=True)
         self.h_mask_held = False
-        self.status = tk.StringVar(value="请选择输入和输出位置。")
+        self.status = tk.StringVar(value="请选择输入素材；输出位置可留空自动创建。")
 
         self.files: list[Path] = []
         self.selected_base_files: list[Path] = []
@@ -1792,9 +2171,32 @@ class MeteorComposer(tk.Tk):
         self.preview_base: np.ndarray | None = None
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_image_item: int | None = None
+        self.preview_cache: OrderedDict[tuple[str, ...], tuple] = OrderedDict()
+        self.base_preview_cache: OrderedDict[tuple[str, int, int, int], np.ndarray] = OrderedDict()
+        self.layer_preview_cache: OrderedDict[tuple[str, int, int, int, int], np.ndarray] = OrderedDict()
+        self.preview_cache_lock = threading.Lock()
+        display_budget, precision_budget, viewport_budget = preview_memory_budgets()
+        self.full_display_cache: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDict()
+        self.full_precision_cache: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDict()
+        self.full_display_cache_bytes = 0
+        self.full_precision_cache_bytes = 0
+        self.full_display_cache_budget = display_budget
+        self.full_precision_cache_budget = precision_budget
+        self.full_cache_inflight: dict[tuple[str, str, int, int], threading.Event] = {}
+        self.full_cache_pinned_paths: set[str] = set()
+        self.prefetch_generation = 0
+        self.viewport_cache: OrderedDict[tuple, tuple[Image.Image, int]] = OrderedDict()
+        self.viewport_cache_bytes = 0
+        self.viewport_cache_budget = viewport_budget
+        self.preview_frame_serial = 0
+        self.preview_mask_overlay: tuple[np.ndarray, tuple[int, int, int, int]] | None = None
+        self.preview_request_id = 0
+        self.preview_selection_after_id: str | None = None
         self.preview_display_size: tuple[int, int] | None = None
         self.canvas_zoom = 1.0
         self.canvas_fit_mode = True
+        self.canvas_preserve_fit_once = False
+        self.canvas_last_window_size: tuple[int, int] | None = None
         self.canvas_center_x = 0.0
         self.canvas_center_y = 0.0
         self.canvas_image_shape: tuple[int, int] | None = None
@@ -1808,6 +2210,9 @@ class MeteorComposer(tk.Tk):
         self.global_preview_loading_signature: str | None = None
         self.global_preview_pending_signature: str | None = None
         self.global_preview_request_after_id: str | None = None
+        self.global_preview_generation = 0
+        self.last_incremental_box: tuple[int, int, int, int] | None = None
+        self.realtime_label_after_id: str | None = None
         self.shared_base_loading_signature: str | None = None
         self.global_exact_after_id: str | None = None
         self.exact_preview_rgb: np.ndarray | None = None
@@ -1816,7 +2221,11 @@ class MeteorComposer(tk.Tk):
         self.exact_labeled_preview_full_rgb: np.ndarray | None = None
         self.exact_preview_signature: str | None = None
         self.exact_preview_loading_signature: str | None = None
+        self.exact_preview_pending_signature: str | None = None
+        self.exact_preview_request_after_id: str | None = None
+        self.exact_preview_open_when_ready = False
         self.exact_preview_window: ExactPreviewViewer | None = None
+        self.exact_preview_generation = 0
         self.current_dims = (1, 1)
         self.display_box = (0, 0, 1, 1)
         self.active_points: list[tuple[float, float]] = []
@@ -1842,6 +2251,8 @@ class MeteorComposer(tk.Tk):
         self.object_drag_original: Stroke | None = None
         self.object_drag_live_source: np.ndarray | None = None
         self.object_drag_live_background: np.ndarray | None = None
+        self.object_drag_live_frame: np.ndarray | None = None
+        self.object_drag_live_box: tuple[int, int, int, int] | None = None
         self.object_drag_live_full_width = 1
         self.object_drag_live_settings: tuple | None = None
         self.object_drag_last_render = 0.0
@@ -1863,12 +2274,27 @@ class MeteorComposer(tk.Tk):
         self.video_window = None
         self.alignment_window = None
         self.screening_window = None
+        self.last_export_path: Path | None = None
 
         self._build_ui()
         self._bind_shortcuts()
         self._setup_autosave()
         self.after(150, self._poll_queue)
         self.after(350, self._restore_autosave)
+
+    def maximize_for_normal_launch(self) -> None:
+        """Use the native maximized state, with a cross-platform fallback."""
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -1878,6 +2304,7 @@ class MeteorComposer(tk.Tk):
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text=APP_NAME, font=("TkDefaultFont", 15, "bold")).pack(side="left")
         ttk.Label(header, text="图片合成工作区").pack(side="left", padx=12)
+        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="打开视频动态工作区…", command=self.open_video_workspace).pack(side="right")
         ttk.Button(header, text="2  Siril＋PTGui星空对齐…", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
         ttk.Button(header, text="流星批量筛选…", command=self.open_screening_workspace).pack(side="right", padx=(0, 6))
@@ -1908,7 +2335,7 @@ class MeteorComposer(tk.Tk):
         self.base_folder_button = ttk.Button(base_buttons, text="选择文件夹…", command=self._browse_base_folder)
         self.base_folder_button.pack(side="left", padx=(4, 0))
         ttk.Label(paths, textvariable=self.base_selection_summary).grid(row=2, column=4, sticky="w", padx=(4, 0))
-        self._path_row(paths, 3, "独立输出文件夹", self.output_dir, self._browse_output)
+        self._path_row(paths, 3, "输出文件夹（可留空）", self.output_dir, self._browse_output)
         ttk.Button(paths, text="只读扫描", command=self.scan_inputs).grid(row=1, column=3, rowspan=3, padx=8, sticky="ns")
         paths.columnconfigure(1, weight=1)
         self._update_output_mode_ui()
@@ -1918,32 +2345,39 @@ class MeteorComposer(tk.Tk):
 
         left = ttk.Frame(body, width=310)
         body.add(left, weight=0)
-        ttk.Label(left, text="TIFF 素材（双击加载）").pack(anchor="w")
+        ttk.Label(left, text="TIFF 素材（单击或上下键立即加载）").pack(anchor="w")
         self.tree = ttk.Treeview(left, columns=("status",), show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="文件")
         self.tree.heading("status", text="蒙版")
         self.tree.column("#0", width=210)
         self.tree.column("status", width=70, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=4)
-        self.tree.bind("<Double-1>", lambda _e: self.load_selected())
-        ttk.Button(left, text="加载所选", command=self.load_selected).pack(fill="x")
-        ttk.Button(left, text="切换查看/绘制源：自动对齐 / 原始图", command=self.toggle_original_state).pack(fill="x", pady=(4, 0))
+        self.tree.bind("<<TreeviewSelect>>", self._tree_selection_changed)
+        source_state = ttk.Frame(left)
+        source_state.pack(fill="x", pady=(4, 0))
+        self.aligned_source_button = ttk.Button(
+            source_state, text="自动对齐图", command=lambda: self._set_current_source_state("aligned")
+        )
+        self.aligned_source_button.pack(side="left", fill="x", expand=True)
+        self.original_source_button = ttk.Button(
+            source_state, text="原始状态图", command=lambda: self._set_current_source_state("original")
+        )
+        self.original_source_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        ttk.Label(left, textvariable=self.source_state_label).pack(anchor="w", pady=(2, 0))
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
         view_bar = ttk.Frame(center)
         view_bar.pack(fill="x", pady=(0, 2))
         ttk.Label(view_bar, text="查看：").pack(side="left")
-        ttk.Radiobutton(view_bar, text="1 原图 TIFF", variable=self.view_mode, value="source", command=self._view_mode_changed).pack(side="left")
+        ttk.Radiobutton(view_bar, text="1 当前素材图", variable=self.view_mode, value="source", command=self._view_mode_changed).pack(side="left")
         ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Label(view_bar, text="编辑视图：拖动画蒙版；按住 H 临时隐藏红色").pack(side="right")
         exact_bar = ttk.Frame(center)
         exact_bar.pack(fill="x", pady=(0, 4))
-        ttk.Button(exact_bar, text="生成并打开导出级精确预览", command=self.request_exact_preview).pack(side="left")
-        ttk.Button(exact_bar, text="打开已生成预览", command=self.open_exact_preview).pack(side="left", padx=(6, 0))
-        ttk.Label(exact_bar, textvariable=self.preview_quality_status).pack(side="left", padx=(12, 0))
+        ttk.Label(exact_bar, textvariable=self.preview_quality_status).pack(side="left")
         ttk.Label(exact_bar, textvariable=self.exact_preview_status).pack(side="left", padx=(8, 0))
         ttk.Button(exact_bar, text="适合窗口", command=self._canvas_fit).pack(side="right", padx=(4, 0))
         ttk.Button(exact_bar, text="100%", command=self._canvas_actual_size).pack(side="right", padx=(4, 0))
@@ -2162,6 +2596,7 @@ class MeteorComposer(tk.Tk):
         self.progress = ttk.Progressbar(bottom, mode="determinate", length=220)
         self.progress.pack(side="left", padx=8)
         ttk.Button(bottom, text="导出合成结果", command=self.export).pack(side="right")
+        ttk.Button(bottom, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
         ttk.Button(bottom, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
 
         # Reserve the bottom controls before allowing the canvas to consume the
@@ -2236,7 +2671,7 @@ class MeteorComposer(tk.Tk):
         if tiff_count:
             self.status.set(
                 f"已自动填入筛选导出目录：{folder}（{tiff_count} 张 TIFF）；"
-                "选择干净底图和独立输出文件夹后即可只读扫描"
+                "选择干净底图后即可扫描；输出位置可留空并自动创建"
             )
         elif raw_count:
             self.status.set(
@@ -2300,6 +2735,7 @@ class MeteorComposer(tk.Tk):
         self.alignment_statuses = {
             str(Path(item.output_layer)): item.status for item in result.items if item.output_layer
         }
+        MeteorComposer._restrict_project_to_active_keys(self, self.pairs)
         self.tree.delete(*self.tree.get_children())
         status_by_path = {str(path): status for path, status in loaded_items}
         for index, path in enumerate(exported):
@@ -2444,13 +2880,7 @@ class MeteorComposer(tk.Tk):
             before = replace(stroke, points=stroke.points.copy())
             stroke.offset_x += dx * amount
             stroke.offset_y += dy * amount
-            incremental = None
-            if self._uses_shared_base():
-                self._prepare_live_object_drag(self.selected_object, before)
-                self._render_live_object_drag(force=True)
-                if self.object_drag_live_source is not None and self.preview_rgb is not None:
-                    incremental = self.preview_rgb.copy()
-                self._clear_live_object_drag()
+            incremental = self._incremental_selected_object_image(before)
             self._record_object_transform(before)
             if incremental is not None:
                 self._commit_incremental_global_preview(incremental, validate=False)
@@ -2525,7 +2955,7 @@ Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 
 查看与文件
 1：原图 TIFF    2：干净 JPG    3：最终融合    4：来源标注
 鼠标滚轮或 +/-：以光标为中心缩放；中键拖动或按住空格+左键拖动：平移
-Ctrl/Command+0：适合窗口    Ctrl/Command+1：100% 快速预览像素
+Ctrl/Command+0：适合窗口    Ctrl/Command+1：100% 原图像素
 拼合到同一张底图：第 3/4 模式汇总全部流星；分别输出：只预览当前图片对
 红色蒙版默认显示；按住 H：临时隐藏，松开恢复
 ← / →：上一张 / 下一张
@@ -2607,9 +3037,16 @@ F1：显示本快捷键表""")
         )
 
     def _browse_output(self) -> None:
-        value = filedialog.askdirectory(title="选择独立输出文件夹")
+        value = filedialog.askdirectory(title="选择输出文件夹（也可留空自动创建）")
         if value:
             self.output_dir.set(value)
+
+    def _open_output_folder(self, path: str | Path | None = None) -> None:
+        target = path or self.last_export_path or self.output_dir.get().strip()
+        try:
+            open_folder(target)
+        except Exception as exc:
+            show_copyable_error(APP_NAME, str(exc), parent=self)
 
     def _uses_shared_base(self) -> bool:
         return self.output_mode.get() == "combined"
@@ -2637,12 +3074,32 @@ F1：显示本快捷键表""")
         self.global_labeled_preview_rgb = None
         self.global_preview_signature = None
         self.global_preview_pending_signature = None
+        self.global_preview_generation = getattr(self, "global_preview_generation", 0) + 1
         self.exact_preview_rgb = None
         self.exact_labeled_preview_rgb = None
         self.exact_preview_full_rgb = None
         self.exact_labeled_preview_full_rgb = None
         self.exact_preview_signature = None
-        self.exact_preview_status.set("导出级预览：底图已变化，请重新生成")
+        self.exact_preview_generation = getattr(self, "exact_preview_generation", 0) + 1
+        self.exact_preview_pending_signature = None
+        if getattr(self, "exact_preview_request_after_id", None) is not None:
+            try:
+                self.after_cancel(self.exact_preview_request_after_id)
+            except tk.TclError:
+                pass
+            self.exact_preview_request_after_id = None
+        self.exact_preview_status.set("精准预览：底图已变化，将自动更新")
+        cache = getattr(self, "preview_cache", None)
+        if cache is not None:
+            with self.preview_cache_lock:
+                cache.clear()
+                self.base_preview_cache.clear()
+                self.layer_preview_cache.clear()
+                self.full_cache_pinned_paths.clear()
+                self.prefetch_generation += 1
+        if hasattr(self, "viewport_cache"):
+            self.viewport_cache.clear()
+            self.viewport_cache_bytes = 0
         if self.global_preview_request_after_id is not None:
             try:
                 self.after_cancel(self.global_preview_request_after_id)
@@ -2660,10 +3117,10 @@ F1：显示本快捷键表""")
         self._invalidate_base_dependent_state()
         self._schedule_autosave()
         source = Path(self.source_dir.get()).expanduser()
-        if source.is_dir() and self.output_dir.get().strip():
+        if source.is_dir():
             self.scan_inputs(reload_current=True)
         else:
-            self.status.set("已选择新底图；选择完整的原图和输出目录后会建立新配对")
+            self.status.set("已选择新底图；选择原图文件夹后会自动建立配对和输出目录")
 
     def scan_inputs(self, reload_current: bool = True) -> bool:
         previous_current = self.current_path
@@ -2673,12 +3130,14 @@ F1：显示本快捷键表""")
             base_text = self.base_dir.get().strip()
             base_input = Path(base_text).expanduser() if base_text else None
             combined = self.output_mode.get() == "combined"
-            output_text = self.output_dir.get().strip()
-            if not output_text:
-                raise ValueError("请选择独立输出文件夹")
-            output = Path(output_text).expanduser()
             if not source.is_dir():
                 raise ValueError("请选择有效的 TIFF 文件夹")
+            output_text = self.output_dir.get().strip()
+            if not output_text:
+                output = source / "MeteorStudio_Output"
+                self.output_dir.set(str(output))
+            else:
+                output = Path(output_text).expanduser()
             selected = [path for path in self.selected_base_files if path.is_file()]
             selected_parents = {path.parent.resolve() for path in selected}
             use_selected = bool(selected) and (
@@ -2692,29 +3151,21 @@ F1：显示本快捷键表""")
                     raise ValueError("“拼合到同一张底图”模式必须选择一张干净底图照片")
                 base_files = [base_input]
                 self.selected_base_files = [base_input]
-                base_roots = {base_input.parent}
             elif use_selected:
                 base_files = selected
-                base_roots = {path.parent for path in selected}
             elif base_input is not None and base_input.is_dir():
                 base_files = sorted(
                     path for path in base_input.iterdir()
                     if path.is_file() and path.suffix.lower() in {".jpg", ".jpeg", ".tif", ".tiff", ".png"}
                 )
                 self.selected_base_files = []
-                base_roots = {base_input}
             elif base_input is not None and base_input.is_file():
                 base_files = [base_input]
                 self.selected_base_files = [base_input]
-                base_roots = {base_input.parent}
             else:
                 raise ValueError("“分别输出”模式请选择一张/多张底图，或包含同名底图的文件夹")
             if not base_files:
                 raise ValueError("没有找到可用的干净底图")
-            if (path_is_within(output, source) or path_is_within(source, output)
-                    or any(path_is_within(output, root) or path_is_within(root, output)
-                           for root in base_roots)):
-                raise ValueError("输出目录必须与输入素材位置完全分开")
             source_files = sorted(p for p in source.iterdir() if p.is_file() and p.suffix.lower() in TIFF_SUFFIXES)
             if not source_files:
                 raise ValueError("原图文件夹中没有 TIFF 文件")
@@ -2730,13 +3181,27 @@ F1：显示本快捷键表""")
                 raise ValueError("干净底图文件夹存在同主文件名的重复 JPG/JPEG：" + "、".join(sorted(duplicates)[:8]))
             valid, mismatched, missing = [], [], []
             pairs: dict[str, Path] = {}
-            for path in source_files:
-                base = base_files[0] if combined else base_by_stem.get(path.stem.casefold())
+            candidates = [
+                (path, base_files[0] if combined else base_by_stem.get(path.stem.casefold()))
+                for path in source_files
+            ]
+            missing.extend(path.name for path, base in candidates if base is None)
+            candidates = [(path, base) for path, base in candidates if base is not None]
+            # Metadata inspection is independent for every pair.  Use several
+            # workers and avoid reopening a shared 500 MB base TIFF once per row.
+            unique_paths = list(dict.fromkeys(
+                [path for pair in candidates for path in pair if path is not None]
+            ))
+            infos = {}
+            if unique_paths:
+                info_workers = min(8, max(1, (os.cpu_count() or 4)), len(unique_paths))
+                with ThreadPoolExecutor(max_workers=info_workers, thread_name_prefix="meteor-scan") as pool:
+                    infos = dict(zip(unique_paths, pool.map(image_info, unique_paths)))
+            for path, base in candidates:
                 if base is None:
-                    missing.append(path.name)
                     continue
-                sw, sh, _sdepth, _schannels = image_info(path)
-                bw, bh, _bdepth, _bchannels = image_info(base)
+                sw, sh, _sdepth, _schannels = infos[path]
+                bw, bh, _bdepth, _bchannels = infos[base]
                 if (sw, sh) == (bw, bh):
                     valid.append(path)
                     pairs[str(path)] = base
@@ -2744,6 +3209,8 @@ F1：显示本快捷键表""")
                     mismatched.append(f"{path.name}: TIFF {sw}×{sh} / JPG {bw}×{bh}")
             self.files = valid
             self.pairs = pairs
+            MeteorComposer._discover_alignment_sources(self, source, valid)
+            MeteorComposer._restrict_project_to_active_keys(self, pairs)
             self.pairing_signature = self._base_selection_signature()
             self._update_blend_preview_label()
             self.tree.delete(*self.tree.get_children())
@@ -2775,25 +3242,96 @@ F1：显示本快捷键表""")
                 self.current_path = None
                 self.preview_source = None
                 self.preview_base = None
+            elif valid:
+                # Always establish a concrete current image.  Combined preview
+                # can start from the shared base immediately, while selecting
+                # the first row also enables the full-resolution exact worker
+                # and prevents the initial black canvas.
+                self.tree.selection_set("0")
+                self.tree.see("0")
+                if reload_current:
+                    self.load_selected()
+            if hasattr(self, "_schedule_autosave"):
+                self._schedule_autosave()
             return True
         except Exception as exc:
             self.pairs = {}
             self.pairing_signature = None
-            messagebox.showerror(APP_NAME, str(exc))
+            show_copyable_error(APP_NAME, str(exc), parent=self)
             return False
 
+    def _restrict_project_to_active_keys(self, keys: Iterable[str]) -> None:
+        """Make one project contain state for one concrete source batch only."""
+        active = {str(key) for key in keys}
+        for name in (
+            "strokes", "candidates", "candidate_thresholds", "image_adjustments",
+            "original_sources", "alignment_statuses", "edit_history", "edit_redo",
+            "shift_anchors",
+        ):
+            values = getattr(self, name, {})
+            setattr(self, name, {key: value for key, value in values.items() if key in active})
+        self.use_original_sources.intersection_update(active)
+        selected = getattr(self, "selected_object", None)
+        if selected is not None and selected[0] not in active:
+            self._clear_object_selection()
+
+    def _discover_alignment_sources(self, source_dir: Path, valid: list[Path]) -> None:
+        """Recover original-image links when an aligned folder is opened directly."""
+        manifest_path = source_dir.parent / "alignment_manifest.json"
+        if not manifest_path.is_file():
+            return
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+            by_output = {
+                str(Path(item["output_layer"]).resolve()): item
+                for item in data.get("items", []) if item.get("output_layer") and item.get("source")
+            }
+            active_keys = {str(path) for path in valid}
+            # Keep mappings belonging to other saved projects, but refresh every
+            # entry in the currently scanned folder from its own manifest.
+            for path in valid:
+                item = by_output.get(str(path.resolve()))
+                if item is None:
+                    continue
+                original = Path(item["source"])
+                if original.is_file() and original.resolve() != path.resolve():
+                    self.original_sources[str(path)] = original
+                    self.alignment_statuses[str(path)] = str(item.get("status", ""))
+            self.use_original_sources.intersection_update(
+                set(self.original_sources) | (set(self.use_original_sources) - active_keys)
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            # A hand-edited/older manifest must never prevent ordinary scanning.
+            return
+
+    def _tree_selection_changed(self, _event=None) -> None:
+        """Load a row after a short debounce so held arrow keys stay responsive."""
+        if self.preview_selection_after_id is not None:
+            try:
+                self.after_cancel(self.preview_selection_after_id)
+            except tk.TclError:
+                pass
+        self.preview_selection_after_id = self.after(55, self.load_selected)
+
     def load_selected(self) -> None:
+        self.preview_selection_after_id = None
         selection = self.tree.selection()
         if not selection:
             return
         path = self.files[int(selection[0])]
         image_path = self._effective_source_path(path)
+        self.full_cache_pinned_paths = {
+            str(path), str(image_path), str(self.original_sources.get(str(path), path)),
+            str(self.pairs[str(path)]),
+        }
         mode = "查看原始图" if str(path) in self.use_original_sources else "查看自动对齐图"
+        self.preview_request_id += 1
+        request_id = self.preview_request_id
         self.status.set(f"正在加载 {path.name}（{mode}）…")
         self._run_worker(
             self._load_preview_worker, path, image_path, path,
             self.original_sources.get(str(path), path), self.pairs[str(path)],
-            self.pairing_signature,
+            self.pairing_signature, request_id,
         )
 
     def _effective_source_path(self, path: Path) -> Path:
@@ -2828,6 +3366,37 @@ F1：显示本快捷键表""")
         self.tree.item(str(index), text=f"[查看{mode}] {review}{path.name}")
         self._schedule_autosave()
         self.load_selected()
+
+    def _set_current_source_state(self, mode: str) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        path = self.files[int(selection[0])]
+        key = str(path)
+        if mode == "original":
+            original = self.original_sources.get(key)
+            if original is None or not original.is_file():
+                self.status.set("未找到这张对齐图对应的原始状态图")
+                return
+            self.use_original_sources.add(key)
+        else:
+            self.use_original_sources.discard(key)
+        self._update_source_state_ui(path)
+        self._schedule_autosave()
+        self.load_selected()
+
+    def _update_source_state_ui(self, path: Path | None) -> None:
+        if path is None:
+            return
+        key = str(path)
+        original_available = key in self.original_sources and self.original_sources[key].is_file()
+        original_active = key in self.use_original_sources and original_available
+        self.source_state_label.set(
+            "当前素材：原始状态图（未对齐）" if original_active else "当前素材：自动对齐图"
+        )
+        if hasattr(self, "original_source_button"):
+            self.original_source_button.configure(state="normal" if original_available else "disabled")
+            self.aligned_source_button.configure(state="normal")
 
     def _current_adjustment_values(self) -> dict:
         return {
@@ -2911,7 +3480,7 @@ F1：显示本快捷键表""")
             (key, index)
             for key, values in self.strokes.items()
             for index, stroke in enumerate(values)
-            if not stroke.erase and stroke.points
+            if key in self.pairs and not stroke.erase and stroke.points
         ]
         self._auto_optimize_references(references)
 
@@ -2928,7 +3497,7 @@ F1：显示本快捷键表""")
             base_path = self.pairs.get(key)
             if base_path is None:
                 continue
-            base = to_uint16(read_image(base_path))
+            base = self._cached_full_image(base_path, True)
             source_cache: dict[str, np.ndarray] = {}
             for index, expected_points in entries:
                 values = self.strokes.get(key, [])
@@ -2941,7 +3510,7 @@ F1：显示本快捷键表""")
                         self.original_sources.get(key, source_path)
                         if mode == "original" else source_path
                     )
-                    source_cache[mode] = to_uint16(read_image(selected_path))
+                    source_cache[mode] = self._cached_full_image(selected_path, True)
                 source = source_cache[mode]
                 if source.shape[:2] != base.shape[:2]:
                     continue
@@ -2961,14 +3530,19 @@ F1：显示本快捷键表""")
         if stroke.auto_black_point is None:
             self.auto_optimize_selected()
             return
+        before = replace(stroke, points=stroke.points.copy())
         stroke.auto_blend_enabled = True
         stroke.brightness_override = None
         stroke.background_cleanup_override = None
         if self.selected_object:
             self._sync_matching_candidate(self.selected_object[0], stroke)
-        self._invalidate_global_preview()
+        incremental = self._incremental_parameter_change_image(before)
+        if incremental is not None:
+            self._commit_incremental_global_preview(incremental, validate=False)
+        else:
+            self._invalidate_global_preview()
+            self._render_preview()
         self._load_selected_object_adjustments()
-        self._render_preview()
         self._schedule_autosave()
         self.status.set("已恢复这颗流星的自动融合参数")
 
@@ -2976,12 +3550,17 @@ F1：显示本快捷键表""")
         stroke = self._selected_stroke()
         if stroke is None:
             return
+        before = replace(stroke, points=stroke.points.copy())
         stroke.auto_blend_enabled = False
         if self.selected_object:
             self._sync_matching_candidate(self.selected_object[0], stroke)
-        self._invalidate_global_preview()
+        incremental = self._incremental_parameter_change_image(before)
+        if incremental is not None:
+            self._commit_incremental_global_preview(incremental, validate=False)
+        else:
+            self._invalidate_global_preview()
+            self._render_preview()
         self._load_selected_object_adjustments()
-        self._render_preview()
         self._schedule_autosave()
         self.status.set("已关闭这颗流星的自动优化，恢复原始蒙版融合")
 
@@ -3039,7 +3618,7 @@ F1：显示本快捷键表""")
         self.adjustment_defaults["match_exposure"] = enabled
         if self.current_path:
             self._load_image_adjustments(str(self.current_path))
-        self.global_preview_signature = None
+        self._invalidate_global_preview()
         self._schedule_autosave()
         self._render_preview()
         self.status.set(
@@ -3059,7 +3638,7 @@ F1：显示本快捷键表""")
         if not adjustment:
             self.image_adjustments.pop(key, None)
         self._load_image_adjustments(key)
-        self.global_preview_signature = None
+        self._invalidate_global_preview()
         self._schedule_autosave()
         self._render_preview()
         self.status.set(f"当前图局部曝光匹配：{policy}")
@@ -3072,6 +3651,7 @@ F1：显示本快捷键表""")
         values = self._current_adjustment_values()
         for name in ("curve_enabled", "curve_shadows", "curve_highlights"):
             adjustment[name] = values[name]
+        self._invalidate_global_preview()
 
     def _load_image_adjustments(self, key: str) -> None:
         values = {**self.adjustment_defaults, **self.image_adjustments.get(key, {})}
@@ -3102,7 +3682,7 @@ F1：显示本快捷键表""")
         if not self.files:
             messagebox.showwarning(APP_NAME, "请先执行只读扫描")
             return
-        if any(self.strokes.values()):
+        if any(self.strokes.get(str(path), []) for path in self.files):
             if not messagebox.askyesno(APP_NAME, "AI 自动检测会替换未锁定蒙版；锁定蒙版继续保留。继续吗？"):
                 return
         self.progress["value"] = 0
@@ -3128,8 +3708,8 @@ F1：显示本快捷键表""")
     def _candidate_worker(
         self, path: Path, image_path: Path, base_path: Path, source_mode: str,
     ):
-        base_preview, _ = detection_preview(read_image(base_path))
-        source_preview, source_scale = detection_preview(read_image(image_path))
+        base_preview, _ = detection_preview(self._cached_full_image(base_path, False))
+        source_preview, source_scale = detection_preview(self._cached_full_image(image_path, False))
         if source_preview.shape != base_preview.shape:
             source_preview = cv2.resize(
                 source_preview, (base_preview.shape[1], base_preview.shape[0]), interpolation=cv2.INTER_AREA
@@ -3142,14 +3722,14 @@ F1：显示本快捷键表""")
             score = int(round(100 * predict_gradient_boosting(
                 candidate_feature_vector(maps, start, end, legacy_score), self.ranker_model
             ))) if self.ranker_model else legacy_score
+            full_width, full_feather = estimate_trail_mask_geometry(
+                source_preview, base_preview, start, end, source_scale
+            )
             start, end, core_length = expand_trail_segment(start, end, width, height)
             points = [
                 (start[0] / max(1, width - 1), start[1] / max(1, height - 1)),
                 (end[0] / max(1, width - 1), end[1] / max(1, height - 1)),
             ]
-            preview_width = float(np.clip(core_length * 0.12, 10.0, 28.0))
-            full_width = int(np.clip(round(preview_width / max(0.001, source_scale)), 36, 140))
-            full_feather = int(np.clip(round(preview_width * 0.70 / max(0.001, source_scale)), 20, 100))
             candidates.append(Stroke(
                 points, full_width, full_feather, False, False, int(score),
                 source_mode=source_mode,
@@ -3207,16 +3787,15 @@ F1：显示本快捷键表""")
         self, files: list[Path], pairs: dict[str, Path], read_paths: dict[str, Path],
         source_modes: dict[str, str],
     ):
-        found: dict[str, list[Stroke]] = {}
-        plane_count = 0
-        for index, path in enumerate(files, start=1):
+        def analyze(path: Path) -> tuple[str, list[Stroke], int]:
             base_path = pairs[str(path)]
-            base_preview, _ = detection_preview(read_image(base_path))
-            source_preview, source_scale = detection_preview(read_image(read_paths.get(str(path), path)))
+            base_preview, _ = detection_preview(self._cached_full_image(base_path, False))
+            source_preview, source_scale = detection_preview(
+                self._cached_full_image(read_paths.get(str(path), path), False)
+            )
             if source_preview.shape != base_preview.shape:
                 source_preview = cv2.resize(source_preview, (base_preview.shape[1], base_preview.shape[0]), interpolation=cv2.INTER_AREA)
             trails, planes = detect_trails(source_preview, base_preview, ranked=True)
-            plane_count += planes
             height, width = source_preview.shape[:2]
             maps = prepare_ml_maps(source_preview, base_preview) if self.ranker_model else None
             ranked_trails = []
@@ -3229,52 +3808,251 @@ F1：显示本快捷键表""")
             selected = [item for item in ranked_trails if item[0] >= 55][:4]
             strokes = []
             for score, start, end in selected:
+                full_width, full_feather = estimate_trail_mask_geometry(
+                    source_preview, base_preview, start, end, source_scale
+                )
                 start, end, core_length = expand_trail_segment(start, end, width, height)
                 points = [(start[0] / max(1, width - 1), start[1] / max(1, height - 1)),
                           (end[0] / max(1, width - 1), end[1] / max(1, height - 1))]
-                preview_width = float(np.clip(core_length * 0.12, 10.0, 28.0))
-                full_width = int(np.clip(round(preview_width / max(0.001, source_scale)), 36, 140))
-                full_feather = int(np.clip(round(preview_width * 0.70 / max(0.001, source_scale)), 20, 100))
                 strokes.append(Stroke(
                     points, width=full_width, feather=full_feather, auto_score=int(score),
                     source_mode=source_modes.get(str(path), "aligned"),
                 ))
-            if strokes:
-                found[str(path)] = strokes
-            self.work_queue.put(("progress", index / len(files) * 100, f"自动检测 {index}/{len(files)}：{path.name}"))
+            return str(path), strokes, planes
+
+        found: dict[str, list[Stroke]] = {}
+        plane_count = 0
+        workers = min(max(1, (os.cpu_count() or 4) // 3), 4, max(1, len(files)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-detect") as pool:
+            results = pool.map(analyze, files)
+            for index, (key, strokes, planes) in enumerate(results, start=1):
+                plane_count += planes
+                path = Path(key)
+                if strokes:
+                    found[key] = strokes
+                self.work_queue.put((
+                    "progress", index / len(files) * 100,
+                    f"并行自动检测 {index}/{len(files)}：{path.name}",
+                ))
         return "autodetected", found, plane_count, source_modes
+
+    @staticmethod
+    def _file_identity(path: Path) -> tuple[str, int, int]:
+        stat = path.stat()
+        return str(path), stat.st_mtime_ns, stat.st_size
+
+    def _cached_full_image(self, path: Path, precision: bool = False) -> np.ndarray:
+        """Decode once, share between workers, and evict by bytes rather than file count."""
+        if not hasattr(self, "full_display_cache") or not hasattr(self, "preview_cache_lock"):
+            decoded16 = to_uint16(read_image(path))
+            return decoded16 if precision else np.right_shift(decoded16, 8).astype(np.uint8)
+        identity = MeteorComposer._file_identity(path)
+        cache = self.full_precision_cache if precision else self.full_display_cache
+        inflight_key = (("16" if precision else "8"), *identity)
+        with self.preview_cache_lock:
+            cached = cache.get(identity)
+            if cached is not None:
+                cache.move_to_end(identity)
+                return cached
+            event = self.full_cache_inflight.get(inflight_key)
+            owner = event is None
+            if owner:
+                event = threading.Event()
+                self.full_cache_inflight[inflight_key] = event
+        if not owner:
+            event.wait()
+            with self.preview_cache_lock:
+                cached = cache.get(identity)
+                if cached is not None:
+                    cache.move_to_end(identity)
+                    return cached
+            return self._cached_full_image(path, precision)
+        try:
+            decoded16 = to_uint16(read_image(path))
+            decoded = decoded16 if precision else np.right_shift(decoded16, 8).astype(np.uint8)
+            with self.preview_cache_lock:
+                cache[identity] = decoded
+                cache.move_to_end(identity)
+                byte_name = "full_precision_cache_bytes" if precision else "full_display_cache_bytes"
+                budget = self.full_precision_cache_budget if precision else self.full_display_cache_budget
+                setattr(self, byte_name, getattr(self, byte_name) + int(decoded.nbytes))
+                # Never evict the currently displayed source/base. Prefetch is
+                # opportunistic and gives way to the active working set.
+                protected_paths = self.full_cache_pinned_paths
+                while getattr(self, byte_name) > budget and len(cache) > 1:
+                    victim = next(
+                        (key for key in cache if key[0] not in protected_paths), None
+                    )
+                    if victim is None:
+                        break
+                    removed = cache.pop(victim)
+                    setattr(self, byte_name, getattr(self, byte_name) - int(removed.nbytes))
+            return decoded
+        finally:
+            with self.preview_cache_lock:
+                finished = self.full_cache_inflight.pop(inflight_key, None)
+                if finished is not None:
+                    finished.set()
+
+    def _cached_display_with_precision(self, path: Path) -> np.ndarray:
+        """Decode the active image once and retain both 16-bit and display forms."""
+        identity = MeteorComposer._file_identity(path)
+        with self.preview_cache_lock:
+            cached = self.full_display_cache.get(identity)
+            if cached is not None:
+                self.full_display_cache.move_to_end(identity)
+                # The display form may have been prefetched without precision.
+                precision_cached = identity in self.full_precision_cache
+            else:
+                precision_cached = False
+        if cached is not None and precision_cached:
+            return cached
+        precise = MeteorComposer._cached_full_image(self, path, True)
+        if cached is not None:
+            return cached
+        display = np.right_shift(precise, 8).astype(np.uint8)
+        with self.preview_cache_lock:
+            existing = self.full_display_cache.get(identity)
+            if existing is not None:
+                self.full_display_cache.move_to_end(identity)
+                return existing
+            self.full_display_cache[identity] = display
+            self.full_display_cache.move_to_end(identity)
+            self.full_display_cache_bytes += int(display.nbytes)
+            while (
+                self.full_display_cache_bytes > self.full_display_cache_budget
+                and len(self.full_display_cache) > 1
+            ):
+                victim = next(
+                    (key for key in self.full_display_cache
+                     if key[0] not in self.full_cache_pinned_paths), None
+                )
+                if victim is None:
+                    break
+                removed = self.full_display_cache.pop(victim)
+                self.full_display_cache_bytes -= int(removed.nbytes)
+        return display
+
+    def _schedule_neighbor_prefetch(self, current: Path) -> None:
+        if current not in self.files:
+            return
+        self.prefetch_generation += 1
+        generation = self.prefetch_generation
+        index = self.files.index(current)
+        nearby = []
+        for distance in (1, 2):
+            for neighbor_index in (index + distance, index - distance):
+                if 0 <= neighbor_index < len(self.files):
+                    nearby.append(self.files[neighbor_index])
+
+        def prefetch() -> None:
+            jobs: dict[Path, bool] = {}
+            for position, source_path in enumerate(nearby):
+                key = str(source_path)
+                warm_precision = position < 2
+                for path in (
+                    source_path,
+                    self.original_sources.get(key, source_path),
+                    self.pairs.get(key, source_path),
+                ):
+                    if path.is_file():
+                        jobs[path] = jobs.get(path, False) or warm_precision
+            work = list(jobs.items())
+            workers = min(3, len(work))
+            if not workers:
+                return
+            def load(job):
+                path, warm_precision = job
+                return (
+                    self._cached_display_with_precision(path)
+                    if warm_precision else self._cached_full_image(path, False)
+                )
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-prefetch") as pool:
+                for _image in pool.map(load, work):
+                    if generation != self.prefetch_generation:
+                        break
+
+        threading.Thread(target=prefetch, daemon=True).start()
 
     def _load_preview_worker(
         self, path: Path, image_path: Path, aligned_path: Path,
         original_path: Path, base_path: Path,
         pairing_signature: str | None = None,
+        request_id: int = 0,
     ):
-        rgb16 = to_uint16(read_image(image_path))
-        height, width = rgb16.shape[:2]
-        scale = min(1.0, 1800 / max(width, height))
-        preview_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        preview = cv2.resize(rgb16, preview_size, interpolation=cv2.INTER_AREA)
-        source_preview = np.right_shift(preview, 8).astype(np.uint8)
-        aligned16 = to_uint16(read_image(aligned_path))
-        original16 = to_uint16(read_image(original_path))
-        if aligned16.shape[:2] != (height, width) or original16.shape[:2] != (height, width):
+        cache_key = tuple(str(value) for target in (
+            image_path, aligned_path, original_path, base_path,
+        ) for value in self._file_identity(target))
+        with self.preview_cache_lock:
+            cached = self.preview_cache.get(cache_key)
+            if cached is not None:
+                self.preview_cache.move_to_end(cache_key)
+                return ("preview", request_id, path, *cached, base_path, pairing_signature)
+
+        unique = list(dict.fromkeys((image_path, aligned_path, original_path, base_path)))
+        workers = min(4, len(unique))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-preview") as pool:
+            decoded = dict(zip(unique, pool.map(self._cached_display_with_precision, unique)))
+        source_preview = decoded[image_path]
+        height, width = source_preview.shape[:2]
+        aligned_preview = decoded[aligned_path]
+        original_preview = decoded[original_path]
+        base_preview = decoded[base_path]
+        if (
+            aligned_preview.shape[:2] != (height, width)
+            or original_preview.shape[:2] != (height, width)
+        ):
             raise ValueError(f"自动对齐图与原始图尺寸不一致：{path.name}")
-        aligned_preview = np.right_shift(
-            cv2.resize(aligned16, preview_size, interpolation=cv2.INTER_AREA), 8
-        ).astype(np.uint8)
-        original_preview = np.right_shift(
-            cv2.resize(original16, preview_size, interpolation=cv2.INTER_AREA), 8
-        ).astype(np.uint8)
-        base16 = to_uint16(read_image(base_path))
-        if base16.shape[:2] != (height, width):
+        if base_preview.shape[:2] != (height, width):
             raise ValueError(f"尺寸不一致：{path.name} / {base_path.name}")
-        base_preview = cv2.resize(base16, (source_preview.shape[1], source_preview.shape[0]), interpolation=cv2.INTER_AREA)
-        base_preview = np.right_shift(base_preview, 8).astype(np.uint8)
-        return (
-            "preview", path, source_preview, aligned_preview, original_preview,
-            base_preview, (width, height),
-            base_path, pairing_signature,
+        preview_size = (width, height)
+        with self.preview_cache_lock:
+            for layer_path, layer_preview in (
+                (aligned_path, aligned_preview), (original_path, original_preview),
+            ):
+                layer_stat = layer_path.stat()
+                layer_key = (
+                    str(layer_path), layer_stat.st_mtime_ns, layer_stat.st_size,
+                    preview_size[0], preview_size[1],
+                )
+                self.layer_preview_cache[layer_key] = layer_preview
+                self.layer_preview_cache.move_to_end(layer_key)
+            while len(self.layer_preview_cache) > 48:
+                self.layer_preview_cache.popitem(last=False)
+        payload = (
+            source_preview, aligned_preview, original_preview, base_preview, (width, height),
         )
+        with self.preview_cache_lock:
+            self.preview_cache[cache_key] = payload
+            self.preview_cache.move_to_end(cache_key)
+            while len(self.preview_cache) > 5:
+                self.preview_cache.popitem(last=False)
+        return ("preview", request_id, path, *payload, base_path, pairing_signature)
+
+    def _cached_layer_preview(
+        self, path: Path, width: int, height: int,
+    ) -> np.ndarray | None:
+        cache = getattr(self, "layer_preview_cache", None)
+        lock = getattr(self, "preview_cache_lock", None)
+        if cache is None or lock is None:
+            return None
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        key = (str(path), stat.st_mtime_ns, stat.st_size, width, height)
+        with lock:
+            image = cache.get(key)
+            if image is not None:
+                cache.move_to_end(key)
+                return image
+            full_key = (str(path), stat.st_mtime_ns, stat.st_size)
+            full_cache = getattr(self, "full_display_cache", {})
+            image = full_cache.get(full_key)
+            if image is not None and image.shape[:2] == (height, width):
+                full_cache.move_to_end(full_key)
+                return image
+            return None
 
     def _request_shared_base_preview(self) -> None:
         """Prepare a shared-base composite without requiring a selected source image."""
@@ -3291,12 +4069,8 @@ F1：显示本快捷键表""")
     def _load_shared_base_preview_worker(
         self, base_path: Path, pairing_signature: str | None,
     ):
-        base16 = to_uint16(read_image(base_path))
-        height, width = base16.shape[:2]
-        scale = min(1.0, 1800 / max(width, height))
-        preview_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-        preview = cv2.resize(base16, preview_size, interpolation=cv2.INTER_AREA)
-        base_preview = np.right_shift(preview, 8).astype(np.uint8)
+        base_preview = self._cached_full_image(base_path, False)
+        height, width = base_preview.shape[:2]
         return "shared_base_preview", base_preview, (width, height), base_path, pairing_signature
 
     def _preview_mask(self) -> np.ndarray:
@@ -3337,14 +4111,16 @@ F1：显示本快捷键表""")
     def _global_preview_state_signature(self) -> str:
         selected = {
             key: [asdict(stroke) for stroke in values]
-            for key, values in self.strokes.items() if values
+            for key, values in self.strokes.items() if key in self.pairs and values
         }
         payload = {
             "base": self.base_dir.get(),
             "pairs": {key: str(value) for key, value in sorted(self.pairs.items())},
             "blend_mode": self.blend_mode.get(),
             "strokes": selected,
-            "adjustments": self.image_adjustments,
+            "adjustments": {
+                key: value for key, value in self.image_adjustments.items() if key in self.pairs
+            },
             "defaults": self.adjustment_defaults,
             "shape": tuple(self.preview_base.shape) if self.preview_base is not None else (),
         }
@@ -3358,30 +4134,75 @@ F1：显示本快捷键表""")
             "base_exposure_ev": self.base_exposure_tenths.get() / 10.0,
         }, sort_keys=True, ensure_ascii=False)
 
+    def _schedule_automatic_exact_preview(self) -> None:
+        if self.preview_base is None or self.current_path is None:
+            return
+        # Let the fast full-size composite publish visible meteors first. Running
+        # both complete pipelines at once doubled disk/memory pressure and could
+        # leave the user staring at the base while two workers competed. The
+        # global-preview completion event calls render again and starts the exact
+        # 16-bit pass immediately afterwards.
+        global_signature = self._global_preview_state_signature()
+        if self.global_preview_signature != global_signature:
+            return
+        signature = self._exact_preview_state_signature()
+        if signature == self.exact_preview_signature:
+            return
+        self.exact_preview_pending_signature = signature
+        if self.exact_preview_request_after_id is not None:
+            try:
+                self.after_cancel(self.exact_preview_request_after_id)
+            except tk.TclError:
+                pass
+        self.exact_preview_request_after_id = self.after(320, self._start_automatic_exact_preview)
+
+    def _start_automatic_exact_preview(self) -> None:
+        self.exact_preview_request_after_id = None
+        signature = self.exact_preview_pending_signature
+        if signature is None or signature != self._exact_preview_state_signature():
+            return
+        if self.exact_preview_loading_signature is not None:
+            return
+        self.exact_preview_pending_signature = None
+        self._begin_exact_preview(signature, False)
+
     def request_exact_preview(self) -> None:
+        """Compatibility entry point; normal operation starts this automatically."""
         if self.preview_base is None or self.current_path is None:
             messagebox.showwarning(APP_NAME, "请先加载一张图片")
             return
         if self.exact_preview_loading_signature is not None:
-            self.status.set("导出级精确预览正在计算，请稍候")
+            self.status.set("原始像素精准预览正在后台更新，请稍候")
             return
         signature = self._exact_preview_state_signature()
+        self._begin_exact_preview(signature, False)
+
+    def _begin_exact_preview(self, signature: str, open_when_ready: bool = False) -> None:
         marked = {
             Path(key): [replace(item, points=item.points.copy()) for item in values]
             for key, values in self.strokes.items()
             if key in self.pairs and values
         }
         self.exact_preview_loading_signature = signature
-        self.exact_preview_status.set("导出级预览：计算中…")
+        self.exact_preview_generation = getattr(self, "exact_preview_generation", 0) + 1
+        generation = self.exact_preview_generation
+        self.exact_preview_open_when_ready = open_when_ready
+        self.exact_preview_status.set("精准预览：后台更新中…")
         self.progress["value"] = 0
-        self.status.set("正在按原始分辨率和 16 位导出链路生成精确预览…")
+        self.status.set("正在按原始分辨率和 16 位导出链路更新当前画布…")
+        full_height, full_width = self.preview_base.shape[:2]
+        quick_scale = min(1.0, 2400.0 / max(1, full_width, full_height))
+        quick_shape = (
+            max(1, int(round(full_height * quick_scale))),
+            max(1, int(round(full_width * quick_scale))),
+        )
         self._run_worker(
             self._exact_preview_worker, signature, marked, self.pairs.copy(),
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(), self.blend_mode.get(),
             {str(path): self.original_sources.get(str(path), path) for path in marked},
             self.output_mode.get(), Path(self.current_path),
-            self.base_exposure_tenths.get() / 10.0, self.preview_base.shape[:2],
+            self.base_exposure_tenths.get() / 10.0, quick_shape, generation,
         )
 
     def open_exact_preview(self) -> None:
@@ -3418,37 +4239,72 @@ F1：显示本快捷键表""")
         self, signature: str, marked: dict[Path, list[Stroke]], pairs: dict[str, Path],
         adjustments: dict[str, dict], adjustment_defaults: dict, blend_mode: str,
         original_paths: dict[str, Path], output_mode: str, current_path: Path,
-        base_exposure_ev: float, preview_shape: tuple[int, int],
+        base_exposure_ev: float, preview_shape: tuple[int, int], generation: int,
     ):
         selected = list(marked.items()) if output_mode == "combined" else [
             (current_path, marked.get(current_path, []))
         ]
+        if output_mode == "combined" and not selected:
+            selected = [(current_path, [])]
         if not selected or str(selected[0][0]) not in pairs:
             raise ValueError("找不到当前图片对应的干净底图")
         first_base_path = pairs[str(selected[0][0])]
-        clean_base = to_uint16(read_image(first_base_path))
+        clean_base = self._cached_full_image(first_base_path, True)
         result = clean_base.copy()
         height, width = result.shape[:2]
         annotations: list[dict] = []
         included = 0
-        for index, (source_path, strokes) in enumerate(selected, start=1):
+        last_partial = 0.0
+        preview_h, preview_w = preview_shape
+        clean_preview16 = cv2.resize(clean_base, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+
+        def load_selected(entry):
+            source_path, strokes = entry
+            if not strokes:
+                return None
+            original_path = original_paths.get(str(source_path), source_path)
+            unique_sources = list(dict.fromkeys((source_path, original_path)))
+            with ThreadPoolExecutor(
+                max_workers=min(2, len(unique_sources)), thread_name_prefix="meteor-exact-pair"
+            ) as pool:
+                decoded = dict(zip(
+                    unique_sources,
+                    pool.map(lambda path: self._cached_full_image(path, True), unique_sources),
+                ))
+            return decoded[source_path], decoded[original_path]
+
+        pipeline_workers = 2 if len(selected) > 1 else 1
+        for index, ((source_path, strokes), decoded_pair) in enumerate(
+            ordered_prefetch(selected, load_selected, pipeline_workers), start=1
+        ):
+            if generation != self.exact_preview_generation:
+                return "exact_preview_cancelled", signature
             if output_mode != "combined":
                 base_path = pairs.get(str(source_path))
                 if base_path is None:
                     raise ValueError(f"找不到同名底图配对：{source_path.name}")
-                clean_base = to_uint16(read_image(base_path))
+                clean_base = self._cached_full_image(base_path, True)
                 result = clean_base.copy()
                 height, width = result.shape[:2]
+                clean_preview16 = cv2.resize(
+                    clean_base, (preview_w, preview_h), interpolation=cv2.INTER_AREA
+                )
             if not strokes:
                 continue
-            aligned_source = to_uint16(read_image(source_path))
             original_path = original_paths.get(str(source_path), source_path)
-            original_source = to_uint16(read_image(original_path))
+            aligned_source, original_source = decoded_pair
             if aligned_source.shape[:2] != (height, width) or original_source.shape[:2] != (height, width):
                 raise ValueError(f"尺寸不一致：{source_path.name}")
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
-            result, mask = compose_meteor_sources(
-                aligned_source, original_source, result, strokes,
+            crop_spec = strokes_for_composite_crop(
+                strokes, width, height, bool(adjustment.get("auto_optimize", True))
+            )
+            if crop_spec is None:
+                continue
+            cropped_strokes, (x0, y0, x1, y1) = crop_spec
+            composed_crop, mask = compose_meteor_sources(
+                aligned_source[y0:y1, x0:x1], original_source[y0:y1, x0:x1],
+                result[y0:y1, x0:x1], cropped_strokes,
                 bool(adjustment["match_exposure"]), bool(adjustment["curve_enabled"]),
                 float(adjustment["curve_shadows"]), float(adjustment["curve_highlights"]),
                 blend_mode, bool(adjustment.get("preserve_brightness", True)),
@@ -3457,18 +4313,38 @@ F1：显示本快捷键表""")
                 bool(adjustment.get("auto_optimize", True)),
             )
             if np.any(mask > 0.001):
+                result[y0:y1, x0:x1] = composed_crop
                 included += 1
                 annotations.extend(meteor_source_annotations(
                     source_path.stem, strokes, width, height,
-                    False, mask,
+                    False, None,
                 ))
+            now = time.monotonic()
+            if index == 1 or index == len(selected) or now - last_partial >= 0.65:
+                partial16 = cv2.resize(
+                    result, (preview_w, preview_h), interpolation=cv2.INTER_AREA
+                )
+                partial16 = adjust_composite_base_exposure(
+                    partial16, clean_preview16, base_exposure_ev
+                )
+                partial_rgb = np.right_shift(partial16, 8).astype(np.uint8)
+                scaled_annotations = scale_source_annotations(
+                    annotations, preview_w / max(1, width), preview_h / max(1, height)
+                )
+                partial_labeled, _records = annotate_meteor_sources(
+                    partial16, scaled_annotations
+                )
+                self.work_queue.put((
+                    "exact_preview_partial", signature, partial_rgb, partial_labeled,
+                    index, len(selected), included,
+                ))
+                last_partial = now
             self.work_queue.put((
                 "progress", index / max(1, len(selected)) * 90,
-                f"导出级精确预览 {index}/{len(selected)}：{source_path.name}",
+                f"原始像素精准预览 {index}/{len(selected)}：{source_path.name}",
             ))
         result = adjust_composite_base_exposure(result, clean_base, base_exposure_ev)
         labeled, _records = annotate_meteor_sources(result, annotations)
-        preview_h, preview_w = preview_shape
         full_rgb = np.right_shift(result, 8).astype(np.uint8)
         full_labeled_rgb = labeled.astype(np.uint8, copy=False)
         resized16 = cv2.resize(result, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
@@ -3519,16 +4395,18 @@ F1：显示本快捷键表""")
             if key in self.pairs and values
         }
         self.global_preview_loading_signature = signature
+        self.global_preview_generation = getattr(self, "global_preview_generation", 0) + 1
+        generation = self.global_preview_generation
         self.status.set(f"正在生成总融合预览：合成 {len(marked)} 张已标记图片…")
         self._run_worker(
-            self._global_preview_worker, signature, self.preview_base.copy(), marked,
+            self._global_preview_worker, signature, generation, self.preview_base.copy(), marked,
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(), self.blend_mode.get(),
             {str(path): self.original_sources.get(str(path), path) for path in marked},
         )
 
     def _global_preview_worker(
-        self, signature: str, base_preview: np.ndarray,
+        self, signature: str, generation: int, base_preview: np.ndarray,
         marked: dict[Path, list[Stroke]], adjustments: dict[str, dict],
         adjustment_defaults: dict, blend_mode: str, original_paths: dict[str, Path],
     ):
@@ -3537,19 +4415,45 @@ F1：显示本快捷键表""")
         total = max(1, len(marked))
         included = 0
         preview_annotations = []
+        last_partial = 0.0
         for index, (source_path, strokes) in enumerate(marked.items(), start=1):
-            aligned = to_uint16(read_image(source_path))
+            if generation != getattr(self, "global_preview_generation", generation):
+                return "global_preview_cancelled", signature
             original_path = original_paths.get(str(source_path), source_path)
-            original = to_uint16(read_image(original_path))
-            full_height, full_width = aligned.shape[:2]
-            if original.shape[:2] != (full_height, full_width):
-                raise ValueError(f"自动对齐图与原始图尺寸不一致：{source_path.name}")
-            aligned_preview = np.right_shift(cv2.resize(
-                aligned, (preview_width, preview_height), interpolation=cv2.INTER_AREA
-            ), 8).astype(np.uint8)
-            original_preview = np.right_shift(cv2.resize(
-                original, (preview_width, preview_height), interpolation=cv2.INTER_AREA
-            ), 8).astype(np.uint8)
+            aligned_preview = MeteorComposer._cached_layer_preview(
+                self,
+                source_path, preview_width, preview_height
+            )
+            original_preview = MeteorComposer._cached_layer_preview(
+                self,
+                original_path, preview_width, preview_height
+            )
+            full_width, full_height, _depth, _channels = image_info(source_path)
+            if aligned_preview is None or original_preview is None:
+                aligned, original = read_uint16_pair(source_path, original_path)
+                full_height, full_width = aligned.shape[:2]
+                if original.shape[:2] != (full_height, full_width):
+                    raise ValueError(f"自动对齐图与原始图尺寸不一致：{source_path.name}")
+                aligned_preview = np.right_shift(cv2.resize(
+                    aligned, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+                ), 8).astype(np.uint8)
+                original_preview = np.right_shift(cv2.resize(
+                    original, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+                ), 8).astype(np.uint8)
+                if hasattr(self, "preview_cache_lock") and hasattr(self, "layer_preview_cache"):
+                    with self.preview_cache_lock:
+                        for layer_path, layer_image in (
+                            (source_path, aligned_preview), (original_path, original_preview),
+                        ):
+                            layer_stat = layer_path.stat()
+                            key = (
+                                str(layer_path), layer_stat.st_mtime_ns, layer_stat.st_size,
+                                preview_width, preview_height,
+                            )
+                            self.layer_preview_cache[key] = layer_image
+                            self.layer_preview_cache.move_to_end(key)
+                        while len(self.layer_preview_cache) > 48:
+                            self.layer_preview_cache.popitem(last=False)
             scale_to_preview = preview_width / max(1, full_width)
             scaled = [Stroke(
                 item.points, max(1, int(round(item.width * scale_to_preview))),
@@ -3581,6 +4485,17 @@ F1：显示本快捷键表""")
                     source_path.stem, scaled, preview_width, preview_height,
                     False, mask,
                 ))
+            now = time.monotonic()
+            if index == 1 or index == len(marked) or now - last_partial >= 0.18:
+                partial = result.copy()
+                partial_labeled, _records = annotate_meteor_sources(
+                    partial, preview_annotations
+                )
+                self.work_queue.put((
+                    "global_preview_partial", signature, partial, partial_labeled,
+                    index, len(marked), included,
+                ))
+                last_partial = now
             self.work_queue.put((
                 "progress", index / total * 100,
                 f"正在生成总融合预览 {index}/{len(marked)}：{source_path.name}",
@@ -3619,59 +4534,61 @@ F1：显示本快捷键表""")
             ]
         composite_mode = mode in {"blend", "labeled"}
         mask_edit_mode = mode == "source"
-        self.preview_quality_status.set("当前画布：快速预览")
+        self.preview_quality_status.set("当前画布：原始像素")
+        self.preview_mask_overlay = None
         if mode == "base":
             shown = adjust_composite_base_exposure(
                 self.preview_base, self.preview_base, self.base_exposure_tenths.get() / 10.0
             )
         elif composite_mode:
             exact_signature = self._exact_preview_state_signature()
-            exact_cached = (
+            exact_full = (
+                self.exact_labeled_preview_full_rgb
+                if mode == "labeled" else self.exact_preview_full_rgb
+            )
+            exact_partial = (
                 self.exact_labeled_preview_rgb if mode == "labeled" else self.exact_preview_rgb
             )
-            if self.exact_preview_signature and self.exact_preview_signature != exact_signature:
-                self.exact_preview_status.set("导出级预览：参数已变化，请重新生成")
-            if self.exact_preview_signature == exact_signature and exact_cached is not None:
-                shown = exact_cached.copy()
-                self.preview_quality_status.set("当前画布：导出级结果（缩放显示）")
-            elif self._uses_shared_base():
-                signature = self._global_preview_state_signature()
-                cached = (
+            exact_current = self.exact_preview_signature == exact_signature and exact_full is not None
+            progressive_current = (
+                self.exact_preview_loading_signature == exact_signature and exact_partial is not None
+            )
+            if exact_current:
+                shown = exact_full
+                self.preview_quality_status.set("当前画布：16 位合成链路 · 原始像素")
+                self.exact_preview_status.set(f"精准预览：有效（{shown.shape[1]}×{shown.shape[0]}）")
+            elif progressive_current and exact_partial.shape[:2] == self.preview_base.shape[:2]:
+                shown = exact_partial
+                self.preview_quality_status.set("当前画布：精准预览正在逐张累积…")
+            else:
+                # The progressive exact frame is intentionally smaller. Showing
+                # it on the main canvas changed the image dimensions twice and
+                # made every view switch appear to zoom by itself. Keep the
+                # full-size fast composite visible until the exact full frame is
+                # ready; progress remains visible in the status bar.
+                global_signature = self._global_preview_state_signature()
+                if self.global_preview_signature != global_signature:
+                    self._request_global_preview(global_signature)
+                fast = (
                     self.global_labeled_preview_rgb if mode == "labeled"
                     else self.global_preview_rgb
                 )
-                if self.global_preview_signature == signature and cached is not None:
-                    shown = cached.copy()
-                else:
-                    # Keep the last composite visible while a transformed object is
-                    # recomposited in the worker; otherwise the entire sky flashes
-                    # back to the empty base after every mouse release.
-                    shown = cached.copy() if cached is not None else self.preview_base.copy()
-                    self._request_global_preview(signature)
-            else:
-                shown, current_mask = compose_meteor_sources(
-                    self.preview_aligned_source if self.preview_aligned_source is not None else self.preview_source,
-                    self.preview_original_source if self.preview_original_source is not None else self.preview_source,
-                    self.preview_base, scaled_strokes,
-                    bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
-                    float(self.curve_shadows.get()), float(self.curve_highlights.get()),
-                    self.blend_mode.get(), bool(self.default_preserve_brightness.get()),
-                    float(self.meteor_brightness.get()), float(self.default_background_cleanup.get()),
-                    bool(self.adjustment_defaults.get("auto_optimize", True)),
-                )
-                if mode == "labeled" and self.current_path:
-                    shown, _records = annotate_meteor_sources(
-                        shown, meteor_source_annotations(
-                            self.current_path.stem, scaled_strokes, width, height,
-                            str(self.current_path) in self.use_original_sources, current_mask,
-                        )
+                if mode == "labeled" and fast is None and self.global_preview_rgb is not None:
+                    fast, _records = annotate_meteor_sources(
+                        self.global_preview_rgb, self._global_annotations_from_state()
                     )
-            if self.exact_preview_signature != exact_signature or exact_cached is None:
+                    self.global_labeled_preview_rgb = fast
+                shown = fast if fast is not None else self.preview_base
+                self.preview_quality_status.set("当前画布：原始像素 · 后台精准更新中…")
+                self._schedule_automatic_exact_preview()
+            if not exact_current and not (
+                progressive_current and exact_partial.shape[:2] == self.preview_base.shape[:2]
+            ):
                 shown = adjust_composite_base_exposure(
                     shown, self.preview_base, self.base_exposure_tenths.get() / 10.0
                 )
         else:
-            shown = self.preview_source.copy()
+            shown = self.preview_source
             # The original TIFF remains intact at the old position. For geometrically
             # transformed meteors, also render a non-destructive copy at the new
             # position so the source view explains exactly what will be composited.
@@ -3692,26 +4609,18 @@ F1：显示本快捷键表""")
                     self.preview_source, shown, reference_strokes,
                     False, False, 0, 0, "普通粘贴", False, 100, 0, False,
                 )
-        mask = np.zeros(shown.shape[:2], dtype=np.float32)
+        mask_crop = None
         if mask_edit_mode:
             current_mode = self._current_source_mode()
             visible_mask_strokes = [
                 item for item in preview_mask_strokes
                 if normalized_source_mode(item) == current_mode
             ]
-            _composed, mask = compose_meteor_objects(
-                self.preview_source, self.preview_base, visible_mask_strokes,
-                bool(self.match_exposure.get()), bool(self.curve_enabled.get()),
-                float(self.curve_shadows.get()), float(self.curve_highlights.get()),
-                self.blend_mode.get(), bool(self.default_preserve_brightness.get()),
-                float(self.meteor_brightness.get()), float(self.default_background_cleanup.get()),
-                bool(self.adjustment_defaults.get("auto_optimize", True)),
-            )
-        if mask_edit_mode and self.show_mask.get() and np.any(mask > 0.001):
-            opacity = (mask * 0.55)[..., None]
-            red = np.empty_like(shown)
-            red[:] = (255, 35, 25)
-            shown = np.clip(shown.astype(np.float32) * (1.0 - opacity) + red.astype(np.float32) * opacity, 0, 255).astype(np.uint8)
+            mask_crop = transformed_mask_crop(self.preview_source, visible_mask_strokes)
+        if mask_edit_mode and self.show_mask.get() and mask_crop is not None:
+            mask, (mx0, my0, mx1, my1) = mask_crop
+            if np.any(mask > 0.001):
+                self.preview_mask_overlay = mask_crop
         self._present_preview_image(shown, composite_mode, mask_edit_mode)
 
     def _canvas_fit_scale(self) -> float:
@@ -3760,6 +4669,7 @@ F1：显示本快捷键表""")
         self.canvas_center_y = height / 2.0
         self.canvas_zoom = self._canvas_fit_scale()
         self.canvas_fit_mode = True
+        self.canvas_preserve_fit_once = False
         self._redraw_canvas_only()
 
     def _canvas_actual_size(self) -> None:
@@ -3846,23 +4756,51 @@ F1：显示本快捷键表""")
     def _canvas_configure(self, _event=None) -> None:
         if self.preview_rgb is None:
             return
-        if not self.canvas_fit_mode:
+        window_size = (max(1, self.winfo_width()), max(1, self.winfo_height()))
+        window_changed = (
+            self.canvas_last_window_size is None
+            or window_size != self.canvas_last_window_size
+        )
+        self.canvas_last_window_size = window_size
+        if self.canvas_fit_mode and window_changed:
+            # Only a real top-level resize may change fit zoom. Notebook/status
+            # reflow and clicks in blank UI areas must leave the photograph at
+            # exactly the same scale.
+            height, width = self.preview_rgb.shape[:2]
+            self.canvas_zoom = self._canvas_fit_scale()
+            self.canvas_center_x = width / 2.0
+            self.canvas_center_y = height / 2.0
+        elif not self.canvas_fit_mode:
             self._clamp_canvas_center()
         self._redraw_canvas_only()
 
     def _present_preview_image(
         self, shown: np.ndarray, composite_mode: bool, mask_edit_mode: bool = False
     ) -> None:
+        same_frame = shown is self.preview_rgb
+        if not same_frame:
+            self.preview_frame_serial += 1
         self.preview_rgb = shown
         canvas_w = max(10, self.canvas.winfo_width())
         canvas_h = max(10, self.canvas.winfo_height())
         h, w = self.preview_rgb.shape[:2]
+        initial_frame = self.canvas_image_shape is None
         if self.canvas_image_shape != (h, w):
+            previous_shape = self.canvas_image_shape
+            if previous_shape is not None and not self.canvas_fit_mode:
+                old_h, old_w = previous_shape
+                self.canvas_center_x = self.canvas_center_x / max(1, old_w) * w
+                self.canvas_center_y = self.canvas_center_y / max(1, old_h) * h
+                # Preserve the same normalized field of view when a background
+                # render changes resolution. View buttons must not zoom or jump.
+                self.canvas_zoom *= old_w / max(1, w)
+            else:
+                self.canvas_center_x = w / 2.0
+                self.canvas_center_y = h / 2.0
             self.canvas_image_shape = (h, w)
-            self.canvas_center_x = w / 2.0
-            self.canvas_center_y = h / 2.0
-            self.canvas_fit_mode = True
-        if self.canvas_fit_mode:
+        preserve_fit = self.canvas_fit_mode and self.canvas_preserve_fit_once
+        self.canvas_preserve_fit_once = False
+        if self.canvas_fit_mode and initial_frame and not preserve_fit:
             self.canvas_zoom = self._canvas_fit_scale()
             self.canvas_center_x = w / 2.0
             self.canvas_center_y = h / 2.0
@@ -3874,12 +4812,55 @@ F1：显示本快捷键表""")
         crop_y1 = min(h, int(np.ceil(origin_y + canvas_h / self.canvas_zoom)))
         if crop_x1 <= crop_x0 or crop_y1 <= crop_y0:
             return
-        image = Image.fromarray(self.preview_rgb[crop_y0:crop_y1, crop_x0:crop_x1])
         dw = max(1, int(round((crop_x1 - crop_x0) * self.canvas_zoom)))
         dh = max(1, int(round((crop_y1 - crop_y0) * self.canvas_zoom)))
-        if image.size != (dw, dh):
-            resample = Image.Resampling.LANCZOS if self.canvas_zoom < 1.0 else Image.Resampling.BICUBIC
-            image = image.resize((dw, dh), resample)
+        viewport_key = (
+            self.preview_frame_serial, crop_x0, crop_y0, crop_x1, crop_y1, dw, dh
+        )
+        cached_view = self.viewport_cache.get(viewport_key)
+        if cached_view is not None:
+            image = cached_view[0]
+            self.viewport_cache.move_to_end(viewport_key)
+        else:
+            image = Image.fromarray(self.preview_rgb[crop_y0:crop_y1, crop_x0:crop_x1])
+            if image.size != (dw, dh):
+                resample = (
+                    Image.Resampling.LANCZOS if self.canvas_zoom < 1.0
+                    else Image.Resampling.BICUBIC
+                )
+                image = image.resize((dw, dh), resample)
+            byte_size = max(1, dw * dh * 3)
+            self.viewport_cache[viewport_key] = (image, byte_size)
+            self.viewport_cache.move_to_end(viewport_key)
+            self.viewport_cache_bytes += byte_size
+            while self.viewport_cache_bytes > self.viewport_cache_budget and len(self.viewport_cache) > 1:
+                _old_key, (_old_image, old_size) = self.viewport_cache.popitem(last=False)
+                self.viewport_cache_bytes -= old_size
+        if mask_edit_mode and self.show_mask.get() and self.preview_mask_overlay is not None:
+            mask, (mx0, my0, mx1, my1) = self.preview_mask_overlay
+            ix0, iy0 = max(crop_x0, mx0), max(crop_y0, my0)
+            ix1, iy1 = min(crop_x1, mx1), min(crop_y1, my1)
+            if ix1 > ix0 and iy1 > iy0:
+                sx = dw / max(1, crop_x1 - crop_x0)
+                sy = dh / max(1, crop_y1 - crop_y0)
+                dx0 = max(0, int(round((ix0 - crop_x0) * sx)))
+                dy0 = max(0, int(round((iy0 - crop_y0) * sy)))
+                dx1 = min(dw, int(round((ix1 - crop_x0) * sx)))
+                dy1 = min(dh, int(round((iy1 - crop_y0) * sy)))
+                if dx1 > dx0 and dy1 > dy0:
+                    alpha = mask[iy0 - my0:iy1 - my0, ix0 - mx0:ix1 - mx0]
+                    alpha = cv2.resize(
+                        alpha, (dx1 - dx0, dy1 - dy0), interpolation=cv2.INTER_AREA
+                    )
+                    alpha = (np.clip(alpha, 0.0, 1.0) * 0.55)[..., None]
+                    display = np.asarray(image).copy()
+                    region = display[dy0:dy1, dx0:dx1].astype(np.float32)
+                    red = np.empty_like(region)
+                    red[:] = (255, 35, 25)
+                    display[dy0:dy1, dx0:dx1] = np.clip(
+                        region * (1.0 - alpha) + red * alpha, 0, 255
+                    ).astype(np.uint8)
+                    image = Image.fromarray(display)
         draw_x = int(round((crop_x0 - origin_x) * self.canvas_zoom))
         draw_y = int(round((crop_y0 - origin_y) * self.canvas_zoom))
         full_x0 = draw_x - crop_x0 * self.canvas_zoom
@@ -4237,7 +5218,9 @@ F1：显示本快捷键表""")
 
     def _editable_object_refs(self) -> list[tuple[str, int]]:
         if self._uses_shared_base():
-            sources = self.strokes.items()
+            sources = (
+                (key, values) for key, values in self.strokes.items() if key in self.pairs
+            )
         elif self.current_path:
             key = str(self.current_path)
             sources = ((key, self.strokes.get(key, [])),)
@@ -4254,6 +5237,9 @@ F1：显示本快捷键表""")
         if self.selected_object is None:
             return None
         key, index = self.selected_object
+        if key not in self.pairs:
+            self.selected_object = None
+            return None
         values = self.strokes.get(key, [])
         if not (0 <= index < len(values)) or values[index].erase:
             self.selected_object = None
@@ -4300,16 +5286,21 @@ F1：显示本快捷键表""")
             center + axis * half_length + normal * half_width,
             center - axis * half_length + normal * half_width,
         ]
+        # Resize handles live outside the meteor body.  Previously eight handles
+        # sat directly on a thin trail and used a 12 px hit radius, so an ordinary
+        # move near the head/tail was frequently interpreted as a scale gesture.
+        handle_length = half_length + 18.0
+        handle_width = half_width + 18.0
         handles = {
-            "length_start": center - axis * half_length,
-            "length_end": center + axis * half_length,
-            "width_neg": center - normal * half_width,
-            "width_pos": center + normal * half_width,
-            "scale_nw": corners[0],
-            "scale_ne": corners[1],
-            "scale_se": corners[2],
-            "scale_sw": corners[3],
-            "rotate": center - normal * (half_width + 30.0),
+            "length_start": center - axis * handle_length,
+            "length_end": center + axis * handle_length,
+            "width_neg": center - normal * handle_width,
+            "width_pos": center + normal * handle_width,
+            "scale_nw": center - axis * handle_length - normal * handle_width,
+            "scale_ne": center + axis * handle_length - normal * handle_width,
+            "scale_se": center + axis * handle_length + normal * handle_width,
+            "scale_sw": center - axis * handle_length + normal * handle_width,
+            "rotate": center - normal * (half_width + 42.0),
         }
         return {
             "points": points, "center": center, "axis": axis, "normal": normal,
@@ -4424,10 +5415,14 @@ F1：显示本快捷键表""")
         stroke.source_mode = mode
         after = replace(stroke, points=stroke.points.copy())
         self._record_edit(key, ("transform", index, (before, after)))
-        self._invalidate_global_preview()
+        incremental = self._incremental_parameter_change_image(before)
+        if incremental is not None:
+            self._commit_incremental_global_preview(incremental, validate=False)
+        else:
+            self._invalidate_global_preview()
+            self._render_preview()
         self._update_tree_status_for_key(key)
         self._load_selected_object_adjustments()
-        self._render_preview()
         self._schedule_autosave()
         label = "原始素材" if mode == "original" else "自动对齐素材"
         self.status.set(f"当前流星已切换为{label}；其他流星保持原来的来源不变")
@@ -4457,7 +5452,7 @@ F1：显示本快捷键表""")
         key, _index = self.selected_object
         self._sync_matching_candidate(key, stroke)
         self._set_selected_controls_state(True, self.selected_override_enabled.get())
-        incremental = self._incremental_selected_object_image(before)
+        incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
             self._commit_incremental_global_preview(incremental, validate=False)
         else:
@@ -4496,9 +5491,12 @@ F1：显示本快捷键表""")
         ) = desired
         key, _index = self.selected_object
         self._sync_matching_candidate(key, stroke)
-        incremental = self._incremental_selected_object_image(before)
+        incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, realtime=True,
+                dirty_box=self.last_incremental_box,
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -4553,7 +5551,7 @@ F1：显示本快捷键表""")
 
     def _object_handle_at(self, canvas_x: float, canvas_y: float) -> str | None:
         best = None
-        best_distance = 12.0
+        best_distance = 7.5
         for name, (hx, hy) in self.object_handle_centers.items():
             distance = float(np.hypot(canvas_x - hx, canvas_y - hy))
             if distance < best_distance:
@@ -4649,6 +5647,8 @@ F1：显示本快捷键表""")
     def _prepare_live_object_drag(self, reference: tuple[str, int], original: Stroke) -> None:
         self.object_drag_live_source = None
         self.object_drag_live_background = None
+        self.object_drag_live_frame = None
+        self.object_drag_live_box = None
         self.object_drag_live_settings = None
         if self.preview_base is None:
             return
@@ -4674,37 +5674,44 @@ F1：显示本快捷键表""")
                 )
                 full_width = self.current_dims[0]
             else:
-                aligned_full = read_image(Path(key))
-                original_full = read_image(self.original_sources.get(key, Path(key)))
-                source_full = original_full if selected_mode == "original" else aligned_full
-                full_width = source_full.shape[1]
                 preview_size = (self.preview_base.shape[1], self.preview_base.shape[0])
-                source_preview = np.right_shift(cv2.resize(
-                    to_uint16(source_full), preview_size,
-                    interpolation=cv2.INTER_AREA,
-                ), 8).astype(np.uint8)
-                aligned_preview = np.right_shift(cv2.resize(
-                    to_uint16(aligned_full), preview_size, interpolation=cv2.INTER_AREA,
-                ), 8).astype(np.uint8)
-                original_preview = np.right_shift(cv2.resize(
-                    to_uint16(original_full), preview_size, interpolation=cv2.INTER_AREA,
-                ), 8).astype(np.uint8)
+                aligned_path = Path(key)
+                original_path = self.original_sources.get(key, aligned_path)
+                full_width = image_info(
+                    original_path if selected_mode == "original" else aligned_path
+                )[0]
+                aligned_preview = self._cached_layer_preview(
+                    aligned_path, preview_size[0], preview_size[1]
+                )
+                original_preview = self._cached_layer_preview(
+                    original_path, preview_size[0], preview_size[1]
+                )
+                # Never decode a 300–500 MB TIFF synchronously inside ButtonPress.
+                # Total-preview generation fills this cache.  If a very old layer
+                # was evicted, drag the lightweight outline now and calculate the
+                # accurate pixels after release instead of freezing the pointer.
+                if aligned_preview is None or original_preview is None:
+                    return
+                source_preview = original_preview if selected_mode == "original" else aligned_preview
             settings = self._object_composite_settings(key)
             if self._uses_shared_base():
                 cached = self.global_preview_rgb
                 if cached is None:
                     return
                 background = cached.copy()
-                old_scaled = self._preview_clone(original, full_width)
-                _old_result, old_mask = compose_meteor_objects(
-                    source_preview, self.preview_base, [old_scaled], *settings
+                old_scaled = auto_optimized_stroke(
+                    self._preview_clone(original, full_width),
+                    bool(self.adjustment_defaults.get("auto_optimize", True)),
                 )
-                removal = np.clip(old_mask * 4.0, 0.0, 1.0)[..., None]
-                background = np.clip(
-                    background.astype(np.float32) * (1.0 - removal)
-                    + self.preview_base.astype(np.float32) * removal,
-                    0, 255,
-                ).astype(np.uint8)
+                old_crop = transformed_object_crop(self.preview_base, old_scaled, fast=True)
+                if old_crop is not None:
+                    _old_patch, old_alpha, _validity, (ox0, oy0, ox1, oy1) = old_crop
+                    removal = np.clip(old_alpha * 4.0, 0.0, 1.0)[..., None]
+                    destination = background[oy0:oy1, ox0:ox1].astype(np.float32)
+                    clean = self.preview_base[oy0:oy1, ox0:ox1].astype(np.float32)
+                    background[oy0:oy1, ox0:ox1] = np.clip(
+                        destination * (1.0 - removal) + clean * removal, 0, 255
+                    ).astype(np.uint8)
             else:
                 if self.current_path is None or key != str(self.current_path):
                     return
@@ -4718,6 +5725,7 @@ F1：显示本快捷键表""")
                 )
             self.object_drag_live_source = source_preview
             self.object_drag_live_background = background
+            self.object_drag_live_frame = background.copy()
             self.object_drag_live_full_width = full_width
             self.object_drag_live_settings = settings
             self.object_drag_last_render = 0.0
@@ -4736,31 +5744,169 @@ F1：显示本快捷键表""")
         ):
             return
         now = time.monotonic()
-        if not force and now - self.object_drag_last_render < 0.045:
+        if not force and now - self.object_drag_last_render < 0.025:
             return
         stroke = self._selected_stroke()
         if stroke is None:
             return
         self.object_drag_last_render = now
-        scaled = self._preview_clone(stroke, self.object_drag_live_full_width)
-        shown, _mask = compose_meteor_objects(
-            self.object_drag_live_source, self.object_drag_live_background,
-            [scaled], *self.object_drag_live_settings,
+        scaled = auto_optimized_stroke(
+            self._preview_clone(stroke, self.object_drag_live_full_width),
+            bool(self.adjustment_defaults.get("auto_optimize", True)),
         )
+        transformed_source = transformed_object_crop(
+            self.object_drag_live_source, scaled, fast=True
+        )
+        transformed_base = transformed_object_crop(self.preview_base, scaled, fast=True)
+        if transformed_source is None or transformed_base is None:
+            self._draw_selected_object_overlay()
+            return
+        source_patch, alpha, validity, box = transformed_source
+        base_patch, _base_alpha, _base_validity, base_box = transformed_base
+        if base_box != box:
+            self._draw_selected_object_overlay()
+            return
+        x0, y0, x1, y1 = box
+        shown = self.object_drag_live_frame
+        if shown is None:
+            shown = self.object_drag_live_background.copy()
+            self.object_drag_live_frame = shown
+        if self.object_drag_live_box is not None:
+            px0, py0, px1, py1 = self.object_drag_live_box
+            shown[py0:py1, px0:px1] = self.object_drag_live_background[py0:py1, px0:px1]
+        destination = shown[y0:y1, x0:x1].astype(np.float32)
+        # The drag frame is deliberately a lightweight positive-residual preview:
+        # it retains the complete core and faint tail and avoids the expensive
+        # cleanup/continuity analysis on every mouse event.  Mouse-up performs the
+        # exact compositor once.
+        positive = np.maximum(
+            source_patch.astype(np.float32) - base_patch.astype(np.float32), 0.0
+        )
+        live_alpha = np.clip(alpha * validity, 0.0, 1.0)[..., None]
+        shown[y0:y1, x0:x1] = np.clip(
+            destination + positive * live_alpha, 0, 255
+        ).astype(np.uint8)
+        self.object_drag_live_box = box
+        self.preview_frame_serial += 1
         self._present_preview_image(shown, True, False)
 
     def _clear_live_object_drag(self) -> None:
         self.object_drag_live_source = None
         self.object_drag_live_background = None
+        self.object_drag_live_frame = None
+        self.object_drag_live_box = None
         self.object_drag_live_settings = None
         self.object_drag_last_render = 0.0
 
     def _incremental_selected_object_image(self, before: Stroke) -> np.ndarray | None:
-        if not self._uses_shared_base() or self.selected_object is None:
+        if self.selected_object is None:
             return None
         return self._incremental_recomposed_object_image(
             self.selected_object, before, include_selected=True
         )
+
+    def _incremental_parameter_change_image(self, before: Stroke) -> np.ndarray | None:
+        adjusted = self._incremental_adjusted_object_image(before)
+        if adjusted is not None:
+            return adjusted
+        return self._incremental_selected_object_image(before)
+
+    def _incremental_adjusted_object_image(
+        self, before: Stroke, reference: tuple[str, int] | None = None,
+    ) -> np.ndarray | None:
+        """Apply one object's parameter delta without rebuilding overlapping meteors.
+
+        Brightness/cleanup/feather sliders do not change scene topology.  Rebuilding
+        a clean ROI forced every overlapping source layer back into memory and could
+        fall through to a full-project render.  Isolated before/after composites
+        provide the selected object's pixel delta while preserving every other
+        already-composited meteor in the visible canvas.
+        """
+        self.last_incremental_box = None
+        reference = reference or self.selected_object
+        if reference is None or self.preview_base is None:
+            return None
+        key, index = reference
+        values = self.strokes.get(key, [])
+        if not (0 <= index < len(values)) or key not in self.pairs:
+            return None
+        current = values[index]
+        # global_preview_rgb is always the unexposed composite. Prefer it even
+        # in per-image output mode: exact_preview_full_rgb may already contain
+        # the user's base-exposure display adjustment, and adding an unexposed
+        # meteor delta to that image would produce the wrong pixels.
+        cached = self.global_preview_rgb
+        if cached is None:
+            if abs(self.base_exposure_tenths.get()) >= 1:
+                return None
+            cached = self.exact_preview_full_rgb if self.exact_preview_full_rgb is not None else self.preview_rgb
+        if cached is None or cached.shape[:2] != self.preview_base.shape[:2]:
+            return None
+        try:
+            preview_h, preview_w = self.preview_base.shape[:2]
+            if self.current_path is not None and key == str(self.current_path):
+                full_width = self.current_dims[0]
+                aligned = self.preview_aligned_source if self.preview_aligned_source is not None else self.preview_source
+                original = self.preview_original_source if self.preview_original_source is not None else self.preview_source
+            else:
+                aligned_path = Path(key)
+                original_path = self.original_sources.get(key, aligned_path)
+                full_width = image_info(self._effective_source_path(aligned_path))[0]
+                aligned = self._cached_layer_preview(aligned_path, preview_w, preview_h)
+                original = self._cached_layer_preview(original_path, preview_w, preview_h)
+                # Selecting an old layer can outlive the rolling preview cache.
+                # Decode only that layer once; never launch a full composite merely
+                # because the user moved a per-meteor slider.
+                if aligned is None:
+                    aligned = self._cached_full_image(aligned_path, False)
+                if original is None:
+                    original = self._cached_full_image(original_path, False)
+            if aligned is None or original is None:
+                return None
+            if aligned.shape[:2] != (preview_h, preview_w):
+                aligned = cv2.resize(aligned, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+            if original.shape[:2] != (preview_h, preview_w):
+                original = cv2.resize(original, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+
+            auto_enabled = bool(self.adjustment_defaults.get("auto_optimize", True))
+            old_scaled = auto_optimized_stroke(self._preview_clone(before, full_width), auto_enabled)
+            new_scaled = auto_optimized_stroke(self._preview_clone(current, full_width), auto_enabled)
+            boxes = []
+            for prepared in (old_scaled, new_scaled):
+                box = stroke_annotation_box(prepared, preview_w, preview_h)
+                if box is not None:
+                    boxes.append(box)
+            if not boxes:
+                return cached.copy()
+            margin = max(old_scaled.feather, new_scaled.feather, 3) * 2 + 6
+            x0 = max(0, min(box[0] for box in boxes) - margin)
+            y0 = max(0, min(box[1] for box in boxes) - margin)
+            x1 = min(preview_w, max(box[2] for box in boxes) + margin)
+            y1 = min(preview_h, max(box[3] for box in boxes) + margin)
+            self.last_incremental_box = (x0, y0, x1, y1)
+            crop_w, crop_h = x1 - x0, y1 - y0
+            old_local = stroke_for_image_crop(old_scaled, preview_w, preview_h, x0, y0, crop_w, crop_h)
+            new_local = stroke_for_image_crop(new_scaled, preview_w, preview_h, x0, y0, crop_w, crop_h)
+            base_crop = self.preview_base[y0:y1, x0:x1]
+            settings = self._object_composite_settings(key)
+            old_layer, _ = compose_meteor_sources(
+                aligned[y0:y1, x0:x1], original[y0:y1, x0:x1],
+                base_crop.copy(), [old_local], *settings,
+            )
+            new_layer, _ = compose_meteor_sources(
+                aligned[y0:y1, x0:x1], original[y0:y1, x0:x1],
+                base_crop.copy(), [new_local], *settings,
+            )
+            # This cached image is the committed composite state. Updating its
+            # small ROI in place avoids copying an 8K frame on every slider tick.
+            result = cached
+            destination = result[y0:y1, x0:x1].astype(np.int16)
+            delta = new_layer.astype(np.int16) - old_layer.astype(np.int16)
+            result[y0:y1, x0:x1] = np.clip(destination + delta, 0, 255).astype(np.uint8)
+            return result
+        except Exception:
+            self.last_incremental_delete_error = traceback.format_exc()
+            return None
 
     def _incremental_deleted_object_image(
         self, reference: tuple[str, int], deleted: Stroke
@@ -4775,10 +5921,26 @@ F1：显示本快捷键表""")
     ) -> np.ndarray | None:
         """Exactly rebuild the union of one object's old and new footprints."""
         self.last_incremental_delete_error = None
+        self.last_incremental_box = None
+        shared = self._uses_shared_base()
+        cached_display = self.global_preview_rgb
+        if shared and cached_display is None:
+            cached_display = (
+                self.exact_preview_full_rgb
+                if self.exact_preview_full_rgb is not None else self.preview_rgb
+            )
+        elif not shared:
+            cached_display = (
+                self.exact_preview_full_rgb
+                if self.exact_preview_full_rgb is not None else self.preview_rgb
+            )
         if (
-            not self._uses_shared_base()
-            or self.preview_base is None
-            or self.global_preview_rgb is None
+            self.preview_base is None
+            or cached_display is None
+            or reference[0] not in self.pairs
+            or (not shared and (
+                self.current_path is None or reference[0] != str(self.current_path)
+            ))
         ):
             return None
         key, deleted_index = reference
@@ -4793,12 +5955,10 @@ F1：显示本快捷键表""")
             )
             transformed = transformed_object_crop(self.preview_base, scaled_before)
             if transformed is None:
-                return self.global_preview_rgb.copy()
-            _patch, old_alpha, _validity, old_box = transformed
+                return cached_display.copy()
+            _patch, _old_alpha, _validity, old_box = transformed
             preview_h, preview_w = self.preview_base.shape[:2]
-            affected_full = np.zeros((preview_h, preview_w), dtype=bool)
-            bx0, by0, bx1, by1 = old_box
-            affected_full[by0:by1, bx0:bx1] |= old_alpha > 1e-6
+            affected_boxes = [old_box]
 
             values_for_key = self.strokes.get(key, [])
             if include_selected and 0 <= deleted_index < len(values_for_key):
@@ -4809,20 +5969,23 @@ F1：显示本快捷键表""")
                     )
                 )
                 if transformed_current is not None:
-                    _new_patch, new_alpha, _new_validity, new_box = transformed_current
-                    nx0, ny0, nx1, ny1 = new_box
-                    affected_full[ny0:ny1, nx0:nx1] |= new_alpha > 1e-6
-            ys, xs = np.nonzero(affected_full)
-            if not len(xs):
-                return self.global_preview_rgb.copy()
-            x0, x1 = int(xs.min()), int(xs.max()) + 1
-            y0, y1 = int(ys.min()), int(ys.max()) + 1
+                    _new_patch, _new_alpha, _new_validity, new_box = transformed_current
+                    affected_boxes.append(new_box)
+            x0 = min(box[0] for box in affected_boxes)
+            y0 = min(box[1] for box in affected_boxes)
+            x1 = max(box[2] for box in affected_boxes)
+            y1 = max(box[3] for box in affected_boxes)
+            self.last_incremental_box = (x0, y0, x1, y1)
 
             # Gather only objects whose footprints intersect the deleted one.
             # They are recomposited in original source order over a clean base;
             # the rest of the cached sky is never touched.
             intersecting: list[tuple[str, int, list[Stroke]]] = []
             for other_key, values in self.strokes.items():
+                if other_key not in self.pairs:
+                    continue
+                if not shared and other_key != key:
+                    continue
                 try:
                     other_width = (
                         self.current_dims[0]
@@ -4851,15 +6014,28 @@ F1：显示本快捷键表""")
                         relevant_positive_indices.append(other_index)
                 if relevant_positive_indices:
                     # Preserve chronological erase semantics for the relevant
-                    # positive objects by retaining every eraser in this source.
-                    relevant = [
-                        item for item_index, item in enumerate(values)
-                        if item.erase or item_index in relevant_positive_indices
-                    ]
+                    # positive objects, but retain only erasers that intersect
+                    # this ROI; distant erasers may normalize outside the crop.
+                    relevant = []
+                    for item_index, item in enumerate(values):
+                        if item_index in relevant_positive_indices:
+                            relevant.append(item)
+                            continue
+                        if not item.erase or not item.points:
+                            continue
+                        erase_box = stroke_annotation_box(
+                            self._preview_clone(item, other_width), preview_w, preview_h
+                        )
+                        if erase_box is None:
+                            continue
+                        ex0, ey0, ex1, ey1 = erase_box
+                        if ex0 < x1 and ex1 > x0 and ey0 < y1 and ey1 > y0:
+                            relevant.append(item)
                     intersecting.append((other_key, other_width, relevant))
 
-            image = self.global_preview_rgb.copy()
-            replacement = self.preview_base.copy()
+            image = cached_display.copy()
+            replacement = self.preview_base[y0:y1, x0:x1].copy()
+            crop_h, crop_w = replacement.shape[:2]
             for other_key, other_width, relevant in intersecting:
                 if self.current_path is not None and other_key == str(self.current_path):
                     aligned_preview = (
@@ -4871,29 +6047,35 @@ F1：显示本快捷键表""")
                         else self.preview_source
                     )
                 else:
-                    aligned_full = to_uint16(read_image(Path(other_key)))
-                    original_full = to_uint16(read_image(
-                        self.original_sources.get(other_key, Path(other_key))
-                    ))
-                    aligned_preview = np.right_shift(cv2.resize(
-                        aligned_full, (preview_w, preview_h), interpolation=cv2.INTER_AREA
-                    ), 8).astype(np.uint8)
-                    original_preview = np.right_shift(cv2.resize(
-                        original_full, (preview_w, preview_h), interpolation=cv2.INTER_AREA
-                    ), 8).astype(np.uint8)
+                    aligned_path = Path(other_key)
+                    original_path = self.original_sources.get(other_key, aligned_path)
+                    aligned_preview = self._cached_layer_preview(
+                        aligned_path, preview_w, preview_h
+                    )
+                    original_preview = self._cached_layer_preview(
+                        original_path, preview_w, preview_h
+                    )
+                    # Mouse-up must never block on full TIFF decoding.  A cache
+                    # miss falls back to the normal background preview worker.
+                    if aligned_preview is None or original_preview is None:
+                        return None
                 if aligned_preview is None or original_preview is None:
                     return None
                 scaled_relevant = [
                     self._preview_clone(item, other_width) for item in relevant
                 ]
+                cropped_relevant = [
+                    stroke_for_image_crop(
+                        item, preview_w, preview_h, x0, y0, crop_w, crop_h
+                    ) for item in scaled_relevant
+                ]
                 replacement, _mask = compose_meteor_sources(
-                    aligned_preview, original_preview, replacement, scaled_relevant,
+                    aligned_preview[y0:y1, x0:x1],
+                    original_preview[y0:y1, x0:x1],
+                    replacement, cropped_relevant,
                     *self._object_composite_settings(other_key),
                 )
-            affected = affected_full[y0:y1, x0:x1]
-            region = image[y0:y1, x0:x1]
-            replacement_region = replacement[y0:y1, x0:x1]
-            region[affected] = replacement_region[affected]
+            image[y0:y1, x0:x1] = replacement
             return image
         except Exception:
             self.last_incremental_delete_error = traceback.format_exc()
@@ -4912,6 +6094,8 @@ F1：显示本快捷键表""")
         start_point = np.asarray(start)
         center = geometry["center"]
         mode = self.object_drag_mode or "move"
+        if mode != "move" and float(np.hypot(*(cursor - start_point))) < 4.0:
+            return "break"
         if mode == "move":
             delta = (cursor - start_point) / geometry["display_scale"]
             stroke.offset_x = original.offset_x + float(delta[0])
@@ -4943,11 +6127,13 @@ F1：显示本快捷键表""")
     def _object_pointer_end(self, _event=None):
         stroke = self._selected_stroke()
         before = self.object_drag_original
+        live_visual = (
+            self.preview_rgb
+            if self.object_drag_live_source is not None and self.preview_rgb is not None
+            else None
+        )
         incremental = None
-        if (
-            stroke is not None and before is not None and stroke != before
-            and self._uses_shared_base()
-        ):
+        if stroke is not None and before is not None and stroke != before:
             incremental = self._incremental_selected_object_image(before)
         self.object_drag_mode = None
         self.object_drag_start = None
@@ -4959,6 +6145,11 @@ F1：显示本快捷键表""")
                 self._commit_incremental_global_preview(incremental, validate=False)
                 self.status.set("流星局部已精确更新；未重绘画面其他区域")
             else:
+                if self._uses_shared_base() and live_visual is not None:
+                    # Keep the last responsive drag frame visible while the exact
+                    # background worker catches up; never flash back to the old spot.
+                    self.global_preview_rgb = live_visual
+                    self.global_labeled_preview_rgb = live_visual
                 self._invalidate_global_preview()
                 self._render_preview()
                 self.status.set("流星变换已应用；最终效果与来源标注已同步更新")
@@ -5011,6 +6202,8 @@ F1：显示本快捷键表""")
 
     def _invalidate_global_preview(self) -> None:
         self.global_preview_signature = None
+        self.global_preview_generation = getattr(self, "global_preview_generation", 0) + 1
+        self.exact_preview_generation = getattr(self, "exact_preview_generation", 0) + 1
         if self.global_exact_after_id is not None:
             try:
                 self.after_cancel(self.global_exact_after_id)
@@ -5024,6 +6217,8 @@ F1：显示本快捷键表""")
         preview_height, preview_width = self.preview_base.shape[:2]
         annotations = []
         for key, values in self.strokes.items():
+            if key not in self.pairs:
+                continue
             if not any(not item.erase and item.points for item in values):
                 continue
             try:
@@ -5041,18 +6236,170 @@ F1：显示本快捷键表""")
         return annotations
 
     def _commit_incremental_global_preview(
-        self, image: np.ndarray, validate: bool = False
+        self, image: np.ndarray, validate: bool = False,
+        realtime: bool = False, dirty_box: tuple[int, int, int, int] | None = None,
     ) -> None:
         """Commit the one-object live result without blanking/rebuilding the full sky."""
-        self.global_preview_rgb = image.copy()
-        self.global_labeled_preview_rgb, _records = annotate_meteor_sources(
-            image, self._global_annotations_from_state()
-        )
+        self.global_preview_rgb = image
+        self.global_labeled_preview_rgb = None
+        if self.view_mode.get() == "labeled" and not realtime:
+            self.global_labeled_preview_rgb, _records = annotate_meteor_sources(
+                image, self._global_annotations_from_state()
+            )
         signature = self._global_preview_state_signature()
         self.global_preview_signature = signature
-        self._render_preview()
+        # Supersede an older full-composite pass. It will stop at the next
+        # source boundary instead of finishing stale work and repainting twice.
+        self.global_preview_generation = getattr(self, "global_preview_generation", 0) + 1
+        # The main canvas stores an 8-bit display of the 16-bit exact result.
+        # A one-object recomposition already updates that display at full source
+        # resolution, so promote it to the current exact-view state instead of
+        # invalidating and recomputing every meteor twice. Export still performs
+        # the complete 16-bit pipeline from source files.
+        if (
+            self.preview_base is not None
+            and image.shape[:2] == self.preview_base.shape[:2]
+        ):
+            exposure_ev = self.base_exposure_tenths.get() / 10.0
+            if abs(exposure_ev) < 1e-6:
+                exact_image = image
+            elif (
+                dirty_box is not None
+                and self.exact_preview_full_rgb is not None
+                and self.exact_preview_full_rgb.shape == image.shape
+            ):
+                # The prior exact frame is still correct outside the edited
+                # footprint. Re-expose only the changed pixels instead of
+                # recompositing (or even re-exposing) the complete 8K canvas.
+                exact_image = self.exact_preview_full_rgb.copy()
+                x0, y0, x1, y1 = dirty_box
+                exact_image[y0:y1, x0:x1] = adjust_composite_base_exposure(
+                    image[y0:y1, x0:x1], self.preview_base[y0:y1, x0:x1], exposure_ev
+                )
+            else:
+                exact_image = adjust_composite_base_exposure(
+                    image, self.preview_base, exposure_ev
+                )
+            self.exact_preview_full_rgb = exact_image
+            self.exact_preview_rgb = exact_image
+            if realtime:
+                # Labels are a derived diagnostic view. Do not regenerate the
+                # full labeled frame for every slider tick; it will be rebuilt
+                # only if the user actually opens that view.
+                self.exact_labeled_preview_full_rgb = None
+                self.exact_labeled_preview_rgb = None
+            else:
+                annotations = self._global_annotations_from_state()
+                labeled, _records = annotate_meteor_sources(exact_image, annotations)
+                self.exact_labeled_preview_full_rgb = labeled.astype(np.uint8, copy=False)
+                self.exact_labeled_preview_rgb = self.exact_labeled_preview_full_rgb
+            self.exact_preview_signature = self._exact_preview_state_signature()
+            self.exact_preview_pending_signature = None
+            if self.exact_preview_request_after_id is not None:
+                try:
+                    self.after_cancel(self.exact_preview_request_after_id)
+                except tk.TclError:
+                    pass
+                self.exact_preview_request_after_id = None
+            self.exact_preview_status.set("精准预览：当前流星已局部更新")
+            # Stop an older full-frame worker at its next meteor boundary. Its
+            # stale partial/final frames must never repaint this local result.
+            self.exact_preview_generation = getattr(self, "exact_preview_generation", 0) + 1
+        display_image = self.exact_preview_full_rgb if self.exact_preview_full_rgb is not None else image
+        if realtime and self.view_mode.get() == "labeled" and dirty_box is not None:
+            labeled = self.preview_rgb
+            if labeled is None or labeled.shape != image.shape:
+                labeled = image.copy()
+            x0, y0, x1, y1 = dirty_box
+            labeled[y0:y1, x0:x1] = display_image[y0:y1, x0:x1]
+            self.global_labeled_preview_rgb = labeled
+            self.exact_labeled_preview_full_rgb = labeled
+            self.exact_labeled_preview_rgb = labeled
+            display_image = labeled
+            self._schedule_realtime_label_refresh()
+        if not (
+            realtime and dirty_box is not None
+            and self._paste_realtime_preview_patch(display_image, dirty_box)
+        ):
+            self._render_preview()
         if validate:
             self._schedule_global_exact_validation(signature)
+
+    def _paste_realtime_preview_patch(
+        self, image: np.ndarray, dirty_box: tuple[int, int, int, int],
+    ) -> bool:
+        """Paste one changed image ROI into the existing Tk photo without a redraw."""
+        if (
+            self.view_mode.get() not in {"blend", "labeled"}
+            or self.preview_photo is None
+            or self.preview_rgb is None
+            or image.shape != self.preview_rgb.shape
+            or self.preview_display_size is None
+        ):
+            return False
+        try:
+            height, width = image.shape[:2]
+            canvas_w = max(10, self.canvas.winfo_width())
+            canvas_h = max(10, self.canvas.winfo_height())
+            origin_x, origin_y = self._canvas_view_origin()
+            crop_x0 = max(0, int(np.floor(origin_x)))
+            crop_y0 = max(0, int(np.floor(origin_y)))
+            crop_x1 = min(width, int(np.ceil(origin_x + canvas_w / self.canvas_zoom)))
+            crop_y1 = min(height, int(np.ceil(origin_y + canvas_h / self.canvas_zoom)))
+            x0, y0, x1, y1 = dirty_box
+            # Include a couple of display pixels so resampling cannot leave a seam.
+            pad = max(2, int(np.ceil(2.0 / max(self.canvas_zoom, 1e-6))))
+            x0, y0 = max(crop_x0, x0 - pad), max(crop_y0, y0 - pad)
+            x1, y1 = min(crop_x1, x1 + pad), min(crop_y1, y1 + pad)
+            if x1 <= x0 or y1 <= y0:
+                self.preview_rgb = image
+                return True
+            dx0 = int(round((x0 - crop_x0) * self.canvas_zoom))
+            dy0 = int(round((y0 - crop_y0) * self.canvas_zoom))
+            dx1 = int(round((x1 - crop_x0) * self.canvas_zoom))
+            dy1 = int(round((y1 - crop_y0) * self.canvas_zoom))
+            if dx1 <= dx0 or dy1 <= dy0:
+                return False
+            patch = Image.fromarray(image[y0:y1, x0:x1])
+            if patch.size != (dx1 - dx0, dy1 - dy0):
+                patch = patch.resize(
+                    (dx1 - dx0, dy1 - dy0),
+                    Image.Resampling.LANCZOS if self.canvas_zoom < 1.0 else Image.Resampling.BILINEAR,
+                )
+            self.preview_rgb = image
+            self.preview_frame_serial += 1
+            self.viewport_cache.clear()
+            patch_photo = ImageTk.PhotoImage(patch, master=self.canvas)
+            self.canvas.tk.call(
+                str(self.preview_photo), "copy", str(patch_photo),
+                "-from", 0, 0, dx1 - dx0, dy1 - dy0,
+                "-to", dx0, dy0,
+            )
+            self._draw_selected_object_overlay()
+            return True
+        except (tk.TclError, ValueError):
+            return False
+
+    def _schedule_realtime_label_refresh(self) -> None:
+        if self.realtime_label_after_id is not None:
+            try:
+                self.after_cancel(self.realtime_label_after_id)
+            except tk.TclError:
+                pass
+
+        def refresh() -> None:
+            self.realtime_label_after_id = None
+            if self.global_preview_rgb is None or self.view_mode.get() != "labeled":
+                return
+            labeled, _records = annotate_meteor_sources(
+                self.global_preview_rgb, self._global_annotations_from_state()
+            )
+            self.global_labeled_preview_rgb = labeled
+            self.exact_labeled_preview_full_rgb = labeled
+            self.exact_labeled_preview_rgb = labeled
+            self._render_preview()
+
+        self.realtime_label_after_id = self.after(420, refresh)
 
     def _schedule_global_exact_validation(self, signature: str) -> None:
         if self.global_exact_after_id is not None:
@@ -5400,7 +6747,7 @@ F1：显示本快捷键表""")
                     stroke.width_scale = max(0.05, float(variables["width_scale"].get()))
                     stroke.opacity = float(np.clip(float(variables["opacity"].get()) / 100.0, 0.0, 1.0))
             except (ValueError, tk.TclError):
-                messagebox.showerror(APP_NAME, "变换参数无效", parent=dialog)
+                show_copyable_error(APP_NAME, "变换参数无效", parent=dialog)
                 return
             self.context_stroke_index = None
             incremental = None
@@ -5620,9 +6967,19 @@ F1：显示本快捷键表""")
         # The new paint/eraser stroke changes only its own footprint. Updating
         # that region here keeps the combined preview cache exact and avoids a
         # full composite the next time the user switches to the blend view.
-        incremental = self._incremental_recomposed_object_image(
-            reference, stroke, include_selected=True
-        )
+        incremental = None
+        if not stroke.erase:
+            # A new brush stroke is an isolated object delta: its "before"
+            # state is simply the same object with no painted points. This is
+            # exact for the affected ROI and does not require decoding every
+            # overlapping meteor layer from the rolling cache.
+            incremental = self._incremental_adjusted_object_image(
+                replace(stroke, points=[]), reference
+            )
+        if incremental is None:
+            incremental = self._incremental_recomposed_object_image(
+                reference, stroke, include_selected=True
+            )
         self.shift_anchors[str(self.current_path)] = self.active_points[-1]
         committed_mode = "橡皮擦" if stroke.erase else "画笔"
         if self.active_canvas_line:
@@ -5642,7 +6999,9 @@ F1：显示本快捷键表""")
         self._update_tree_status()
         self.show_mask.set(True)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._render_preview()
         positive_count = sum(
@@ -5884,6 +7243,7 @@ F1：显示本快捷键表""")
         self.autosave_suspended = False
 
     def _project_data(self) -> dict:
+        active = set(self.pairs) or {str(path) for path in self.files}
         return {
             "version": PROJECT_VERSION,
             "source_dir": self.source_dir.get(),
@@ -5902,18 +7262,32 @@ F1：显示本快捷键表""")
             "auto_optimize": self.auto_optimize.get(),
             "auto_optimize_strength": self.auto_optimize_strength.get(),
             "adjustment_defaults": self.adjustment_defaults,
-            "image_adjustments": self.image_adjustments,
+            "image_adjustments": {
+                key: value for key, value in self.image_adjustments.items() if key in active
+            },
             "export_tiff": self.export_tiff.get(),
             "blend_mode": self.blend_mode.get(),
             "brush_width": self.brush_width.get(),
             "eraser_width": self.eraser_width.get(),
             "feather": self.feather.get(),
-            "candidate_thresholds": self.candidate_thresholds,
-            "original_sources": {key: str(value) for key, value in self.original_sources.items()},
-            "use_original_sources": sorted(self.use_original_sources),
-            "alignment_statuses": self.alignment_statuses,
-            "candidates": {key: [asdict(item) for item in value] for key, value in self.candidates.items()},
-            "strokes": {key: [asdict(item) for item in value] for key, value in self.strokes.items()},
+            "candidate_thresholds": {
+                key: value for key, value in self.candidate_thresholds.items() if key in active
+            },
+            "original_sources": {
+                key: str(value) for key, value in self.original_sources.items() if key in active
+            },
+            "use_original_sources": sorted(self.use_original_sources & active),
+            "alignment_statuses": {
+                key: value for key, value in self.alignment_statuses.items() if key in active
+            },
+            "candidates": {
+                key: [asdict(item) for item in value]
+                for key, value in self.candidates.items() if key in active
+            },
+            "strokes": {
+                key: [asdict(item) for item in value]
+                for key, value in self.strokes.items() if key in active
+            },
         }
 
     def _apply_project_data(self, data: dict) -> None:
@@ -6090,7 +7464,7 @@ F1：显示本快捷键表""")
             self._apply_project_data(data)
             source = Path(self.source_dir.get()).expanduser()
             base = Path(self.base_dir.get()).expanduser()
-            if source.is_dir() and (base.is_dir() or base.is_file()) and self.output_dir.get().strip():
+            if source.is_dir() and (base.is_dir() or base.is_file()):
                 self.scan_inputs()
             self.autosave_status.set("自动保存：已恢复上次会话")
         except Exception as exc:
@@ -6143,15 +7517,10 @@ F1：显示本快捷键表""")
         base_dir = Path(self.base_dir.get())
         output_text = self.output_dir.get().strip()
         if not output_text:
-            messagebox.showerror(APP_NAME, "请选择独立输出文件夹")
-            return
-        output = Path(output_text)
-        base_locations = {path.parent for path in self.pairs.values()}
-        if (path_is_within(output, source) or path_is_within(source, output)
-                or any(path_is_within(output, base) or path_is_within(base, output)
-                       for base in base_locations)):
-            messagebox.showerror(APP_NAME, "输出目录必须与 TIFF/JPG 两个输入文件夹完全分开")
-            return
+            output = source / "MeteorStudio_Output"
+            self.output_dir.set(str(output))
+        else:
+            output = Path(output_text)
         combined = self.output_mode.get() == "combined"
         export_summary = (
             f"将把 {len(marked)} 张图片中的全部流星累计拼合到一张底图。\n"
@@ -6168,6 +7537,7 @@ F1：显示本快捷键表""")
             return
         self.progress["value"] = 0
         self.status.set("开始导出…")
+        self._release_large_caches_for_export()
         self._run_worker(
             self._export_worker, output, marked, self.pairs.copy(),
             {key: value.copy() for key, value in self.image_adjustments.items()},
@@ -6176,6 +7546,31 @@ F1：显示本快捷键表""")
             {str(path): self.original_sources.get(str(path), path) for path in marked},
             self.output_mode.get(), self.base_exposure_tenths.get() / 10.0,
         )
+
+    def _release_large_caches_for_export(self) -> None:
+        """Free decoded source caches before OpenCV starts the 16-bit export.
+
+        An exact 8K preview plus the rolling TIFF cache can occupy several GB.
+        Keeping those decoded source frames while the exporter creates its own
+        16-bit working buffers caused OpenCV allocation failures at the first
+        meteor. The visible canvas/photo remains intact; only reloadable source
+        caches and redundant labeled copies are discarded.
+        """
+        self.exact_preview_generation += 1
+        self.global_preview_generation += 1
+        with self.preview_cache_lock:
+            self.full_display_cache.clear()
+            self.full_precision_cache.clear()
+            self.full_display_cache_bytes = 0
+            self.full_precision_cache_bytes = 0
+            self.preview_cache.clear()
+            self.preview_cache_bytes = 0
+            self.viewport_cache.clear()
+            self.viewport_cache_bytes = 0
+        self.global_labeled_preview_rgb = None
+        self.exact_labeled_preview_rgb = None
+        self.exact_labeled_preview_full_rgb = None
+        gc.collect()
 
     def _export_worker(
         self, output_dir: Path, marked: dict[Path, list[Stroke]], pairs: dict[str, Path],
@@ -6213,38 +7608,78 @@ F1：显示本快捷键表""")
             if combined and combined_result is not None:
                 base = combined_result
             else:
+                # Export owns a bounded working set. Do not feed decoded 16-bit
+                # frames back into the interactive preview cache: doing so can
+                # retain roughly a gigabyte while OpenCV allocates blend buffers.
                 base = to_uint16(read_image(base_path))
                 if combined:
                     combined_base_path = base_path
                     combined_clean_base = base.copy()
             height, width = base.shape[:2]
-            aligned_source = read_image(source_path)
             original_path = original_paths.get(str(source_path), source_path)
-            original_source = read_image(original_path)
-            if aligned_source.shape[:2] != (height, width) or original_source.shape[:2] != (height, width):
+            unique_sources = list(dict.fromkeys((source_path, original_path)))
+            with ThreadPoolExecutor(
+                max_workers=min(2, len(unique_sources)), thread_name_prefix="meteor-export"
+            ) as pool:
+                decoded = dict(zip(
+                    unique_sources,
+                    pool.map(
+                        lambda path: to_uint16(read_image(path)),
+                        unique_sources,
+                    ),
+                ))
+            aligned16, original16 = decoded[source_path], decoded[original_path]
+            if aligned16.shape[:2] != (height, width) or original16.shape[:2] != (height, width):
                 raise ValueError(f"尺寸不一致：{source_path.name}")
-            aligned16 = to_uint16(aligned_source)
-            original16 = to_uint16(original_source)
-            result, mask_float = compose_meteor_sources(
-                aligned16, original16, base, strokes, match, curve_enabled,
-                curve_shadows, curve_highlights, blend_mode,
-                bool(adjustment.get("preserve_brightness", True)),
-                float(adjustment.get("meteor_brightness", 100)),
-                float(adjustment.get("background_cleanup", 70)),
-                bool(adjustment.get("auto_optimize", True)),
+            crop_spec = strokes_for_composite_crop(
+                strokes, width, height, bool(adjustment.get("auto_optimize", True))
             )
-            if not np.any(mask_float > 0.001):
+            if crop_spec is None:
                 continue
-            source_boxes = meteor_mask_boxes(mask_float)
+            cropped_strokes, (x0, y0, x1, y1) = crop_spec
+            result = base if combined and combined_result is not None else base.copy()
+            try:
+                composed_crop, mask_crop = compose_meteor_sources(
+                    aligned16[y0:y1, x0:x1], original16[y0:y1, x0:x1],
+                    result[y0:y1, x0:x1], cropped_strokes, match, curve_enabled,
+                    curve_shadows, curve_highlights, blend_mode,
+                    bool(adjustment.get("preserve_brightness", True)),
+                    float(adjustment.get("meteor_brightness", 100)),
+                    float(adjustment.get("background_cleanup", 70)),
+                    bool(adjustment.get("auto_optimize", True)),
+                )
+            except cv2.error as exc:
+                raise RuntimeError(
+                    f"OpenCV 合成失败：{source_path.name}，局部区域 "
+                    f"{x1 - x0}×{y1 - y0}。\n{exc}"
+                ) from exc
+            if not np.any(mask_crop > 0.001):
+                continue
+            result[y0:y1, x0:x1] = composed_crop
+            local_boxes = meteor_mask_boxes(mask_crop)
+            source_boxes = [
+                (bx0 + x0, by0 + y0, bx1 + x0, by1 + y0)
+                for bx0, by0, bx1, by1 in local_boxes
+            ]
             item_annotations = meteor_source_annotations(
                 source_path.stem, strokes, width, height,
-                False, mask_float,
+                False, mask_crop, (x0, y0),
             )
             if combined:
                 combined_annotations.extend(item_annotations)
-            mask_full = np.clip(mask_float * 65535, 0, 65535).astype(np.uint16)
+            # Allocate one full mask, not both float16 and uint16 copies. On an
+            # 8K frame this removes an 80+ MB peak before PNG compression.
+            mask_full = np.zeros((height, width), dtype=np.uint16)
+            mask_full[y0:y1, x0:x1] = np.clip(
+                mask_crop.astype(np.float32) * 65535.0, 0, 65535
+            ).astype(np.uint16)
             mask_path = masks_dir / f"{source_path.stem}_mask.png"
-            ok, encoded = cv2.imencode(".png", mask_full)
+            try:
+                ok, encoded = cv2.imencode(".png", mask_full)
+            except cv2.error as exc:
+                raise RuntimeError(
+                    f"OpenCV 蒙版编码失败：{source_path.name}（{width}×{height}）。\n{exc}"
+                ) from exc
             if not ok:
                 raise IOError(f"蒙版保存失败：{mask_path.name}")
             encoded.tofile(mask_path)
@@ -6319,7 +7754,7 @@ F1：显示本快捷键表""")
                 "source_regions": [list(box) for box in source_boxes],
                 "outputs": outputs,
             })
-            del aligned_source, original_source, aligned16, original16, mask_full
+            del aligned16, original16, mask_full
             if not combined:
                 del base, result
             self.work_queue.put(("progress", index / total * 90, f"正在合成 {index}/{total}：{source_path.name}"))
@@ -6415,14 +7850,17 @@ F1：显示本快捷键表""")
                         continue
                     self.preview_base = base_preview
                     self.current_dims = dims
+                    self.full_cache_pinned_paths = {str(base_path)}
                     if self.view_mode.get() in {"blend", "labeled"} and self._uses_shared_base():
                         self._render_preview()
                 elif kind == "preview":
                     (
-                        _, path, source_preview, aligned_preview, original_preview,
+                        _, request_id, path, source_preview, aligned_preview, original_preview,
                         base_preview, dims, base_path, pairing_signature,
                     ) = item
                     if (
+                        request_id != self.preview_request_id
+                        or
                         pairing_signature != self.pairing_signature
                         or self.pairs.get(str(path)) != base_path
                     ):
@@ -6432,8 +7870,12 @@ F1：显示本快捷键表""")
                     self.preview_aligned_source = aligned_preview
                     self.preview_original_source = original_preview
                     self.preview_base = base_preview
-                    self.preview_rgb = source_preview
                     self.current_dims = dims
+                    self.full_cache_pinned_paths = {
+                        str(path), str(self._effective_source_path(path)),
+                        str(self.original_sources.get(str(path), path)), str(base_path),
+                    }
+                    self._update_source_state_ui(path)
                     key = str(path)
                     self._load_image_adjustments(key)
                     self.setting_candidate_threshold = True
@@ -6442,6 +7884,19 @@ F1：显示本快捷键表""")
                     self._update_candidate_summary(key)
                     self.status.set(f"已加载 {path.name}；可拖动画笔，或单击起点后 Shift+单击终点画直线。")
                     self._render_preview()
+                    self._schedule_neighbor_prefetch(path)
+                elif kind == "global_preview_partial":
+                    _, signature, image, labeled_image, completed, total, included = item
+                    if signature != self._global_preview_state_signature():
+                        continue
+                    self.global_preview_rgb = image
+                    self.global_labeled_preview_rgb = labeled_image
+                    self.progress["value"] = completed / max(1, total) * 100
+                    self.status.set(
+                        f"总融合预览正在累积 {completed}/{total}：已加入 {included} 张流星素材"
+                    )
+                    if self.view_mode.get() in {"blend", "labeled"}:
+                        self._render_preview()
                 elif kind == "global_preview":
                     _, signature, image, labeled_image, included = item
                     if self.global_preview_loading_signature == signature:
@@ -6460,6 +7915,31 @@ F1：显示本快捷键表""")
                         # Discard its stale image and schedule exactly one render
                         # for the newest state instead of starting overlapping jobs.
                         self.after_idle(self._render_preview)
+                elif kind == "global_preview_cancelled":
+                    _, signature = item
+                    if self.global_preview_loading_signature == signature:
+                        self.global_preview_loading_signature = None
+                    if self.view_mode.get() in {"blend", "labeled"}:
+                        self.after_idle(self._render_preview)
+                elif kind == "exact_preview_cancelled":
+                    _, signature = item
+                    if self.exact_preview_loading_signature == signature:
+                        self.exact_preview_loading_signature = None
+                    if self.exact_preview_signature != self._exact_preview_state_signature():
+                        self.after_idle(self._schedule_automatic_exact_preview)
+                elif kind == "exact_preview_partial":
+                    _, signature, image, labeled_image, completed, total, included = item
+                    if signature != self._exact_preview_state_signature():
+                        continue
+                    self.exact_preview_rgb = image
+                    self.exact_labeled_preview_rgb = labeled_image
+                    self.progress["value"] = completed / max(1, total) * 90
+                    self.exact_preview_status.set(f"精准预览：逐张累积 {completed}/{total}")
+                    self.status.set(
+                        f"精确预览正在生成 {completed}/{total}：已加入 {included} 张流星素材"
+                    )
+                    if self.view_mode.get() in {"blend", "labeled"}:
+                        self._render_preview()
                 elif kind == "exact_preview":
                     (
                         _, signature, image, labeled_image,
@@ -6473,26 +7953,36 @@ F1：显示本快捷键表""")
                         self.exact_preview_full_rgb = full_image
                         self.exact_labeled_preview_full_rgb = full_labeled_image
                         self.exact_preview_signature = signature
+                        if abs(self.base_exposure_tenths.get()) < 1:
+                            self.global_preview_rgb = full_image
+                            self.global_labeled_preview_rgb = full_labeled_image
+                            self.global_preview_signature = self._global_preview_state_signature()
                         self.progress["value"] = 100
                         self.exact_preview_status.set(
-                            f"导出级预览：有效（原图 {full_dims[0]}×{full_dims[1]}）"
+                            f"精准预览：有效（原图 {full_dims[0]}×{full_dims[1]}）"
                         )
                         self.status.set(
-                            f"导出级精确预览完成：按原始尺寸、16 位合成了 {included} 张流星素材"
+                            f"精准预览完成：按原始尺寸、16 位合成了 {included} 张流星素材"
                         )
-                        self.view_mode.set("blend")
                         self._render_preview()
-                        self.open_exact_preview()
+                        if self.exact_preview_open_when_ready:
+                            self.open_exact_preview()
                     else:
-                        self.exact_preview_status.set("导出级预览：生成期间参数已变化，请重试")
+                        if self.exact_preview_signature != self._exact_preview_state_signature():
+                            self.exact_preview_status.set("精准预览：参数已变化，正在重新计算…")
+                    self.exact_preview_open_when_ready = False
+                    if self.exact_preview_signature != self._exact_preview_state_signature():
+                        self.after_idle(self._schedule_automatic_exact_preview)
                 elif kind == "blend_optimized":
                     _, results, strength, requested = item
                     applied = 0
+                    local_change = None
                     for key, index, expected_points, parameters in results:
                         values = self.strokes.get(key, [])
                         if not (0 <= index < len(values)) or values[index].points != expected_points:
                             continue
                         stroke = values[index]
+                        before = replace(stroke, points=stroke.points.copy())
                         stroke.auto_blend_enabled = True
                         stroke.auto_strength = str(parameters["strength"])
                         stroke.auto_black_point = float(parameters["black_point"])
@@ -6501,15 +7991,26 @@ F1：显示本快捷键表""")
                         stroke.auto_feather = int(parameters["feather"])
                         self._sync_matching_candidate(key, stroke)
                         applied += 1
+                        if requested == 1:
+                            local_change = ((key, index), before)
                     self.progress["value"] = 100
-                    self._invalidate_global_preview()
+                    incremental = None
+                    if applied == 1 and local_change is not None:
+                        reference, before = local_change
+                        incremental = self._incremental_recomposed_object_image(
+                            reference, before, include_selected=True
+                        )
+                    if incremental is not None:
+                        self._commit_incremental_global_preview(incremental, validate=False)
+                    elif applied:
+                        self._invalidate_global_preview()
+                        self._render_preview()
                     self._load_selected_object_adjustments()
                     self._update_tree_status()
-                    self._render_preview()
                     self._schedule_autosave()
                     self.status.set(
                         f"逐流星自动融合优化完成（{strength}）：已更新 {applied}/{requested} 颗；"
-                        "可生成导出级精确预览检查暗部"
+                        "当前画布将自动按原始像素更新"
                     )
                 elif kind == "progress":
                     _, value, text = item
@@ -6581,6 +8082,7 @@ F1：显示本快捷键表""")
                     )
                 elif kind == "exported":
                     _, run_dir, count, learn_after_export, marked, pairs, original_paths, output_mode = item
+                    self.last_export_path = Path(run_dir)
                     self.progress["value"] = 100
                     self.status.set(f"导出完成：{run_dir}")
                     result_summary = (
@@ -6588,11 +8090,14 @@ F1：显示本快捷键表""")
                         if output_mode == "combined" else f"已分别输出 {count} 张合成图。"
                     )
                     if learn_after_export:
-                        messagebox.showinfo(
+                        should_open = messagebox.askyesno(
                             APP_NAME,
                             f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}\n\n"
-                            "现在开始在后台验证并训练个性化 AI。导出结果不受训练成败影响。",
+                            "现在开始在后台验证并训练个性化 AI。导出结果不受训练成败影响。\n\n"
+                            "是否打开导出文件夹？",
                         )
+                        if should_open:
+                            self._open_output_folder(run_dir)
                         self.progress["value"] = 0
                         self.status.set("正在从本次最终蒙版学习…")
                         learning_marked: dict[Path, list[Stroke]] = {}
@@ -6613,7 +8118,11 @@ F1：显示本快捷键表""")
                                 learning_pairs[str(actual)] = pairs[str(path)]
                         self._run_worker(self._learn_worker, learning_marked, learning_pairs)
                     else:
-                        messagebox.showinfo(APP_NAME, f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}")
+                        if messagebox.askyesno(
+                            APP_NAME,
+                            f"导出完成，{result_summary}\n\n结果目录：\n{run_dir}\n\n是否打开导出文件夹？",
+                        ):
+                            self._open_output_folder(run_dir)
                 elif kind == "learned":
                     _, report = item
                     self.progress["value"] = 100
@@ -6642,20 +8151,20 @@ F1：显示本快捷键表""")
                     _, text, details = item
                     self.progress["value"] = 100
                     self.status.set("AI 学习失败；导出结果不受影响")
-                    messagebox.showerror(
+                    show_copyable_error(
                         APP_NAME + " — AI 学习失败",
                         f"照片已经正常导出，但 AI 学习没有完成：\n{text}\n\n原模型保持不变。",
+                        parent=self,
+                        details=details,
                     )
-                    print(details)
                 elif kind == "error":
                     _, text, details = item
                     self.shared_base_loading_signature = None
                     if self.exact_preview_loading_signature is not None:
                         self.exact_preview_loading_signature = None
-                        self.exact_preview_status.set("导出级预览：生成失败")
+                        self.exact_preview_status.set("精准预览：后台更新失败")
                     self.status.set("处理失败")
-                    messagebox.showerror(APP_NAME, f"{text}\n\n详细信息已打印到终端。")
-                    print(details)
+                    show_copyable_error(APP_NAME, text, parent=self, details=details)
         except queue.Empty:
             pass
         self.after(150, self._poll_queue)
@@ -6686,4 +8195,6 @@ if __name__ == "__main__":
         finally:
             application.destroy()
     else:
-        MeteorComposer().mainloop()
+        application = MeteorComposer()
+        application.after_idle(application.maximize_for_normal_launch)
+        application.mainloop()
