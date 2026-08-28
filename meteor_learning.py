@@ -118,12 +118,85 @@ def build_feedback_dataset(
     }
 
 
+def build_screening_feedback_dataset(toolkit: dict) -> dict[str, np.ndarray]:
+    """Load only exact candidate labels from the screening workspace.
+
+    Image-level keep/reject decisions are intentionally absent: a kept photo
+    may contain a real meteor somewhere other than the AI candidate.
+    """
+    feature_count = len(toolkit["ML_FEATURE_NAMES"])
+    empty = {
+        "x": np.empty((0, feature_count), dtype=np.float32),
+        "y": np.empty(0, dtype=np.int8),
+        "groups": np.empty(0, dtype=str),
+        "legacy": np.empty(0, dtype=np.float32),
+        "metadata": np.empty(0, dtype=str),
+    }
+    path = toolkit.get("screening_feedback_path")
+    if path is None or not path.is_file():
+        return empty
+    try:
+        records = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return empty
+    rows, labels, groups, legacy, metadata = [], [], [], [], []
+    for record in records:
+        if not isinstance(record, dict) or record.get("label") not in (0, 1):
+            continue
+        features = np.asarray(record.get("features", []), dtype=np.float32)
+        if features.shape != (feature_count,):
+            # Manually added missed meteors have no original automatic feature
+            # vector. Reconstruct the same temporal reference and shared model
+            # features when the source sequence is still available.
+            try:
+                source_path = Path(record["source_path"])
+                source = toolkit["screening_preview"](source_path)
+                neighbors = [
+                    toolkit["screening_preview"](Path(value))
+                    for value in record.get("neighbor_paths", [])
+                    if Path(value).is_file()
+                ]
+                neighbors = [image for image in neighbors if image.shape == source.shape]
+                if not neighbors:
+                    continue
+                reference, _displacement = toolkit["temporal_reference"](source, neighbors)
+                maps = toolkit["prepare_ml_maps"](source, reference)
+                features = toolkit["candidate_feature_vector"](
+                    maps, tuple(record["start"]), tuple(record["end"]),
+                    float(record.get("legacy", 1.0)) * 100.0,
+                )
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+        if features.shape != (feature_count,):
+            continue
+        rows.append(features)
+        labels.append(int(record["label"]))
+        source_name = str(record.get("source_path", "unknown"))
+        groups.append("screening:" + source_name)
+        legacy.append(float(record.get("legacy", 0.0)))
+        metadata.append("screening:" + str(record.get("id", len(rows))))
+    if not rows:
+        return empty
+    return {
+        "x": np.asarray(rows, dtype=np.float32),
+        "y": np.asarray(labels, dtype=np.int8),
+        "groups": np.asarray(groups),
+        "legacy": np.asarray(legacy, dtype=np.float32),
+        "metadata": np.asarray(metadata),
+    }
+
+
 def learn_from_feedback(
     marked: dict[Path, list], pairs: dict[str, Path], toolkit: dict,
     base_dataset_path: Path, current_model: dict, user_model_path: Path,
     progress: Callable[[float, str], None],
 ) -> dict:
-    feedback = build_feedback_dataset(marked, pairs, toolkit, progress)
+    mask_feedback = build_feedback_dataset(marked, pairs, toolkit, progress)
+    screening_feedback = build_screening_feedback_dataset(toolkit)
+    feedback = {
+        key: np.concatenate((mask_feedback[key], screening_feedback[key]))
+        for key in ("x", "y", "groups", "legacy", "metadata")
+    }
     if len(feedback["y"]) < 30 or len(np.unique(feedback["y"])) < 2:
         raise ValueError("有效训练反馈不足：至少需要同时包含正候选和负候选")
     loaded = np.load(base_dataset_path, allow_pickle=False)
@@ -161,6 +234,7 @@ def learn_from_feedback(
         "accepted": accepted,
         "feedback_samples": int(len(feedback["y"])),
         "feedback_positive": int(feedback["y"].sum()),
+        "screening_feedback_samples": int(len(screening_feedback["y"])),
         "combined_samples": int(len(y)),
         "validation": validation,
         "previous_validation": {

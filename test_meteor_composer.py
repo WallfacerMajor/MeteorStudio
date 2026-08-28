@@ -18,6 +18,7 @@ from meteor_composer import (
     adjust_composite_base_exposure,
     analyze_meteor_blend_parameters,
     active_stroke_keys,
+    merge_collinear_candidates,
 )
 
 
@@ -64,6 +65,50 @@ class ProjectionBoundaryTests(unittest.TestCase):
         image[20:180, 60:260] = 35
         distance = content_distance_map(image)
         self.assertTrue(line_inside_valid_content(distance, (120, 70), (210, 110)))
+
+
+class MeteorFragmentMergeTests(unittest.TestCase):
+    @staticmethod
+    def candidate(start, end, score=100):
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = float(np.hypot(dx, dy))
+        angle = float(np.arctan2(dy, dx))
+        midpoint = ((start[0] + end[0]) * 0.5, (start[1] + end[1]) * 0.5)
+        return score, length, angle, midpoint, start, end
+
+    def test_three_fragments_of_one_meteor_become_one_candidate(self):
+        candidates = [
+            self.candidate((100, 100), (160, 130), 90),
+            self.candidate((168, 134), (225, 162), 82),
+            self.candidate((234, 167), (292, 196), 75),
+        ]
+        merged = merge_collinear_candidates(candidates)
+        self.assertEqual(len(merged), 1)
+        self.assertGreater(merged[0][1], 205)
+
+    def test_parallel_separate_meteors_remain_independent(self):
+        candidates = [
+            self.candidate((100, 100), (190, 145)),
+            self.candidate((105, 135), (195, 180)),
+        ]
+        self.assertEqual(len(merge_collinear_candidates(candidates)), 2)
+
+
+class ScreeningExportHandoffTests(unittest.TestCase):
+    def test_exported_screening_folder_is_filled_into_composer(self):
+        with tempfile.TemporaryDirectory() as folder_name:
+            folder = Path(folder_name)
+            (folder / "meteor.tif").touch()
+            composer = SimpleNamespace(
+                source_dir=FakeVar(""), status=FakeVar(""),
+                _set_paths_panel_visible=lambda visible: setattr(composer, "panel_visible", visible),
+                _schedule_autosave=lambda: setattr(composer, "autosaved", True),
+            )
+            MeteorComposer._load_screening_export(composer, folder)
+            self.assertEqual(composer.source_dir.get(), str(folder))
+            self.assertTrue(composer.panel_visible)
+            self.assertTrue(composer.autosaved)
+            self.assertIn("1 张 TIFF", composer.status.get())
 
 
 class ExposureScopeTests(unittest.TestCase):

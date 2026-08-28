@@ -19,11 +19,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from PIL import Image, ImageOps, ImageTk
 from alignment_workspace import open_alignment_workspace
+from meteor_screening import open_screening_workspace
 from video_meteor import open_video_workspace
 
 
 APP_NAME = "流星影像工坊"
-APP_VERSION = "0.1.45-per-meteor-source"
+APP_VERSION = "0.1.55-screening-export-handoff"
 PROJECT_VERSION = 27
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
@@ -628,7 +629,76 @@ def line_inside_valid_content(
     return float(np.mean(distance[ys, xs] >= safe_margin)) >= 0.90
 
 
-def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
+def merge_collinear_candidates(candidates: list[tuple]) -> list[tuple]:
+    """Join LSD fragments that describe one continuous physical trail.
+
+    A meteor with a weak middle or a saturated core is commonly returned as
+    several collinear pieces.  Comparing only segment centres leaves those
+    pieces as separate clickable candidates.  This merges their projected
+    intervals while retaining parallel but spatially separate trails.
+    """
+    merged: list[tuple] = []
+    for item in sorted(candidates, reverse=True, key=lambda value: value[0]):
+        score, length, angle, midpoint, start, end = item
+        joined = False
+        for index, kept in enumerate(merged):
+            kept_score, kept_length, kept_angle, _kept_midpoint, kept_start, kept_end = kept
+            delta = angle - kept_angle
+            angle_delta = abs(np.arctan2(np.sin(2 * delta), np.cos(2 * delta))) / 2
+            if angle_delta > np.deg2rad(7.0):
+                continue
+            direction = np.asarray([np.cos(kept_angle), np.sin(kept_angle)], np.float32)
+            normal = np.asarray([-direction[1], direction[0]], np.float32)
+            first = np.asarray([kept_start, kept_end], np.float32)
+            second = np.asarray([start, end], np.float32)
+            first_normal = float(np.mean(first @ normal))
+            second_normal = float(np.mean(second @ normal))
+            perpendicular = abs(first_normal - second_normal)
+            maximum_width = max(9.0, min(18.0, min(kept_length, length) * 0.10))
+            if perpendicular > maximum_width:
+                continue
+            first_interval = np.sort(first @ direction)
+            second_interval = np.sort(second @ direction)
+            axial_gap = max(
+                0.0,
+                float(max(first_interval[0], second_interval[0]) - min(first_interval[1], second_interval[1])),
+            )
+            maximum_gap = max(14.0, min(65.0, min(kept_length, length) * 0.55))
+            if axial_gap > maximum_gap:
+                continue
+            points = np.concatenate((first, second), axis=0)
+            projections = points @ direction
+            center_normal = float(np.median(points @ normal))
+            new_start = direction * float(np.min(projections)) + normal * center_normal
+            new_end = direction * float(np.max(projections)) + normal * center_normal
+            new_start_tuple = tuple(int(round(value)) for value in new_start)
+            new_end_tuple = tuple(int(round(value)) for value in new_end)
+            new_length = float(np.linalg.norm(new_end - new_start))
+            new_midpoint = (
+                (new_start_tuple[0] + new_end_tuple[0]) * 0.5,
+                (new_start_tuple[1] + new_end_tuple[1]) * 0.5,
+            )
+            merged[index] = (
+                max(score, kept_score), new_length, kept_angle, new_midpoint,
+                new_start_tuple, new_end_tuple,
+            )
+            joined = True
+            break
+        if not joined:
+            merged.append(item)
+
+    # A fragment can bridge two groups, so repeat until the result is stable.
+    if len(merged) < len(candidates) and len(merged) > 1:
+        second_pass = merge_collinear_candidates(merged)
+        if len(second_pass) < len(merged):
+            return second_pass
+    return sorted(merged, reverse=True, key=lambda value: value[0])
+
+
+def detect_trails(
+    source: np.ndarray, base: np.ndarray, ranked: bool = False,
+    valid_region: np.ndarray | None = None,
+):
     src = cv2.cvtColor(source, cv2.COLOR_RGB2GRAY).astype(np.float32)
     dst = cv2.cvtColor(base, cv2.COLOR_RGB2GRAY).astype(np.float32)
     s2, s98 = np.percentile(src, (2, 98))
@@ -640,13 +710,31 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
     residual = difference - cv2.GaussianBlur(difference, (0, 0), sigmaX=sigma, sigmaY=sigma)
     magnitude = np.abs(residual)
     height, width = magnitude.shape
+    region = None
+    if valid_region is not None:
+        if valid_region.shape != magnitude.shape:
+            region = cv2.resize(
+                valid_region.astype(np.uint8), (width, height), interpolation=cv2.INTER_NEAREST,
+            ) > 0
+        else:
+            region = valid_region > 0
+        region = cv2.morphologyEx(
+            region.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8),
+        ) > 0
     content_distance = content_distance_map(source)
     detector = cv2.createLineSegmentDetector(cv2.LSD_REFINE_ADV)
     detected_parts = []
-    for low_percentile, high_percentile in ((97.0, 99.90), (93.0, 99.65), (88.0, 99.30)):
-        low, high = np.percentile(magnitude, (low_percentile, high_percentile))
+    percentile_pairs = ((97.0, 99.90), (93.0, 99.65), (88.0, 99.30), (80.0, 99.00))
+    # One partition pass is substantially cheaper than rescanning the complete
+    # image for each detector band. Values and detection behavior are unchanged.
+    percentile_values = np.percentile(magnitude, [value for pair in percentile_pairs for value in pair])
+    for band_index, _pair in enumerate(percentile_pairs):
+        low, high = percentile_values[band_index * 2:band_index * 2 + 2]
         enhanced = np.clip((magnitude - low) * 255.0 / max(1.0, high - low), 0, 255).astype(np.uint8)
-        enhanced[int(height * 0.82):] = 0
+        if region is None:
+            enhanced[int(height * 0.82):] = 0
+        else:
+            enhanced[~region] = 0
         lines = normalize_lsd_lines(detector.detect(enhanced)[0])
         if len(lines):
             detected_parts.append(lines)
@@ -654,7 +742,10 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
         return [], 0
     detected = np.concatenate(detected_parts, axis=0)
 
-    min_length = max(18.0, max(height, width) * 0.018)
+    # At a 1400px RAW screening proxy, short/faint meteors can be only 14–20px
+    # long. The later temporal profile and AI score are safer rejection gates
+    # than discarding them here solely by length.
+    min_length = max(12.0, max(height, width) * 0.010)
     base_u8 = np.clip(dst, 0, 255).astype(np.uint8)
     structural_edges = cv2.Canny(base_u8, 35, 90)
     structural_edges = cv2.dilate(structural_edges, np.ones((5, 5), np.uint8)) > 0
@@ -671,8 +762,14 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
         samples = max(30, int(length))
         xs = np.linspace(start[0], end[0], samples).clip(0, width - 1).astype(int)
         ys = np.linspace(start[1], end[1], samples).clip(0, height - 1).astype(int)
-        if float(np.median(ys)) > height * 0.79:
-            continue
+        if region is None:
+            if float(np.median(ys)) > height * 0.79:
+                continue
+        else:
+            sky_fraction = float(np.mean(region[ys, xs]))
+            middle = slice(samples // 4, max(samples // 4 + 1, samples * 3 // 4))
+            if sky_fraction < 0.78 or float(np.mean(region[ys[middle], xs[middle]])) < 0.90:
+                continue
         edge_fraction = float(np.mean(structural_edges[ys, xs]))
         bright_fraction = float(np.mean(dst[ys, xs] > bright_limit))
         if edge_fraction > 0.92 or bright_fraction > 0.24:
@@ -698,28 +795,15 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
         return [], 0
     raw_candidates.sort(reverse=True, key=lambda item: item[0])
 
-    # Merge duplicate LSD edges belonging to the same physical streak.
-    candidates = []
-    for item in raw_candidates:
-        _score, _length, angle, midpoint, start, end = item
-        direction = np.array([np.cos(angle), np.sin(angle)])
-        normal = np.array([-direction[1], direction[0]])
-        duplicate = False
-        for kept in candidates:
-            delta = angle - kept[2]
-            angle_delta = abs(np.arctan2(np.sin(2 * delta), np.cos(2 * delta))) / 2
-            perpendicular = abs(float(np.dot(np.array(midpoint) - np.array(kept[3]), normal)))
-            center_distance = float(np.hypot(midpoint[0] - kept[3][0], midpoint[1] - kept[3][1]))
-            if angle_delta < np.deg2rad(8) and perpendicular < 10 and center_distance < max(30, _length):
-                duplicate = True
-                break
-        if not duplicate:
-            candidates.append(item)
+    # Merge duplicate LSD edges and separated weak/core/tail fragments into one
+    # candidate before classification and user interaction.
+    candidates = merge_collinear_candidates(raw_candidates)
 
     meteors = []
     ranked_meteors = []
     planes = 0
     best_score = candidates[0][0]
+    global_profile_threshold = float(np.percentile(magnitude, 99.65))
     if os.environ.get("METEOR_DEBUG"):
         print("candidates", [(round(c[0], 1), round(c[1], 1), c[4], c[5]) for c in candidates[:10]])
     for score, length, angle, midpoint, start, end in candidates[:60 if ranked else 20]:
@@ -739,7 +823,11 @@ def detect_trails(source: np.ndarray, base: np.ndarray, ranked: bool = False):
             py = shifted[:, 1].clip(0, height - 1).astype(int)
             profile_parts.append(magnitude[py, px])
         profile = np.max(np.stack(profile_parts), axis=0)
-        profile_threshold = max(float(np.percentile(magnitude, 99.65)), float(np.median(profile) + 6 * np.median(np.abs(profile - np.median(profile)))))
+        profile_median = float(np.median(profile))
+        profile_threshold = max(
+            global_profile_threshold,
+            float(profile_median + 6 * np.median(np.abs(profile - profile_median))),
+        )
         active = profile > profile_threshold
         active = cv2.morphologyEx(active.astype(np.uint8)[None, :], cv2.MORPH_CLOSE, np.ones((1, 5), np.uint8))[0] > 0
         padded = np.pad(active.astype(np.int8), (1, 1))
@@ -1774,6 +1862,7 @@ class MeteorComposer(tk.Tk):
         self.autosave_suspended = True
         self.video_window = None
         self.alignment_window = None
+        self.screening_window = None
 
         self._build_ui()
         self._bind_shortcuts()
@@ -1791,10 +1880,11 @@ class MeteorComposer(tk.Tk):
         ttk.Label(header, text="图片合成工作区").pack(side="left", padx=12)
         ttk.Button(header, text="打开视频动态工作区…", command=self.open_video_workspace).pack(side="right")
         ttk.Button(header, text="2  Siril＋PTGui星空对齐…", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
-        self.paths_toggle_button = ttk.Button(header, text="收起 1 素材与输出", command=self._toggle_paths_panel)
+        ttk.Button(header, text="流星批量筛选…", command=self.open_screening_workspace).pack(side="right", padx=(0, 6))
+        self.paths_toggle_button = ttk.Button(header, text="收起 1 流星合成功能", command=self._toggle_paths_panel)
         self.paths_toggle_button.pack(side="right", padx=(0, 6))
 
-        paths = ttk.LabelFrame(root, text="1  素材与输出（源素材只读）", padding=8)
+        paths = ttk.LabelFrame(root, text="1  流星合成功能（源素材只读）", padding=8)
         paths.pack(fill="x")
         self.paths_panel = paths
         mode_row = ttk.Frame(paths)
@@ -2090,10 +2180,10 @@ class MeteorComposer(tk.Tk):
     def _set_paths_panel_visible(self, visible: bool) -> None:
         if not visible and self.paths_panel.winfo_manager():
             self.paths_panel.pack_forget()
-            self.paths_toggle_button.configure(text="展开 1 素材与输出")
+            self.paths_toggle_button.configure(text="展开 1 流星合成功能")
         elif visible and not self.paths_panel.winfo_manager():
             self.paths_panel.pack(fill="x", after=self.paths_toggle_button.master)
-            self.paths_toggle_button.configure(text="收起 1 素材与输出")
+            self.paths_toggle_button.configure(text="收起 1 流星合成功能")
         self.after_idle(self._render_preview)
 
     def open_video_workspace(self) -> None:
@@ -2120,6 +2210,42 @@ class MeteorComposer(tk.Tk):
                 pass
         self.alignment_window = open_alignment_workspace(self, self._load_alignment_result)
         self._activate_child_workspace(self.alignment_window, "alignment_window")
+
+    def open_screening_workspace(self) -> None:
+        if self.screening_window is not None:
+            try:
+                if self.screening_window.winfo_exists():
+                    self.screening_window.deiconify()
+                    self.screening_window.lift()
+                    return
+            except tk.TclError:
+                pass
+        self.screening_window = open_screening_workspace(self, self._load_screening_export)
+        self._activate_child_workspace(self.screening_window, "screening_window")
+
+    def _load_screening_export(self, exported_folder: Path) -> None:
+        """Carry the concrete timestamped screening result into compositing."""
+        folder = Path(exported_folder)
+        if not folder.is_dir():
+            return
+        self.source_dir.set(str(folder))
+        source_files = [path for path in folder.iterdir() if path.is_file()]
+        tiff_count = sum(path.suffix.lower() in TIFF_SUFFIXES for path in source_files)
+        raw_count = sum(path.suffix.lower() in {".arw", ".nef", ".nrw", ".cr2", ".cr3", ".crw"} for path in source_files)
+        self._set_paths_panel_visible(True)
+        if tiff_count:
+            self.status.set(
+                f"已自动填入筛选导出目录：{folder}（{tiff_count} 张 TIFF）；"
+                "选择干净底图和独立输出文件夹后即可只读扫描"
+            )
+        elif raw_count:
+            self.status.set(
+                f"已自动填入筛选导出目录：{folder}（{raw_count} 张 RAW）；"
+                "RAW 需先运行 Siril＋PTGui 星空对齐，生成 TIFF 后再合成"
+            )
+        else:
+            self.status.set(f"已自动填入筛选导出目录：{folder}")
+        self._schedule_autosave()
 
     def _activate_child_workspace(self, window: tk.Toplevel, attribute: str) -> None:
         """Present a tool workspace as a replacement for the main workspace."""
@@ -6249,6 +6375,11 @@ F1：显示本快捷键表""")
                 "detect_trails": detect_trails,
                 "prepare_ml_maps": prepare_ml_maps,
                 "candidate_feature_vector": candidate_feature_vector,
+                "screening_feedback_path": (
+                    __import__("meteor_screening").screening_feedback_file_path()
+                ),
+                "screening_preview": __import__("meteor_screening").screening_preview,
+                "temporal_reference": __import__("meteor_screening").temporal_reference,
                 "ML_FEATURE_NAMES": ML_FEATURE_NAMES,
             }
             report = learn_from_feedback(
