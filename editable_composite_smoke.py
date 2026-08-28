@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -30,7 +31,7 @@ def run_smoke(app) -> dict:
     if tab_names != ["3  蒙版与候选", "4  融合与底图", "5  所选流星"]:
         raise AssertionError(f"Unexpected workspace tabs: {tab_names}")
     required_controls = {
-        "B ✎ 画笔", "E ▱ 橡皮擦", "AI分析当前单张候选", "自动检测全部",
+        "B ✎ 画笔", "E ▱ 橡皮擦", "本地模型分析当前单张", "自动检测全部",
         "保存项目", "载入项目", "自动优化当前流星", "自动优化全部流星",
         "重置底图曝光", "恢复自动值", "恢复原始融合", "导出合成结果",
     }
@@ -623,6 +624,8 @@ def run_smoke(app) -> dict:
     real_slider_exact = app._begin_exact_preview
     real_slider_invalidate = app._invalidate_global_preview
     real_slider_render = app._render_preview
+    real_slider_auto_exact = app._schedule_automatic_exact_preview
+    real_slider_validation = app._schedule_global_exact_validation
     slider_render_calls = 0
     def count_slider_invalidate():
         nonlocal slider_invalidations
@@ -636,17 +639,38 @@ def run_smoke(app) -> dict:
     app._begin_exact_preview = lambda signature, open_when_ready=False: slider_full_rebuilds.append(("exact", signature))
     app._invalidate_global_preview = count_slider_invalidate
     app._render_preview = count_slider_render
+    app._schedule_automatic_exact_preview = lambda: slider_full_rebuilds.append(("auto_exact", ""))
+    app._schedule_global_exact_validation = lambda signature: slider_full_rebuilds.append(("validation", signature))
+    delayed_fires = []
+    app.global_preview_request_after_id = app.after(
+        360, lambda: delayed_fires.append("global")
+    )
+    app.exact_preview_request_after_id = app.after(
+        430, lambda: delayed_fires.append("exact")
+    )
+    app.global_exact_after_id = app.after(
+        1220, lambda: delayed_fires.append("validation")
+    )
     app.selected_brightness.set(137)
     app.selected_cleanup.set(84)
     app.selected_saturation.set(112)
     app.selected_match.set(True)
     app.selected_feather.set(19)
     app._selected_adjustment_changed()
-    app.update()
+    # Cover both delayed pipelines (automatic exact at 320 ms and the former
+    # global validation at 1200 ms). The previous immediate-only test restored
+    # these spies before the user-visible duplicate jobs could begin.
+    deadline = time.monotonic() + 1.45
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        time.sleep(0.01)
     app._request_global_preview = real_slider_request
     app._begin_exact_preview = real_slider_exact
     app._invalidate_global_preview = real_slider_invalidate
     app._render_preview = real_slider_render
+    app._schedule_automatic_exact_preview = real_slider_auto_exact
+    app._schedule_global_exact_validation = real_slider_validation
     app.pairs.pop(overlap_key, None)
     app.strokes.pop(overlap_key, None)
     app.output_mode.set("separate")
@@ -655,6 +679,16 @@ def run_smoke(app) -> dict:
             f"Per-meteor slider rebuilt the composite: invalidations={slider_invalidations}, "
             f"workers={slider_full_rebuilds}"
         )
+    if delayed_fires:
+        raise AssertionError(
+            f"Per-meteor slider did not cancel deferred full-frame jobs: {delayed_fires}"
+        )
+    if any((
+        app.global_preview_request_after_id,
+        app.exact_preview_request_after_id,
+        app.global_exact_after_id,
+    )):
+        raise AssertionError("Per-meteor slider left a delayed full-preview job queued")
     if slider_render_calls or app.preview_image_item != slider_canvas_item:
         raise AssertionError(
             f"Per-meteor slider redrew the viewport instead of pasting its ROI: "
@@ -818,6 +852,28 @@ def run_smoke(app) -> dict:
     app.view_mode.set("source")
     app._render_preview()
     app.update()
+
+    # A preview worker may replace a quick frame with the full-resolution
+    # version shortly after an otherwise unrelated click.  In fit mode that
+    # replacement must preserve the *visible* field of view; keeping the same
+    # numeric pixels-to-screen zoom would make the photograph suddenly grow.
+    full_frame = app.preview_rgb.copy()
+    quick_frame = cv2.resize(
+        full_frame,
+        (max(2, full_frame.shape[1] // 2), max(2, full_frame.shape[0] // 2)),
+        interpolation=cv2.INTER_AREA,
+    )
+    app._present_preview_image(quick_frame, False, True)
+    app._canvas_fit()
+    quick_box = tuple(float(value) for value in app.display_box)
+    app._present_preview_image(full_frame, False, True)
+    app.update()
+    full_box = tuple(float(value) for value in app.display_box)
+    if any(abs(current - expected) > 1.5 for current, expected in zip(full_box, quick_box)):
+        raise AssertionError(
+            f"Full-resolution preview replacement changed visible fit: {quick_box} -> {full_box}"
+        )
+
     app._canvas_fit()
     main_fit_zoom = app.canvas_zoom
     app.control_notebook.select(app.selected_tools_tab)
@@ -830,9 +886,38 @@ def run_smoke(app) -> dict:
         raise AssertionError("Returning to a non-image panel changed fit-view zoom")
     blank_x = max(1, app.mask_tools_tab.winfo_width() - 3)
     blank_y = max(1, app.mask_tools_tab.winfo_height() - 3)
-    app.mask_tools_tab.event_generate("<ButtonPress-1>", x=blank_x, y=blank_y)
-    app.mask_tools_tab.event_generate("<ButtonRelease-1>", x=blank_x, y=blank_y)
-    app.update()
+    root_x = app.mask_tools_tab.winfo_rootx() + blank_x
+    root_y = app.mask_tools_tab.winfo_rooty() + blank_y
+    click_target = app.winfo_containing(root_x, root_y) or app.mask_tools_tab
+    local_x = root_x - click_target.winfo_rootx()
+    local_y = root_y - click_target.winfo_rooty()
+    before_blank_click = (
+        app.canvas_fit_mode,
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+    )
+    click_target.event_generate("<ButtonPress-1>", x=local_x, y=local_y)
+    click_target.event_generate("<ButtonRelease-1>", x=local_x, y=local_y)
+    # Let focus, Configure and delayed preview callbacks run.  The old test only
+    # sampled immediately and missed the user-visible jump after the click.
+    deadline = time.monotonic() + 0.25
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        time.sleep(0.01)
+    after_blank_click = (
+        app.canvas_fit_mode,
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+    )
+    if after_blank_click != before_blank_click:
+        raise AssertionError(
+            f"Blank panel click changed visible viewport: {before_blank_click} -> {after_blank_click}"
+        )
     if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
         raise AssertionError("Clicking blank space inside the bottom panel changed zoom")
     x0, y0, x1, y1 = app.display_box

@@ -71,6 +71,13 @@ def _atomic_json(path: Path, payload: dict) -> None:
     os.replace(temporary, path)
 
 
+def _atomic_dataset(path: Path, dataset: dict[str, np.ndarray]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.stem + ".writing.npz")
+    np.savez_compressed(temporary, **dataset)
+    os.replace(temporary, path)
+
+
 def build_feedback_dataset(
     marked: dict[Path, list], pairs: dict[str, Path], toolkit: dict,
     progress: Callable[[float, str], None],
@@ -189,7 +196,7 @@ def build_screening_feedback_dataset(toolkit: dict) -> dict[str, np.ndarray]:
 def learn_from_feedback(
     marked: dict[Path, list], pairs: dict[str, Path], toolkit: dict,
     base_dataset_path: Path, current_model: dict, user_model_path: Path,
-    progress: Callable[[float, str], None],
+    progress: Callable[[float, str], None], user_dataset_path: Path | None = None,
 ) -> dict:
     mask_feedback = build_feedback_dataset(marked, pairs, toolkit, progress)
     screening_feedback = build_screening_feedback_dataset(toolkit)
@@ -199,8 +206,13 @@ def learn_from_feedback(
     }
     if len(feedback["y"]) < 30 or len(np.unique(feedback["y"])) < 2:
         raise ValueError("有效训练反馈不足：至少需要同时包含正候选和负候选")
-    loaded = np.load(base_dataset_path, allow_pickle=False)
-    base = {key: loaded[key] for key in loaded.files}
+    dataset_source = (
+        user_dataset_path
+        if user_dataset_path is not None and user_dataset_path.is_file()
+        else base_dataset_path
+    )
+    with np.load(dataset_source, allow_pickle=False) as loaded:
+        base = {key: loaded[key] for key in loaded.files}
     replaced_groups = set(feedback["groups"].tolist())
     keep = np.asarray([group not in replaced_groups for group in base["groups"]], dtype=bool)
     dataset = {
@@ -257,8 +269,11 @@ def learn_from_feedback(
     backup_dir.mkdir(parents=True, exist_ok=True)
     backup = backup_dir / ("meteor_ranker_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".json")
     _atomic_json(backup, current_model)
+    if user_dataset_path is not None:
+        _atomic_dataset(user_dataset_path, dataset)
     _atomic_json(user_model_path, payload)
     report["model_path"] = str(user_model_path)
     report["backup_path"] = str(backup)
+    report["dataset_path"] = str(user_dataset_path) if user_dataset_path is not None else None
     progress(100, "个性化 AI 模型已通过验证并保存")
     return report

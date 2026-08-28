@@ -408,7 +408,12 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.active_candidates: dict[str, int] = {}
         self.preview_cache: OrderedDict[str, np.ndarray] = OrderedDict()
         self.full_preview_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self.full_preview_cache_bytes = 0
+        self.full_preview_cache_budget = 768 << 20
         self.full_preview_loading: set[str] = set()
+        self.analysis_generation = 0
+        self.analysis_running = False
+        self.export_running = False
         self.use_original_preview = tk.BooleanVar(value=False)
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_render_rgb: np.ndarray | None = None
@@ -443,7 +448,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         header = ttk.Frame(root)
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text="流星批量筛选", font=("TkDefaultFont", 15, "bold")).pack(side="left")
-        ttk.Label(header, text="与流星合成共用同一AI · 支持主流RAW/TIFF/JPG/PNG · 原图只读").pack(side="left", padx=12)
+        ttk.Label(header, text="与流星合成共用同一本地模型 · 支持主流RAW/TIFF/JPG/PNG · 原图只读").pack(side="left", padx=12)
         ttk.Button(header, text="返回流星合成功能", command=self._return_to_composer).pack(side="right")
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(0, 6))
 
@@ -461,8 +466,10 @@ class MeteorScreeningWindow(tk.Toplevel):
         ).pack(side="left", fill="x", expand=True, padx=8)
         ttk.Label(sensitivity_row, text="候选更多").pack(side="left")
         ttk.Label(sensitivity_row, textvariable=self.sensitivity_hint, width=22).pack(side="left", padx=(10, 0))
-        ttk.Button(settings, text="开始分析", command=self.analyze).grid(row=0, column=4, rowspan=2, padx=(10, 0), sticky="nsew")
-        ttk.Button(settings, text="导出已选流星照片", command=self.copy_selected).grid(row=2, column=4, padx=(10, 0), pady=(7, 0), sticky="ew")
+        self.analyze_button = ttk.Button(settings, text="开始分析", command=self.analyze)
+        self.analyze_button.grid(row=0, column=4, rowspan=2, padx=(10, 0), sticky="nsew")
+        self.export_button = ttk.Button(settings, text="导出已选流星照片", command=self.copy_selected)
+        self.export_button.grid(row=2, column=4, padx=(10, 0), pady=(7, 0), sticky="ew")
         ttk.Label(settings, text="最近实际导出位置").grid(row=3, column=0, sticky="w", pady=(7, 0))
         ttk.Entry(settings, textvariable=self.last_export_dir, state="readonly").grid(
             row=3, column=1, columnspan=3, sticky="ew", padx=6, pady=(7, 0),
@@ -482,7 +489,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.tree = ttk.Treeview(left, columns=columns, show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="照片")
         self.tree.heading("decision", text="状态")
-        self.tree.heading("score", text="AI可能性")
+        self.tree.heading("score", text="流星评分")
         self.tree.heading("candidates", text="候选")
         self.tree.heading("note", text="提示")
         self.tree.column("#0", width=260)
@@ -714,6 +721,9 @@ class MeteorScreeningWindow(tk.Toplevel):
             self.output_dir.set(value)
 
     def analyze(self) -> None:
+        if self.analysis_running:
+            self.status.set("已有分析任务正在运行，请等待完成")
+            return
         source = Path(self.source_dir.get().strip()).expanduser()
         if not source.is_dir():
             show_copyable_error("流星批量筛选", "请选择有效的照片文件夹", parent=self)
@@ -732,16 +742,25 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.active_candidates.clear()
         self.preview_cache.clear()
         self.full_preview_cache.clear()
+        self.full_preview_cache_bytes = 0
         self.full_preview_loading.clear()
         self.tree.delete(*self.tree.get_children())
         self.progress["value"] = 0
         self.status.set(f"正在分析 {len(files)} 张照片；必要时自动配准相邻星点…")
-        threading.Thread(target=self._analyze_worker, args=(files,), daemon=True).start()
+        self.analysis_generation += 1
+        generation = self.analysis_generation
+        self.analysis_running = True
+        self.analyze_button.configure(state="disabled", text="分析中…")
+        threading.Thread(
+            target=self._analyze_worker, args=(files, generation, str(source)), daemon=True,
+            name=f"meteor-screening-{generation}",
+        ).start()
 
-    def _analyze_worker(self, files: list[Path]) -> None:
+    def _analyze_worker(self, files: list[Path], generation: int, source_signature: str) -> None:
         try:
             from meteor_composer import (
-                candidate_feature_vector, detect_trails, load_meteor_ranker,
+                calibrate_secondary_candidate_scores, candidate_feature_vector,
+                detect_trails, load_meteor_ranker,
                 predict_gradient_boosting, prepare_ml_maps,
             )
             model = load_meteor_ranker()
@@ -773,7 +792,7 @@ class MeteorScreeningWindow(tk.Toplevel):
                 # Always retain the shared model's feature vector. It is used
                 # only if the user explicitly labels this exact candidate.
                 maps = prepare_ml_maps(current, reference) if trails else None
-                candidates = []
+                measured = []
                 for start, end, legacy_score in trails[:12]:
                     features = (
                         candidate_feature_vector(maps, start, end, legacy_score)
@@ -785,6 +804,17 @@ class MeteorScreeningWindow(tk.Toplevel):
                         )))
                     else:
                         score = int(legacy_score)
+                    measured.append((
+                        int(np.clip(score, 0, 100)), start, end,
+                        float(legacy_score), features,
+                    ))
+                calibrated = calibrate_secondary_candidate_scores([
+                    (score, start, end, legacy_score)
+                    for score, start, end, legacy_score, _features in measured
+                ])
+                candidates = []
+                for (score, start, end, legacy_score), measured_item in zip(calibrated, measured):
+                    features = measured_item[4]
                     candidates.append(ScreeningCandidate(
                         start, end, int(np.clip(score, 0, 100)), legacy_score=float(legacy_score),
                         features=features.tolist(),
@@ -821,7 +851,8 @@ class MeteorScreeningWindow(tk.Toplevel):
                             results.append(result)
                             shape = cache[result.path].shape[:2]
                             self.work_queue.put((
-                                "progress", completed / len(files) * 92,
+                                "analysis_progress", generation, source_signature,
+                                completed / len(files) * 92,
                                 f"并行分析 {completed}/{len(files)}（{analysis_workers} 线程）",
                             ))
 
@@ -834,10 +865,12 @@ class MeteorScreeningWindow(tk.Toplevel):
             while len(cache) > 12:
                 cache.popitem(last=False)
             mark_temporal_repeats(results, shape)
-            self.work_queue.put(("finished", results, cache))
+            self.work_queue.put(("analysis_finished", generation, source_signature, results, cache))
         except Exception as exc:
             import traceback
-            self.work_queue.put(("error", str(exc), traceback.format_exc()))
+            self.work_queue.put((
+                "analysis_error", generation, source_signature, str(exc), traceback.format_exc()
+            ))
 
     def _automatic_decision(self, result: ScreeningResult) -> bool:
         return result.score >= self._score_cutoff()
@@ -1346,6 +1379,9 @@ class MeteorScreeningWindow(tk.Toplevel):
         self._set_decision(None)
 
     def copy_selected(self) -> None:
+        if self.export_running:
+            self.status.set("导出任务正在运行，请等待完成")
+            return
         if not self.results:
             messagebox.showwarning("流星批量筛选", "请先完成分析", parent=self)
             return
@@ -1365,7 +1401,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         if not selected:
             messagebox.showwarning("流星批量筛选", "当前没有保留的照片", parent=self)
             return
-        run_dir = output / ("meteor_selected_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+        run_dir = output / ("meteor_selected_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
         run_dir.mkdir(parents=True, exist_ok=False)
         explicit_feedback = []
         result_indices = {item.path: index for index, item in enumerate(self.results)}
@@ -1395,41 +1431,63 @@ class MeteorScreeningWindow(tk.Toplevel):
                     "manual": bool(candidate.manual),
                     "updated_at": datetime.now().isoformat(timespec="seconds"),
                 })
-        feedback_path = save_screening_feedback(explicit_feedback)
-        report = []
-        for result in selected:
-            source_path = Path(result.path)
-            destination = run_dir / source_path.name
-            shutil.copy2(source_path, destination)
-            report.append({
-                **asdict(result), "copied_to": str(destination),
-                "decision": self._decision_label(result),
-                "decision_source": self.decision_sources.get(result.path, "automatic"),
-            })
-        (run_dir / "screening_report.json").write_text(
-            json.dumps({
-                "source_folder": str(source),
-                "screening_sensitivity": int(self.sensitivity.get()),
-                "sensitivity_description": self.sensitivity_hint.get(),
-                "internal_score_cutoff": self._score_cutoff(),
-                "selected_count": len(selected),
-                "candidate_feedback_count": len(explicit_feedback),
+        selected_snapshot = [
+            (
+                Path(result.path), asdict(result), self._decision_label(result),
+                self.decision_sources.get(result.path, "automatic"),
+            )
+            for result in selected
+        ]
+        report_header = {
+            "source_folder": str(source),
+            "screening_sensitivity": int(self.sensitivity.get()),
+            "sensitivity_description": self.sensitivity_hint.get(),
+            "internal_score_cutoff": self._score_cutoff(),
+            "selected_count": len(selected),
+            "candidate_feedback_count": len(explicit_feedback),
+            "learning_rule": "Only explicitly labeled candidates train the AI; image keep/reject decisions never do.",
+        }
+        self.export_running = True
+        self.export_button.configure(state="disabled", text="导出中…")
+        self.status.set(f"正在后台导出 {len(selected)} 张原图…")
+        threading.Thread(
+            target=self._copy_selected_worker,
+            args=(run_dir, selected_snapshot, explicit_feedback, report_header),
+            daemon=True, name="meteor-screening-export",
+        ).start()
+
+    def _copy_selected_worker(
+        self, run_dir: Path, selected: list[tuple[Path, dict, str, str]],
+        explicit_feedback: list[dict], report_header: dict,
+    ) -> None:
+        try:
+            feedback_path = save_screening_feedback(explicit_feedback)
+            report = []
+            for index, (source_path, item_data, decision, decision_source) in enumerate(selected, start=1):
+                destination = run_dir / source_path.name
+                shutil.copy2(source_path, destination)
+                report.append({
+                    **item_data, "copied_to": str(destination),
+                    "decision": decision, "decision_source": decision_source,
+                })
+                self.work_queue.put((
+                    "export_progress", index / max(1, len(selected)) * 100,
+                    f"正在导出原图 {index}/{len(selected)}：{source_path.name}",
+                ))
+            payload = {
+                **report_header,
                 "candidate_feedback_file": str(feedback_path) if feedback_path else None,
-                "learning_rule": "Only explicitly labeled candidates train the AI; image keep/reject decisions never do.",
                 "items": report,
-            }, ensure_ascii=False, indent=2), encoding="utf-8",
-        )
-        self.last_export_dir.set(str(run_dir))
-        self._save_autosave()
-        feedback_note = f"；保存 {len(explicit_feedback)} 条候选级AI反馈" if explicit_feedback else ""
-        self.status.set(f"已导出 {len(selected)} 张；实际导出位置：{run_dir}{feedback_note}")
-        if messagebox.askyesno(
-            "流星批量筛选",
-            f"已导出 {len(selected)} 张流星照片。{feedback_note}\n\n"
-            f"实际导出位置：\n{run_dir}\n\n"
-            "返回流星合成功能时会自动填入这个文件夹。\n\n是否现在打开？", parent=self
-        ):
-            self._open_export_folder()
+            }
+            (run_dir / "screening_report.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+            self.work_queue.put((
+                "screening_exported", run_dir, len(selected), len(explicit_feedback)
+            ))
+        except Exception as exc:
+            import traceback
+            self.work_queue.put(("screening_export_error", str(exc), traceback.format_exc()))
 
     def _open_export_folder(self) -> None:
         path = self.last_export_dir.get().strip() or self.output_dir.get().strip()
@@ -1442,13 +1500,30 @@ class MeteorScreeningWindow(tk.Toplevel):
         try:
             while True:
                 item = self.work_queue.get_nowait()
-                if item[0] == "progress":
+                if item[0] == "analysis_progress":
+                    _, generation, source_signature, value, text = item
+                    if (
+                        generation != self.analysis_generation
+                        or source_signature != str(Path(self.source_dir.get().strip()).expanduser())
+                    ):
+                        continue
+                    self.progress["value"] = value
+                    self.status.set(text)
+                elif item[0] == "export_progress":
                     _, value, text = item
                     self.progress["value"] = value
                     self.status.set(text)
-                elif item[0] == "finished":
-                    self.results = item[1]
-                    self.preview_cache = item[2]
+                elif item[0] == "analysis_finished":
+                    _, generation, source_signature, results, preview_cache = item
+                    if generation != self.analysis_generation:
+                        continue
+                    self.analysis_running = False
+                    self.analyze_button.configure(state="normal", text="开始分析")
+                    if source_signature != str(Path(self.source_dir.get().strip()).expanduser()):
+                        self.status.set("分析期间照片文件夹已变化，旧结果已丢弃")
+                        continue
+                    self.results = results
+                    self.preview_cache = preview_cache
                     self.progress["value"] = 100
                     self._refresh_tree(False)
                     self._show_selected()
@@ -1458,10 +1533,18 @@ class MeteorScreeningWindow(tk.Toplevel):
                 elif item[0] == "full_preview":
                     _, path, image = item
                     self.full_preview_loading.discard(path)
+                    previous = self.full_preview_cache.pop(path, None)
+                    if previous is not None:
+                        self.full_preview_cache_bytes -= int(previous.nbytes)
                     self.full_preview_cache[path] = image
+                    self.full_preview_cache_bytes += int(image.nbytes)
                     self.full_preview_cache.move_to_end(path)
-                    while len(self.full_preview_cache) > 5:
-                        self.full_preview_cache.popitem(last=False)
+                    while (
+                        self.full_preview_cache_bytes > self.full_preview_cache_budget
+                        and len(self.full_preview_cache) > 1
+                    ):
+                        _old_path, removed = self.full_preview_cache.popitem(last=False)
+                        self.full_preview_cache_bytes -= int(removed.nbytes)
                     if path == self.preview_path and self.use_original_preview.get():
                         self.preview_zoom = 1.0
                         self.preview_pan_x = self.preview_pan_y = 0.0
@@ -1477,11 +1560,40 @@ class MeteorScreeningWindow(tk.Toplevel):
                         self.use_original_preview.set(False)
                         self._rebuild_preview_overlay()
                         self.status.set(f"原图精细预览读取失败：{message}")
-                elif item[0] == "error":
-                    _, message, details = item
+                elif item[0] == "analysis_error":
+                    _, generation, _source_signature, message, details = item
+                    if generation != self.analysis_generation:
+                        continue
+                    self.analysis_running = False
+                    self.analyze_button.configure(state="normal", text="开始分析")
                     self.status.set("分析失败：" + message)
                     show_copyable_error(
                         "流星批量筛选", message, parent=self, details=details
+                    )
+                elif item[0] == "screening_exported":
+                    _, run_dir, count, feedback_count = item
+                    self.export_running = False
+                    self.export_button.configure(state="normal", text="导出已选流星照片")
+                    self.progress["value"] = 100
+                    self.last_export_dir.set(str(run_dir))
+                    self._save_autosave()
+                    feedback_note = f"；保存 {feedback_count} 条候选级模型反馈" if feedback_count else ""
+                    self.status.set(f"已导出 {count} 张；实际导出位置：{run_dir}{feedback_note}")
+                    if messagebox.askyesno(
+                        "流星批量筛选",
+                        f"已导出 {count} 张流星照片。{feedback_note}\n\n"
+                        f"实际导出位置：\n{run_dir}\n\n"
+                        "返回流星合成功能时会自动填入这个文件夹。\n\n是否现在打开？",
+                        parent=self,
+                    ):
+                        self._open_export_folder()
+                elif item[0] == "screening_export_error":
+                    _, message, details = item
+                    self.export_running = False
+                    self.export_button.configure(state="normal", text="导出已选流星照片")
+                    self.status.set("导出失败：" + message)
+                    show_copyable_error(
+                        "流星批量筛选 — 导出失败", message, parent=self, details=details
                     )
         except queue.Empty:
             pass

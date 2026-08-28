@@ -29,8 +29,8 @@ from platform_utils import open_folder
 from error_dialog import show_copyable_error, show_runtime_log
 
 
-APP_NAME = "流星影像工坊"
-APP_VERSION = "0.2.0-full-resolution-preview"
+APP_NAME = "MeteorStudio"
+APP_VERSION = "0.2.1"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 
@@ -195,6 +195,27 @@ def read_uint16_pair(first: Path, second: Path) -> tuple[np.ndarray, np.ndarray]
         future_first = pool.submit(lambda: to_uint16(read_image(first)))
         future_second = pool.submit(lambda: to_uint16(read_image(second)))
         return future_first.result(), future_second.result()
+
+
+def place_source_on_canvas(image: np.ndarray, target_height: int, target_width: int) -> np.ndarray:
+    """Centre an untouched camera frame on a PTGui canvas without stretching it."""
+    height, width = image.shape[:2]
+    if (height, width) == (target_height, target_width):
+        return image
+    scale = min(1.0, target_width / max(1, width), target_height / max(1, height))
+    if scale < 1.0:
+        placed = cv2.resize(
+            image,
+            (max(1, round(width * scale)), max(1, round(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    else:
+        placed = image
+    canvas = np.zeros((target_height, target_width, *placed.shape[2:]), dtype=placed.dtype)
+    y0 = max(0, (target_height - placed.shape[0]) // 2)
+    x0 = max(0, (target_width - placed.shape[1]) // 2)
+    canvas[y0:y0 + placed.shape[0], x0:x0 + placed.shape[1]] = placed
+    return canvas
 
 
 def image_info(path: Path) -> tuple[int, int, str, int]:
@@ -456,6 +477,10 @@ def autosave_file_path() -> Path:
 
 def user_model_file_path() -> Path:
     return autosave_file_path().parent / "models" / "meteor_ranker_user.json"
+
+
+def user_dataset_file_path() -> Path:
+    return autosave_file_path().parent / "models" / "candidate_dataset_user.npz"
 
 
 def bundled_resource_path(name: str) -> Path:
@@ -736,6 +761,20 @@ def load_meteor_ranker() -> dict | None:
     return None
 
 
+def meteor_model_status(model: dict | None) -> str:
+    if not model:
+        return "本地模型：未找到，使用旧评分"
+    metrics = model.get("metrics", {})
+    samples = metrics.get("samples")
+    learned_at = str(metrics.get("learned_at", ""))[:10]
+    kind = "个性化" if model.get("_personalized") else "内置"
+    details = [f"{samples}样本" if samples is not None else ""]
+    if learned_at:
+        details.append(learned_at)
+    suffix = " · ".join(value for value in details if value)
+    return f"本地模型：{kind}" + (f" · {suffix}" if suffix else "")
+
+
 def normalize_lsd_lines(lines: np.ndarray | None) -> np.ndarray:
     """Normalize OpenCV LSD output across versions to an (N, 4) array."""
     if lines is None:
@@ -812,7 +851,12 @@ def merge_collinear_candidates(candidates: list[tuple]) -> list[tuple]:
                 0.0,
                 float(max(first_interval[0], second_interval[0]) - min(first_interval[1], second_interval[1])),
             )
-            maximum_gap = max(14.0, min(65.0, min(kept_length, length) * 0.55))
+            # Faint tails often disappear for a distance comparable to the
+            # detected bright fragments themselves.  The former 0.55 ratio
+            # left DSC08083 as three separate candidates (roughly 25--39 px
+            # fragments with 27--32 px gaps).  Perpendicular and angle gates
+            # above still keep nearby parallel trails independent.
+            maximum_gap = max(20.0, min(80.0, min(kept_length, length) * 1.40))
             if axial_gap > maximum_gap:
                 continue
             points = np.concatenate((first, second), axis=0)
@@ -842,6 +886,44 @@ def merge_collinear_candidates(candidates: list[tuple]) -> list[tuple]:
         if len(second_pass) < len(merged):
             return second_pass
     return sorted(merged, reverse=True, key=lambda value: value[0])
+
+
+def calibrate_secondary_candidate_scores(
+    candidates: list[tuple[int, tuple[int, int], tuple[int, int], float]],
+) -> list[tuple[int, tuple[int, int], tuple[int, int], float]]:
+    """Keep a short weak residual from outranking one obvious long meteor.
+
+    The local classifier judges appearance, while the detector's legacy score
+    carries useful whole-frame relative strength.  On DSC08083 a 41 px vertical
+    registration residual received a higher AI score than the real 160 px
+    meteor.  It should remain available at a low threshold, but must not become
+    a second automatic meteor at the normal threshold.
+    """
+    if len(candidates) < 2:
+        return candidates
+
+    def length(item) -> float:
+        _score, start, end, _legacy = item
+        return float(np.hypot(end[0] - start[0], end[1] - start[1]))
+
+    anchor = max(candidates, key=lambda item: (float(item[3]), length(item)))
+    anchor_length = length(anchor)
+    anchor_legacy = float(anchor[3])
+    if anchor_legacy < 85.0 or anchor_length < 1.0:
+        return candidates
+
+    calibrated = []
+    for item in candidates:
+        score, start, end, legacy = item
+        item_length = length(item)
+        if (
+            item is not anchor
+            and float(legacy) < 55.0
+            and item_length < anchor_length * 0.38
+        ):
+            score = min(int(score), 49)
+        calibrated.append((int(score), start, end, float(legacy)))
+    return calibrated
 
 
 def detect_trails(
@@ -1530,10 +1612,81 @@ def dominant_meteor_signal_gate(
         return np.zeros_like(alpha, dtype=np.float32)
     dominant_index = max(component_scores)[1]
     dominant = (labels == dominant_index).astype(np.uint8)
+    # The bright core and a faint taper can be disconnected at the high seed
+    # threshold even when the user painted one complete meteor.  Starting from
+    # the dominant core, trace a lower-threshold 1-D run along its principal
+    # axis. This protects aligned weak head/tail pixels without admitting
+    # unrelated blocks elsewhere in a broad hand-painted mask.
+    protected = dominant.copy()
+    dominant_y, dominant_x = np.nonzero(dominant)
+    if len(stroke.points) >= 2 and len(dominant_x) >= 5:
+        coordinates = np.column_stack((dominant_x, dominant_y)).astype(np.float32)
+        center = coordinates.mean(axis=0)
+        covariance = np.cov(coordinates, rowvar=False)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        axis = eigenvectors[:, int(np.argmax(eigenvalues))].astype(np.float32)
+        grid_y, grid_x = np.mgrid[0:alpha.shape[0], 0:alpha.shape[1]].astype(np.float32)
+        along = (grid_x - center[0]) * axis[0] + (grid_y - center[1]) * axis[1]
+        across = np.abs(
+            (grid_x - center[0]) * (-axis[1]) + (grid_y - center[1]) * axis[0]
+        )
+        corridor_radius = float(np.clip(
+            stroke.width * max(0.05, stroke.width_scale) * 0.24, 3.0, 14.0
+        ))
+        weak_threshold = max(
+            floor,
+            median + 2.0 * 1.4826 * mad,
+            float(np.percentile(values, 35.0)) * 0.55,
+        )
+        weak_pixels = (
+            (luminance > weak_threshold)
+            & (alpha > 0.055)
+            & (across <= corridor_radius)
+        )
+        if np.any(weak_pixels):
+            weak_projection = np.rint(along[weak_pixels]).astype(np.int32)
+            dominant_projection = np.rint(along[dominant > 0]).astype(np.int32)
+            low_projection = int(min(weak_projection.min(), dominant_projection.min()))
+            high_projection = int(max(weak_projection.max(), dominant_projection.max()))
+            profile = np.zeros(high_projection - low_projection + 1, np.uint8)
+            profile[weak_projection - low_projection] = 1
+            # Bridge small gaps in a fading trail, then discard isolated stars.
+            close_length = int(np.clip(round(
+                stroke.width * max(0.05, stroke.width_scale) * 2.20
+            ), 7, 161)) | 1
+            profile = cv2.morphologyEx(
+                profile[None, :], cv2.MORPH_CLOSE,
+                np.ones((1, close_length), np.uint8),
+            )[0]
+            minimum_run = max(4, int(round(corridor_radius * 0.55)))
+            padded_profile = np.pad(profile.astype(np.int8), (1, 1))
+            run_starts = np.flatnonzero(np.diff(padded_profile) == 1)
+            run_ends = np.flatnonzero(np.diff(padded_profile) == -1)
+            dominant_low = int(dominant_projection.min() - low_projection)
+            dominant_high = int(dominant_projection.max() - low_projection)
+            chosen_run = None
+            chosen_overlap = -1
+            for run_start, run_end in zip(run_starts, run_ends):
+                if run_end - run_start < minimum_run:
+                    continue
+                overlap = max(
+                    0, min(int(run_end), dominant_high + 1)
+                    - max(int(run_start), dominant_low)
+                )
+                if overlap > chosen_overlap:
+                    chosen_overlap = overlap
+                    chosen_run = (int(run_start), int(run_end))
+            if chosen_run is not None and chosen_overlap > 0:
+                projection_index = np.rint(along).astype(np.int32) - low_projection
+                axial_support = (
+                    (projection_index >= chosen_run[0])
+                    & (projection_index < chosen_run[1])
+                )
+                protected |= (weak_pixels & axial_support).astype(np.uint8)
     radius = int(np.clip(round(max(2.0, stroke.width * stroke.width_scale) * 0.32), 2, 18))
     kernel_size = radius * 2 + 1
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    support = cv2.dilate(dominant, kernel).astype(np.float32)
+    support = cv2.dilate(protected, kernel).astype(np.float32)
     sigma = max(0.8, radius * 0.45)
     support = cv2.GaussianBlur(support, (0, 0), sigmaX=sigma, sigmaY=sigma)
     if float(support.max()) > 0:
@@ -1553,6 +1706,16 @@ def dominant_meteor_signal_gate(
     # (the previous quadratic mapping retained 9%, visible on dark skies).
     amount = 1.0 - (1.0 - float(np.clip(cleanup_strength / 100.0, 0.0, 1.0))) ** 3
     tonal_gate = (1.0 - amount) + amount * levels
+    if np.any(protected != dominant):
+        tail_floor = cv2.GaussianBlur(
+            protected.astype(np.float32), (0, 0), sigmaX=1.15
+        )
+        if float(tail_floor.max()) > 0:
+            tail_floor /= float(tail_floor.max())
+        # Aligned weak samples have already passed the noise and continuity
+        # checks above. Do not run them through the 2.7%-at-default dark-end
+        # gate again, or a complete hand-painted trail becomes core-only.
+        tonal_gate = np.maximum(tonal_gate, tail_floor * 0.32)
     # Alpha is applied later by the compositor. Geometry and tonal rejection
     # belong here; multiplying alpha again would dim the bright core twice.
     return np.clip(support * tonal_gate, 0.0, 1.0)
@@ -1651,7 +1814,10 @@ def compose_meteor_objects(
                     ]
         if not np.any(alpha > 0.001):
             continue
-        base_patch = result[y0:y1, x0:x1]
+        # Every meteor must be extracted against the same immutable clean base.
+        # Using ``result`` here made local matching and brightness depend on the
+        # hidden stroke order whenever two transformed masks overlapped.
+        base_patch = base[y0:y1, x0:x1]
         raw_source = source_patch.astype(np.float32)
         object_cleanup = (
             stroke.background_cleanup_override
@@ -1854,7 +2020,13 @@ def compose_meteor_objects(
                 effective_alpha = alpha + (1.0 - alpha) * highlight
         a = effective_alpha[..., None]
         blended = base_patch * (1.0 - a) + candidate * a
-        result[y0:y1, x0:x1] = np.clip(blended, 0, clip_max).astype(base.dtype)
+        # Only positive meteor signal reaches this point. Merge independent
+        # objects with a maximum so changing list/source order cannot alter the
+        # final pixels or double an overlap into a clipped white patch.
+        destination = result[y0:y1, x0:x1]
+        result[y0:y1, x0:x1] = np.maximum(
+            destination, np.clip(blended, 0, clip_max).astype(base.dtype)
+        )
         union[y0:y1, x0:x1] = np.maximum(
             union[y0:y1, x0:x1], alpha.astype(np.float16, copy=False)
         )
@@ -1883,9 +2055,10 @@ def compose_meteor_sources(
         selected = [item for item in ordered if normalized_source_mode(item) == mode]
         if not any(not item.erase and item.points for item in selected):
             continue
-        result, source_mask = compose_meteor_objects(
-            sources[mode], result, selected, *settings
+        source_result, source_mask = compose_meteor_objects(
+            sources[mode], base, selected, *settings
         )
+        result = np.maximum(result, source_result)
         union = np.maximum(union, source_mask)
     return result, union
 
@@ -2176,6 +2349,12 @@ class MeteorComposer(tk.Tk):
         self.layer_preview_cache: OrderedDict[tuple[str, int, int, int, int], np.ndarray] = OrderedDict()
         self.preview_cache_lock = threading.Lock()
         display_budget, precision_budget, viewport_budget = preview_memory_budgets()
+        # These legacy caches also retain full-resolution arrays. Bound them by
+        # bytes so they cannot silently defeat the decoded-image LRU budget.
+        self.preview_cache_bytes = 0
+        self.layer_preview_cache_bytes = 0
+        self.preview_cache_budget = max(192 << 20, display_budget // 3)
+        self.layer_preview_cache_budget = max(256 << 20, display_budget // 2)
         self.full_display_cache: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDict()
         self.full_precision_cache: OrderedDict[tuple[str, int, int], np.ndarray] = OrderedDict()
         self.full_display_cache_bytes = 0
@@ -2185,6 +2364,7 @@ class MeteorComposer(tk.Tk):
         self.full_cache_inflight: dict[tuple[str, str, int, int], threading.Event] = {}
         self.full_cache_pinned_paths: set[str] = set()
         self.prefetch_generation = 0
+        self.prefetch_active_count = 0
         self.viewport_cache: OrderedDict[tuple, tuple[Image.Image, int]] = OrderedDict()
         self.viewport_cache_bytes = 0
         self.viewport_cache_budget = viewport_budget
@@ -2196,7 +2376,7 @@ class MeteorComposer(tk.Tk):
         self.canvas_zoom = 1.0
         self.canvas_fit_mode = True
         self.canvas_preserve_fit_once = False
-        self.canvas_last_window_size: tuple[int, int] | None = None
+        self.canvas_last_allocation: tuple[int, int] | None = None
         self.canvas_center_x = 0.0
         self.canvas_center_y = 0.0
         self.canvas_image_shape: tuple[int, int] | None = None
@@ -2220,6 +2400,7 @@ class MeteorComposer(tk.Tk):
         self.exact_preview_full_rgb: np.ndarray | None = None
         self.exact_labeled_preview_full_rgb: np.ndarray | None = None
         self.exact_preview_signature: str | None = None
+        self.export_running = False
         self.exact_preview_loading_signature: str | None = None
         self.exact_preview_pending_signature: str | None = None
         self.exact_preview_request_after_id: str | None = None
@@ -2262,12 +2443,7 @@ class MeteorComposer(tk.Tk):
         self.hover_candidate_items: list[int] = []
         self.work_queue: queue.Queue = queue.Queue()
         self.ranker_model = load_meteor_ranker()
-        if self.ranker_model:
-            self.ai_model_status.set(
-                "AI模型：个性化" if self.ranker_model.get("_personalized") else "AI模型：内置基础版"
-            )
-        else:
-            self.ai_model_status.set("AI模型：未找到，使用旧评分")
+        self.ai_model_status.set(meteor_model_status(self.ranker_model))
         self.autosave_path = autosave_file_path()
         self.autosave_after_id: str | None = None
         self.autosave_suspended = True
@@ -2303,7 +2479,7 @@ class MeteorComposer(tk.Tk):
         header = ttk.Frame(root)
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text=APP_NAME, font=("TkDefaultFont", 15, "bold")).pack(side="left")
-        ttk.Label(header, text="图片合成工作区").pack(side="left", padx=12)
+        ttk.Label(header, text="流星合成工作区").pack(side="left", padx=12)
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="打开视频动态工作区…", command=self.open_video_workspace).pack(side="right")
         ttk.Button(header, text="2  Siril＋PTGui星空对齐…", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
@@ -2325,7 +2501,7 @@ class MeteorComposer(tk.Tk):
             mode_row, text="分别输出（按同名底图逐张生成）", variable=self.output_mode,
             value="separate", command=self._output_mode_changed,
         ).pack(side="left", padx=(18, 0))
-        self._path_row(paths, 1, "原图 TIFF 文件夹", self.source_dir, self._browse_source)
+        self._path_row(paths, 1, "流星/对齐 TIFF 文件夹", self.source_dir, self._browse_source)
         ttk.Label(paths, text="干净底图", width=18).grid(row=2, column=0, sticky="w", pady=2)
         ttk.Entry(paths, textvariable=self.base_dir).grid(row=2, column=1, sticky="ew", padx=5)
         base_buttons = ttk.Frame(paths)
@@ -2371,7 +2547,7 @@ class MeteorComposer(tk.Tk):
         view_bar.pack(fill="x", pady=(0, 2))
         ttk.Label(view_bar, text="查看：").pack(side="left")
         ttk.Radiobutton(view_bar, text="1 当前素材图", variable=self.view_mode, value="source", command=self._view_mode_changed).pack(side="left")
-        ttk.Radiobutton(view_bar, text="2 干净 JPG", variable=self.view_mode, value="base", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
+        ttk.Radiobutton(view_bar, text="2 干净底图", variable=self.view_mode, value="base", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
         ttk.Label(view_bar, text="编辑视图：拖动画蒙版；按住 H 临时隐藏红色").pack(side="right")
@@ -2449,7 +2625,7 @@ class MeteorComposer(tk.Tk):
         ttk.Scale(mask_tools, from_=0, to=80, variable=self.feather, orient="horizontal", command=lambda _v: self._tool_settings_changed()).grid(row=0, column=10, sticky="ew", padx=5)
         ttk.Label(mask_tools, textvariable=self.feather, width=4).grid(row=0, column=11)
 
-        ttk.Button(mask_tools, text="AI分析当前单张候选", command=self.detect_current_candidates).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
+        ttk.Button(mask_tools, text="本地模型分析当前单张", command=self.detect_current_candidates).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
         ttk.Label(mask_tools, text="AI分数阈值").grid(row=1, column=2, pady=(7, 0))
         ttk.Scale(mask_tools, from_=1, to=100, variable=self.candidate_threshold, orient="horizontal", command=self._candidate_threshold_changed).grid(row=1, column=3, columnspan=2, sticky="ew", padx=5, pady=(7, 0))
         ttk.Label(mask_tools, textvariable=self.candidate_threshold, width=4).grid(row=1, column=5, pady=(7, 0))
@@ -2595,7 +2771,8 @@ class MeteorComposer(tk.Tk):
         ttk.Label(bottom, textvariable=self.autosave_status).pack(side="left", padx=8)
         self.progress = ttk.Progressbar(bottom, mode="determinate", length=220)
         self.progress.pack(side="left", padx=8)
-        ttk.Button(bottom, text="导出合成结果", command=self.export).pack(side="right")
+        self.export_button = ttk.Button(bottom, text="导出合成结果", command=self.export)
+        self.export_button.pack(side="right")
         ttk.Button(bottom, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
         ttk.Button(bottom, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
 
@@ -2883,7 +3060,9 @@ class MeteorComposer(tk.Tk):
             incremental = self._incremental_selected_object_image(before)
             self._record_object_transform(before)
             if incremental is not None:
-                self._commit_incremental_global_preview(incremental, validate=False)
+                self._commit_incremental_global_preview(
+                    incremental, validate=False, dirty_box=self.last_incremental_box
+                )
             else:
                 self._invalidate_global_preview()
                 self._render_preview()
@@ -2948,12 +3127,12 @@ Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 
 右键所选流星：删除、重置或输入精确变换参数
 
 单张候选
-点击“AI分析当前单张候选”，再拖动 AI 分数阈值；阈值越低，加入的候选越多
+点击“本地模型分析当前单张”，再拖动候选评分阈值；阈值越低，加入的候选越多
 鼠标靠近候选轨迹：弹出“＋选中”按钮，点击后直接加入并锁定
 红色蒙版及候选分数默认显示；按住 H 可临时隐藏
 
 查看与文件
-1：原图 TIFF    2：干净 JPG    3：最终融合    4：来源标注
+1：流星素材图    2：干净底图    3：最终融合    4：来源标注
 鼠标滚轮或 +/-：以光标为中心缩放；中键拖动或按住空格+左键拖动：平移
 Ctrl/Command+0：适合窗口    Ctrl/Command+1：100% 原图像素
 拼合到同一张底图：第 3/4 模式汇总全部流星；分别输出：只预览当前图片对
@@ -2971,7 +3150,7 @@ F1：显示本快捷键表""")
         ttk.Button(parent, text="选择…", command=command).grid(row=row, column=2)
 
     def _browse_source(self) -> None:
-        value = filedialog.askdirectory(title="选择原图 TIFF 文件夹")
+        value = filedialog.askdirectory(title="选择流星/对齐 TIFF 文件夹")
         if value:
             self.source_dir.set(value)
 
@@ -3095,6 +3274,8 @@ F1：显示本快捷键表""")
                 cache.clear()
                 self.base_preview_cache.clear()
                 self.layer_preview_cache.clear()
+                self.preview_cache_bytes = 0
+                self.layer_preview_cache_bytes = 0
                 self.full_cache_pinned_paths.clear()
                 self.prefetch_generation += 1
         if hasattr(self, "viewport_cache"):
@@ -3538,7 +3719,9 @@ F1：显示本快捷键表""")
             self._sync_matching_candidate(self.selected_object[0], stroke)
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -3556,7 +3739,9 @@ F1：显示本快捷键表""")
             self._sync_matching_candidate(self.selected_object[0], stroke)
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -3718,10 +3903,13 @@ F1：显示本快捷键表""")
         height, width = source_preview.shape[:2]
         candidates = []
         maps = prepare_ml_maps(source_preview, base_preview) if self.ranker_model else None
+        scored_trails = []
         for start, end, legacy_score in trails:
             score = int(round(100 * predict_gradient_boosting(
                 candidate_feature_vector(maps, start, end, legacy_score), self.ranker_model
             ))) if self.ranker_model else legacy_score
+            scored_trails.append((int(score), start, end, float(legacy_score)))
+        for score, start, end, legacy_score in calibrate_secondary_candidate_scores(scored_trails):
             full_width, full_feather = estimate_trail_mask_geometry(
                 source_preview, base_preview, start, end, source_scale
             )
@@ -3803,11 +3991,12 @@ F1：显示本快捷键表""")
                 score = int(round(100 * predict_gradient_boosting(
                     candidate_feature_vector(maps, start, end, legacy_score), self.ranker_model
                 ))) if self.ranker_model else legacy_score
-                ranked_trails.append((score, start, end))
+                ranked_trails.append((int(score), start, end, float(legacy_score)))
+            ranked_trails = calibrate_secondary_candidate_scores(ranked_trails)
             ranked_trails.sort(reverse=True, key=lambda item: item[0])
             selected = [item for item in ranked_trails if item[0] >= 55][:4]
             strokes = []
-            for score, start, end in selected:
+            for score, start, end, _legacy_score in selected:
                 full_width, full_feather = estimate_trail_mask_geometry(
                     source_preview, base_preview, start, end, source_scale
                 )
@@ -3840,6 +4029,40 @@ F1：显示本快捷键表""")
     def _file_identity(path: Path) -> tuple[str, int, int]:
         stat = path.stat()
         return str(path), stat.st_mtime_ns, stat.st_size
+
+    @staticmethod
+    def _payload_array_bytes(payload: Iterable) -> int:
+        """Count unique NumPy buffers retained by one cache payload."""
+        seen: set[int] = set()
+        total = 0
+        for value in payload:
+            if isinstance(value, np.ndarray) and id(value) not in seen:
+                seen.add(id(value))
+                total += int(value.nbytes)
+        return total
+
+    def _store_layer_preview_locked(self, key: tuple, image: np.ndarray) -> None:
+        previous = self.layer_preview_cache.pop(key, None)
+        if previous is not None:
+            self.layer_preview_cache_bytes -= int(previous.nbytes)
+        self.layer_preview_cache[key] = image
+        self.layer_preview_cache_bytes += int(image.nbytes)
+        while (
+            self.layer_preview_cache_bytes > self.layer_preview_cache_budget
+            and len(self.layer_preview_cache) > 1
+        ):
+            _old_key, removed = self.layer_preview_cache.popitem(last=False)
+            self.layer_preview_cache_bytes -= int(removed.nbytes)
+
+    def _store_preview_payload_locked(self, key: tuple, payload: tuple) -> None:
+        previous = self.preview_cache.pop(key, None)
+        if previous is not None:
+            self.preview_cache_bytes -= self._payload_array_bytes(previous)
+        self.preview_cache[key] = payload
+        self.preview_cache_bytes += self._payload_array_bytes(payload)
+        while self.preview_cache_bytes > self.preview_cache_budget and len(self.preview_cache) > 1:
+            _old_key, removed = self.preview_cache.popitem(last=False)
+            self.preview_cache_bytes -= self._payload_array_bytes(removed)
 
     def _cached_full_image(self, path: Path, precision: bool = False) -> np.ndarray:
         """Decode once, share between workers, and evict by bytes rather than file count."""
@@ -3946,31 +4169,37 @@ F1：显示本快捷键表""")
                     nearby.append(self.files[neighbor_index])
 
         def prefetch() -> None:
-            jobs: dict[Path, bool] = {}
-            for position, source_path in enumerate(nearby):
-                key = str(source_path)
-                warm_precision = position < 2
-                for path in (
-                    source_path,
-                    self.original_sources.get(key, source_path),
-                    self.pairs.get(key, source_path),
-                ):
-                    if path.is_file():
-                        jobs[path] = jobs.get(path, False) or warm_precision
-            work = list(jobs.items())
-            workers = min(3, len(work))
-            if not workers:
-                return
-            def load(job):
-                path, warm_precision = job
-                return (
-                    self._cached_display_with_precision(path)
-                    if warm_precision else self._cached_full_image(path, False)
-                )
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-prefetch") as pool:
-                for _image in pool.map(load, work):
-                    if generation != self.prefetch_generation:
-                        break
+            with self.preview_cache_lock:
+                self.prefetch_active_count += 1
+            try:
+                jobs: dict[Path, bool] = {}
+                for position, source_path in enumerate(nearby):
+                    key = str(source_path)
+                    warm_precision = position < 2
+                    for path in (
+                        source_path,
+                        self.original_sources.get(key, source_path),
+                        self.pairs.get(key, source_path),
+                    ):
+                        if path.is_file():
+                            jobs[path] = jobs.get(path, False) or warm_precision
+                work = list(jobs.items())
+                workers = min(3, len(work))
+                if not workers:
+                    return
+                def load(job):
+                    path, warm_precision = job
+                    return (
+                        self._cached_display_with_precision(path)
+                        if warm_precision else self._cached_full_image(path, False)
+                    )
+                with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-prefetch") as pool:
+                    for _image in pool.map(load, work):
+                        if generation != self.prefetch_generation:
+                            break
+            finally:
+                with self.preview_cache_lock:
+                    self.prefetch_active_count = max(0, self.prefetch_active_count - 1)
 
         threading.Thread(target=prefetch, daemon=True).start()
 
@@ -3994,16 +4223,21 @@ F1：显示本快捷键表""")
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="meteor-preview") as pool:
             decoded = dict(zip(unique, pool.map(self._cached_display_with_precision, unique)))
         source_preview = decoded[image_path]
-        height, width = source_preview.shape[:2]
         aligned_preview = decoded[aligned_path]
         original_preview = decoded[original_path]
         base_preview = decoded[base_path]
-        if (
-            aligned_preview.shape[:2] != (height, width)
-            or original_preview.shape[:2] != (height, width)
-        ):
-            raise ValueError(f"自动对齐图与原始图尺寸不一致：{path.name}")
-        if base_preview.shape[:2] != (height, width):
+        height, width = base_preview.shape[:2]
+        if aligned_preview.shape[:2] != (height, width):
+            if aligned_path == original_path:
+                aligned_preview = place_source_on_canvas(aligned_preview, height, width)
+            else:
+                raise ValueError(f"自动对齐图尺寸异常：{path.name}")
+        original_preview = place_source_on_canvas(original_preview, height, width)
+        if image_path == aligned_path:
+            source_preview = aligned_preview
+        elif image_path == original_path:
+            source_preview = original_preview
+        elif source_preview.shape[:2] != (height, width):
             raise ValueError(f"尺寸不一致：{path.name} / {base_path.name}")
         preview_size = (width, height)
         with self.preview_cache_lock:
@@ -4015,18 +4249,12 @@ F1：显示本快捷键表""")
                     str(layer_path), layer_stat.st_mtime_ns, layer_stat.st_size,
                     preview_size[0], preview_size[1],
                 )
-                self.layer_preview_cache[layer_key] = layer_preview
-                self.layer_preview_cache.move_to_end(layer_key)
-            while len(self.layer_preview_cache) > 48:
-                self.layer_preview_cache.popitem(last=False)
+                self._store_layer_preview_locked(layer_key, layer_preview)
         payload = (
             source_preview, aligned_preview, original_preview, base_preview, (width, height),
         )
         with self.preview_cache_lock:
-            self.preview_cache[cache_key] = payload
-            self.preview_cache.move_to_end(cache_key)
-            while len(self.preview_cache) > 5:
-                self.preview_cache.popitem(last=False)
+            self._store_preview_payload_locked(cache_key, payload)
         return ("preview", request_id, path, *payload, base_path, pairing_signature)
 
     def _cached_layer_preview(
@@ -4207,7 +4435,7 @@ F1：显示本快捷键表""")
 
     def open_exact_preview(self) -> None:
         if self.exact_preview_full_rgb is None or self.exact_labeled_preview_full_rgb is None:
-            messagebox.showinfo(APP_NAME, "尚未生成可放大的导出级预览，请先点击“生成并打开”。")
+            messagebox.showinfo(APP_NAME, "导出级精准预览正在自动生成，请稍候后再打开。")
             return
         if self.exact_preview_signature != self._exact_preview_state_signature():
             messagebox.showwarning(APP_NAME, "蒙版或融合参数已经变化，请重新生成导出级精确预览。")
@@ -4293,8 +4521,12 @@ F1：显示本快捷键表""")
                 continue
             original_path = original_paths.get(str(source_path), source_path)
             aligned_source, original_source = decoded_pair
-            if aligned_source.shape[:2] != (height, width) or original_source.shape[:2] != (height, width):
-                raise ValueError(f"尺寸不一致：{source_path.name}")
+            if aligned_source.shape[:2] != (height, width):
+                if source_path == original_path:
+                    aligned_source = place_source_on_canvas(aligned_source, height, width)
+                else:
+                    raise ValueError(f"尺寸不一致：{source_path.name}")
+            original_source = place_source_on_canvas(original_source, height, width)
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
             crop_spec = strokes_for_composite_crop(
                 strokes, width, height, bool(adjustment.get("auto_optimize", True))
@@ -4432,8 +4664,10 @@ F1：显示本快捷键表""")
             if aligned_preview is None or original_preview is None:
                 aligned, original = read_uint16_pair(source_path, original_path)
                 full_height, full_width = aligned.shape[:2]
-                if original.shape[:2] != (full_height, full_width):
-                    raise ValueError(f"自动对齐图与原始图尺寸不一致：{source_path.name}")
+                if aligned.shape[:2] != (preview_height, preview_width) and source_path == original_path:
+                    aligned = place_source_on_canvas(aligned, preview_height, preview_width)
+                    full_height, full_width = aligned.shape[:2]
+                original = place_source_on_canvas(original, full_height, full_width)
                 aligned_preview = np.right_shift(cv2.resize(
                     aligned, (preview_width, preview_height), interpolation=cv2.INTER_AREA
                 ), 8).astype(np.uint8)
@@ -4450,10 +4684,7 @@ F1：显示本快捷键表""")
                                 str(layer_path), layer_stat.st_mtime_ns, layer_stat.st_size,
                                 preview_width, preview_height,
                             )
-                            self.layer_preview_cache[key] = layer_image
-                            self.layer_preview_cache.move_to_end(key)
-                        while len(self.layer_preview_cache) > 48:
-                            self.layer_preview_cache.popitem(last=False)
+                            self._store_layer_preview_locked(key, layer_image)
             scale_to_preview = preview_width / max(1, full_width)
             scaled = [Stroke(
                 item.points, max(1, int(round(item.width * scale_to_preview))),
@@ -4486,7 +4717,7 @@ F1：显示本快捷键表""")
                     False, mask,
                 ))
             now = time.monotonic()
-            if index == 1 or index == len(marked) or now - last_partial >= 0.18:
+            if index == 1 or index == len(marked) or now - last_partial >= 0.65:
                 partial = result.copy()
                 partial_labeled, _records = annotate_meteor_sources(
                     partial, preview_annotations
@@ -4670,6 +4901,9 @@ F1：显示本快捷键表""")
         self.canvas_zoom = self._canvas_fit_scale()
         self.canvas_fit_mode = True
         self.canvas_preserve_fit_once = False
+        self.canvas_last_allocation = (
+            max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
+        )
         self._redraw_canvas_only()
 
     def _canvas_actual_size(self) -> None:
@@ -4753,19 +4987,22 @@ F1：显示本快捷键表""")
             self._canvas_pan_end_event()
         return "break"
 
-    def _canvas_configure(self, _event=None) -> None:
+    def _canvas_configure(self, event=None) -> None:
         if self.preview_rgb is None:
             return
-        window_size = (max(1, self.winfo_width()), max(1, self.winfo_height()))
-        window_changed = (
-            self.canvas_last_window_size is None
-            or window_size != self.canvas_last_window_size
+        allocation = (
+            max(1, int(getattr(event, "width", self.canvas.winfo_width()))),
+            max(1, int(getattr(event, "height", self.canvas.winfo_height()))),
         )
-        self.canvas_last_window_size = window_size
-        if self.canvas_fit_mode and window_changed:
-            # Only a real top-level resize may change fit zoom. Notebook/status
-            # reflow and clicks in blank UI areas must leave the photograph at
-            # exactly the same scale.
+        allocation_changed = (
+            self.canvas_last_allocation is None
+            or allocation != self.canvas_last_allocation
+        )
+        self.canvas_last_allocation = allocation
+        if self.canvas_fit_mode and allocation_changed:
+            # Fit only when the image canvas itself was actually resized.  The
+            # former top-level-window check could remain stale until a later
+            # focus/click event and made a blank panel click appear to zoom.
             height, width = self.preview_rgb.shape[:2]
             self.canvas_zoom = self._canvas_fit_scale()
             self.canvas_center_x = width / 2.0
@@ -4798,6 +5035,11 @@ F1：显示本快捷键表""")
                 self.canvas_center_x = w / 2.0
                 self.canvas_center_y = h / 2.0
             self.canvas_image_shape = (h, w)
+            if self.canvas_fit_mode:
+                # Quick and exact workers can return the same scene at different
+                # pixel dimensions.  Re-fit the replacement frame so its visible
+                # bounds remain fixed instead of growing with its resolution.
+                self.canvas_zoom = self._canvas_fit_scale()
         preserve_fit = self.canvas_fit_mode and self.canvas_preserve_fit_once
         self.canvas_preserve_fit_once = False
         if self.canvas_fit_mode and initial_frame and not preserve_fit:
@@ -5161,7 +5403,9 @@ F1：显示本快捷键表""")
         self._update_candidate_summary(key)
         self._update_tree_status()
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
             self.status.set(f"已选中并锁定 {score} 分候选；对应局部已即时融合")
         else:
             self._render_preview()
@@ -5417,7 +5661,9 @@ F1：显示本快捷键表""")
         self._record_edit(key, ("transform", index, (before, after)))
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -5454,7 +5700,9 @@ F1：显示本快捷键表""")
         self._set_selected_controls_state(True, self.selected_override_enabled.get())
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -5866,7 +6114,7 @@ F1：显示本快捷键表""")
             if aligned.shape[:2] != (preview_h, preview_w):
                 aligned = cv2.resize(aligned, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
             if original.shape[:2] != (preview_h, preview_w):
-                original = cv2.resize(original, (preview_w, preview_h), interpolation=cv2.INTER_AREA)
+                original = place_source_on_canvas(original, preview_h, preview_w)
 
             auto_enabled = bool(self.adjustment_defaults.get("auto_optimize", True))
             old_scaled = auto_optimized_stroke(self._preview_clone(before, full_width), auto_enabled)
@@ -6033,7 +6281,14 @@ F1：显示本快捷键表""")
                             relevant.append(item)
                     intersecting.append((other_key, other_width, relevant))
 
-            image = cached_display.copy()
+            # In the shared-base editor global_preview_rgb is an owned committed
+            # buffer, so replace only its dirty ROI. Separate mode can borrow a
+            # source/exact frame and must copy to avoid mutating that input.
+            image = (
+                cached_display
+                if shared and cached_display is self.global_preview_rgb
+                else cached_display.copy()
+            )
             replacement = self.preview_base[y0:y1, x0:x1].copy()
             crop_h, crop_w = replacement.shape[:2]
             for other_key, other_width, relevant in intersecting:
@@ -6055,12 +6310,28 @@ F1：显示本快捷键表""")
                     original_preview = self._cached_layer_preview(
                         original_path, preview_w, preview_h
                     )
-                    # Mouse-up must never block on full TIFF decoding.  A cache
-                    # miss falls back to the normal background preview worker.
-                    if aligned_preview is None or original_preview is None:
-                        return None
+                    # A rolling-cache miss must not turn one meteor edit into a
+                    # complete project rebuild. Decode only the intersecting
+                    # source layer(s); compositing remains limited to this ROI.
+                    if aligned_preview is None:
+                        aligned_preview = self._cached_full_image(aligned_path, False)
+                    if original_preview is None:
+                        original_preview = self._cached_full_image(original_path, False)
                 if aligned_preview is None or original_preview is None:
                     return None
+                if aligned_preview.shape[:2] != (preview_h, preview_w):
+                    if self.current_path is not None and other_key == str(self.current_path):
+                        return None
+                    if aligned_path == original_path:
+                        aligned_preview = place_source_on_canvas(
+                            aligned_preview, preview_h, preview_w
+                        )
+                    else:
+                        return None
+                if original_preview.shape[:2] != (preview_h, preview_w):
+                    original_preview = place_source_on_canvas(
+                        original_preview, preview_h, preview_w
+                    )
                 scaled_relevant = [
                     self._preview_clone(item, other_width) for item in relevant
                 ]
@@ -6142,7 +6413,9 @@ F1：显示本快捷键表""")
         if stroke is not None and before is not None and stroke != before:
             self._record_object_transform(before)
             if incremental is not None:
-                self._commit_incremental_global_preview(incremental, validate=False)
+                self._commit_incremental_global_preview(
+                    incremental, validate=False, dirty_box=self.last_incremental_box
+                )
                 self.status.set("流星局部已精确更新；未重绘画面其他区域")
             else:
                 if self._uses_shared_base() and live_visual is not None:
@@ -6240,6 +6513,23 @@ F1：显示本快捷键表""")
         realtime: bool = False, dirty_box: tuple[int, int, int, int] | None = None,
     ) -> None:
         """Commit the one-object live result without blanking/rebuilding the full sky."""
+        # A local result supersedes every deferred whole-frame request. Leaving
+        # one of these timers alive was why the UI looked correct immediately,
+        # then restarted total-composite and exact-preview passes moments later.
+        for attribute in (
+            "global_preview_request_after_id",
+            "exact_preview_request_after_id",
+            "global_exact_after_id",
+        ):
+            after_id = getattr(self, attribute, None)
+            if after_id is not None:
+                try:
+                    self.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attribute, None)
+        self.global_preview_pending_signature = None
+        self.exact_preview_pending_signature = None
         self.global_preview_rgb = image
         self.global_labeled_preview_rgb = None
         if self.view_mode.get() == "labeled" and not realtime:
@@ -6271,7 +6561,7 @@ F1：显示本快捷键表""")
                 # The prior exact frame is still correct outside the edited
                 # footprint. Re-expose only the changed pixels instead of
                 # recompositing (or even re-exposing) the complete 8K canvas.
-                exact_image = self.exact_preview_full_rgb.copy()
+                exact_image = self.exact_preview_full_rgb
                 x0, y0, x1, y1 = dirty_box
                 exact_image[y0:y1, x0:x1] = adjust_composite_base_exposure(
                     image[y0:y1, x0:x1], self.preview_base[y0:y1, x0:x1], exposure_ev
@@ -6294,13 +6584,6 @@ F1：显示本快捷键表""")
                 self.exact_labeled_preview_full_rgb = labeled.astype(np.uint8, copy=False)
                 self.exact_labeled_preview_rgb = self.exact_labeled_preview_full_rgb
             self.exact_preview_signature = self._exact_preview_state_signature()
-            self.exact_preview_pending_signature = None
-            if self.exact_preview_request_after_id is not None:
-                try:
-                    self.after_cancel(self.exact_preview_request_after_id)
-                except tk.TclError:
-                    pass
-                self.exact_preview_request_after_id = None
             self.exact_preview_status.set("精准预览：当前流星已局部更新")
             # Stop an older full-frame worker at its next meteor boundary. Its
             # stale partial/final frames must never repaint this local result.
@@ -6463,7 +6746,9 @@ F1：显示本快捷键表""")
         self._clear_object_selection()
         self._update_tree_status_for_key(key)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
             self.status.set("已即时删除这颗流星；未重算其他区域，可用 Ctrl/Command+Z 恢复")
         else:
             self._invalidate_global_preview()
@@ -6482,7 +6767,9 @@ F1：显示本快捷键表""")
             incremental = self._incremental_selected_object_image(before)
             self._record_object_transform(before)
             if incremental is not None:
-                self._commit_incremental_global_preview(incremental, validate=False)
+                self._commit_incremental_global_preview(
+                    incremental, validate=False, dirty_box=self.last_incremental_box
+                )
             else:
                 self._invalidate_global_preview()
                 self._render_preview()
@@ -6576,7 +6863,7 @@ F1：显示本快捷键表""")
                 self.object_menu.grab_release()
             return "break"
         if self.view_mode.get() != "source":
-            self.status.set("干净 JPG 仅用于检查底图；请在 1 原图 TIFF 中编辑蒙版")
+            self.status.set("干净底图仅用于检查；请在 1 流星素材图中编辑蒙版")
             return "break"
         index = self._find_stroke_near(event.x, event.y)
         if index is None:
@@ -6758,7 +7045,9 @@ F1：显示本快捷键表""")
                 after = replace(stroke, points=stroke.points.copy())
                 self._record_edit(object_key, ("transform", index, (before, after)))
             if incremental is not None:
-                self._commit_incremental_global_preview(incremental, validate=False)
+                self._commit_incremental_global_preview(
+                    incremental, validate=False, dirty_box=self.last_incremental_box
+                )
             else:
                 self._invalidate_global_preview()
                 self._render_preview()
@@ -6776,7 +7065,7 @@ F1：显示本快捷键表""")
         if self.view_mode.get() in {"blend", "labeled"}:
             return self._object_pointer_start(event)
         if self.view_mode.get() != "source":
-            self.status.set("干净 JPG 是只读检查视图；请切换到 1 原图 TIFF 绘制蒙版")
+            self.status.set("干净底图是只读检查视图；请切换到 1 流星素材图绘制蒙版")
             return "break"
         # Defensive Photoshop-style transaction boundary. If Windows/Tk lost the
         # previous mouse-up while the preview was repainting, never replace that
@@ -7065,7 +7354,9 @@ F1：显示本快捷键表""")
         self._restore_shift_anchor()
         self._update_tree_status_for_key(key)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -7123,7 +7414,9 @@ F1：显示本快捷键表""")
         self._restore_shift_anchor()
         self._update_tree_status_for_key(key)
         if incremental is not None:
-            self._commit_incremental_global_preview(incremental, validate=False)
+            self._commit_incremental_global_preview(
+                incremental, validate=False, dirty_box=self.last_incremental_box
+            )
         else:
             self._invalidate_global_preview()
             self._render_preview()
@@ -7488,6 +7781,9 @@ F1：显示本快捷键表""")
         self.status.set(f"项目已载入：{path}")
 
     def export(self) -> None:
+        if self.export_running:
+            self.status.set("导出任务正在运行，请等待完成")
+            return
         if (
             self.pairing_signature != self._base_selection_signature()
             or not self.pairs
@@ -7536,16 +7832,45 @@ F1：显示本快捷键表""")
         if learning_choice is None:
             return
         self.progress["value"] = 0
-        self.status.set("开始导出…")
+        self.status.set("正在停止预览任务并准备导出…")
+        self.export_running = True
+        self.export_button.configure(state="disabled", text="导出中…")
         self._release_large_caches_for_export()
-        self._run_worker(
-            self._export_worker, output, marked, self.pairs.copy(),
+        export_args = (
+            output, marked, self.pairs.copy(),
             {key: value.copy() for key, value in self.image_adjustments.items()},
             self.adjustment_defaults.copy(),
             bool(self.export_tiff.get()), bool(learning_choice), self.blend_mode.get(),
             {str(path): self.original_sources.get(str(path), path) for path in marked},
             self.output_mode.get(), self.base_exposure_tenths.get() / 10.0,
         )
+        self._start_export_when_preview_workers_stop(export_args)
+
+    def _start_export_when_preview_workers_stop(self, export_args: tuple, attempt: int = 0) -> None:
+        """Do not overlap multi-gigabyte preview and 16-bit export workers."""
+        if (
+            self.exact_preview_loading_signature is not None
+            or self.global_preview_loading_signature is not None
+            or self.prefetch_active_count > 0
+        ):
+            if attempt < 300:
+                self.after(100, self._start_export_when_preview_workers_stop, export_args, attempt + 1)
+                return
+            self.export_running = False
+            self.export_button.configure(state="normal", text="导出合成结果")
+            self.status.set("导出已停止：预览任务未能及时退出")
+            show_copyable_error(
+                APP_NAME + " — 无法安全开始导出",
+                "后台预览或预取任务在 30 秒内没有退出。为避免内存冲突，本次没有开始导出；"
+                "请稍候后重试，并可从运行日志复制详细信息。",
+                parent=self,
+            )
+            return
+        # A cancelled prefetch may have completed its current decode after the
+        # first purge. Clear that reloadable data once more before export owns RAM.
+        self._release_large_caches_for_export()
+        self.status.set("开始导出…")
+        self._run_worker(self._export_worker, *export_args, error_kind="export_error")
 
     def _release_large_caches_for_export(self) -> None:
         """Free decoded source caches before OpenCV starts the 16-bit export.
@@ -7558,6 +7883,7 @@ F1：显示本快捷键表""")
         """
         self.exact_preview_generation += 1
         self.global_preview_generation += 1
+        self.prefetch_generation += 1
         with self.preview_cache_lock:
             self.full_display_cache.clear()
             self.full_precision_cache.clear()
@@ -7565,6 +7891,9 @@ F1：显示本快捷键表""")
             self.full_precision_cache_bytes = 0
             self.preview_cache.clear()
             self.preview_cache_bytes = 0
+            self.base_preview_cache.clear()
+            self.layer_preview_cache.clear()
+            self.layer_preview_cache_bytes = 0
             self.viewport_cache.clear()
             self.viewport_cache_bytes = 0
         self.global_labeled_preview_rgb = None
@@ -7629,8 +7958,12 @@ F1：显示本快捷键表""")
                     ),
                 ))
             aligned16, original16 = decoded[source_path], decoded[original_path]
-            if aligned16.shape[:2] != (height, width) or original16.shape[:2] != (height, width):
-                raise ValueError(f"尺寸不一致：{source_path.name}")
+            if aligned16.shape[:2] != (height, width):
+                if source_path == original_path:
+                    aligned16 = place_source_on_canvas(aligned16, height, width)
+                else:
+                    raise ValueError(f"尺寸不一致：{source_path.name}")
+            original16 = place_source_on_canvas(original16, height, width)
             crop_spec = strokes_for_composite_crop(
                 strokes, width, height, bool(adjustment.get("auto_optimize", True))
             )
@@ -7821,17 +8154,18 @@ F1：显示本快捷键表""")
                 marked, pairs, toolkit, dataset_path, self.ranker_model,
                 user_model_file_path(),
                 lambda value, text: self.work_queue.put(("progress", value, text)),
+                user_dataset_file_path(),
             )
             return "learned", report
         except Exception as exc:
             return "learning_failed", str(exc), traceback.format_exc()
 
-    def _run_worker(self, function, *args) -> None:
+    def _run_worker(self, function, *args, error_kind: str = "error") -> None:
         def runner():
             try:
                 self.work_queue.put(function(*args))
             except Exception as exc:
-                self.work_queue.put(("error", str(exc), traceback.format_exc()))
+                self.work_queue.put((error_kind, str(exc), traceback.format_exc()))
         threading.Thread(target=runner, daemon=True).start()
 
     def _poll_queue(self) -> None:
@@ -7997,21 +8331,35 @@ F1：显示本快捷键表""")
                     incremental = None
                     if applied == 1 and local_change is not None:
                         reference, before = local_change
-                        incremental = self._incremental_recomposed_object_image(
-                            reference, before, include_selected=True
+                        # Auto-optimization changes only this object's blend
+                        # parameters. Apply its before/after pixel delta; there
+                        # is no reason to reconstruct overlapping meteors.
+                        incremental = self._incremental_adjusted_object_image(
+                            before, reference
                         )
+                        if incremental is None:
+                            incremental = self._incremental_recomposed_object_image(
+                                reference, before, include_selected=True
+                            )
                     if incremental is not None:
-                        self._commit_incremental_global_preview(incremental, validate=False)
-                    elif applied:
+                        self._commit_incremental_global_preview(
+                            incremental, validate=False, dirty_box=self.last_incremental_box
+                        )
+                    elif applied and requested > 1:
                         self._invalidate_global_preview()
                         self._render_preview()
                     self._load_selected_object_adjustments()
                     self._update_tree_status()
                     self._schedule_autosave()
-                    self.status.set(
-                        f"逐流星自动融合优化完成（{strength}）：已更新 {applied}/{requested} 颗；"
-                        "当前画布将自动按原始像素更新"
-                    )
+                    if applied == 1 and requested == 1:
+                        self.status.set(
+                            f"当前流星自动融合优化完成（{strength}）；仅更新该流星局部，"
+                            "未启动总融合或原始像素整图任务"
+                        )
+                    else:
+                        self.status.set(
+                            f"逐流星自动融合优化完成（{strength}）：已更新 {applied}/{requested} 颗"
+                        )
                 elif kind == "progress":
                     _, value, text = item
                     self.progress["value"] = value
@@ -8082,6 +8430,8 @@ F1：显示本快捷键表""")
                     )
                 elif kind == "exported":
                     _, run_dir, count, learn_after_export, marked, pairs, original_paths, output_mode = item
+                    self.export_running = False
+                    self.export_button.configure(state="normal", text="导出合成结果")
                     self.last_export_path = Path(run_dir)
                     self.progress["value"] = 100
                     self.status.set(f"导出完成：{run_dir}")
@@ -8129,7 +8479,7 @@ F1：显示本快捷键表""")
                     validation = report["validation"]
                     if report["accepted"]:
                         self.ranker_model = load_meteor_ranker()
-                        self.ai_model_status.set("AI模型：个性化")
+                        self.ai_model_status.set(meteor_model_status(self.ranker_model))
                         self.status.set("个性化 AI 学习完成并已启用")
                         messagebox.showinfo(
                             APP_NAME + " — AI 学习完成",
@@ -8157,9 +8507,16 @@ F1：显示本快捷键表""")
                         parent=self,
                         details=details,
                     )
+                elif kind == "export_error":
+                    _, text, details = item
+                    self.export_running = False
+                    self.export_button.configure(state="normal", text="导出合成结果")
+                    self.status.set("导出失败")
+                    show_copyable_error(APP_NAME + " — 导出失败", text, parent=self, details=details)
                 elif kind == "error":
                     _, text, details = item
                     self.shared_base_loading_signature = None
+                    self.global_preview_loading_signature = None
                     if self.exact_preview_loading_signature is not None:
                         self.exact_preview_loading_signature = None
                         self.exact_preview_status.set("精准预览：后台更新失败")

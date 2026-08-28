@@ -20,11 +20,11 @@ from meteor_composer import (
     adjust_composite_base_exposure,
     analyze_meteor_blend_parameters,
     active_stroke_keys,
-    merge_collinear_candidates,
+    calibrate_secondary_candidate_scores, merge_collinear_candidates,
     transformed_mask_crop, transformed_stroke_points, stroke_for_image_crop,
     strokes_for_composite_crop, preview_memory_budgets,
     estimate_trail_mask_geometry,
-    to_uint16,
+    to_uint16, place_source_on_canvas,
 )
 
 
@@ -37,6 +37,21 @@ class FakeVar:
 
     def set(self, value):
         self.value = value
+
+
+class SourceCanvasPlacementTests(unittest.TestCase):
+    def test_larger_panorama_centers_original_without_stretching(self):
+        source = np.arange(4 * 6 * 3, dtype=np.uint16).reshape(4, 6, 3)
+        placed = place_source_on_canvas(source, 8, 12)
+        self.assertEqual(placed.shape, (8, 12, 3))
+        np.testing.assert_array_equal(placed[2:6, 3:9], source)
+        self.assertFalse(np.any(placed[:2]))
+
+    def test_smaller_canvas_scales_source_to_fit(self):
+        source = np.full((8, 16, 3), 4000, dtype=np.uint16)
+        placed = place_source_on_canvas(source, 6, 6)
+        self.assertEqual(placed.shape, (6, 6, 3))
+        self.assertTrue(np.any(placed))
 
 
 class FloatTiffDisplayTests(unittest.TestCase):
@@ -182,6 +197,32 @@ class MeteorFragmentMergeTests(unittest.TestCase):
             self.candidate((105, 135), (195, 180)),
         ]
         self.assertEqual(len(merge_collinear_candidates(candidates)), 2)
+
+    def test_dsc08083_weak_gaps_become_one_candidate(self):
+        # Real detector output saved for DSC08083 before the regression fix.
+        candidates = [
+            self.candidate((1158, 192), (1167, 165), 66),
+            self.candidate((1134, 260), (1146, 223), 100),
+            self.candidate((1177, 136), (1186, 112), 60),
+        ]
+        merged = merge_collinear_candidates(candidates)
+        self.assertEqual(len(merged), 1)
+        self.assertGreater(merged[0][1], 150)
+
+    def test_distant_collinear_meteors_remain_independent(self):
+        candidates = [
+            self.candidate((100, 100), (130, 100)),
+            self.candidate((230, 100), (260, 100)),
+        ]
+        self.assertEqual(len(merge_collinear_candidates(candidates)), 2)
+
+    def test_short_weak_residual_does_not_outrank_obvious_meteor(self):
+        calibrated = calibrate_secondary_candidate_scores([
+            (64, (1135, 261), (1184, 108), 100.0),
+            (76, (1053, 224), (1055, 183), 47.0),
+        ])
+        self.assertEqual(calibrated[0][0], 64)
+        self.assertEqual(calibrated[1][0], 49)
 
 
 class ScreeningExportHandoffTests(unittest.TestCase):
@@ -719,6 +760,30 @@ class MeteorBrightnessTests(unittest.TestCase):
         self.assertLessEqual(int(weak_block_error.max()), 1)
         self.assertGreater(int(result[54:59, 90:110].max()), 170)
 
+    def test_cleanup_preserves_continuous_faint_tail_beyond_bright_core(self):
+        base = np.full((120, 260, 3), (28, 34, 43), dtype=np.uint8)
+        source = base.copy()
+        # A broad manual mask surrounds one meteor whose two faint tapered ends
+        # sit well below the seed threshold used to find its bright core.
+        cv2.line(source, (28, 61), (88, 59), (39, 47, 57), 3, cv2.LINE_AA)
+        cv2.line(source, (86, 59), (174, 56), (205, 220, 238), 4, cv2.LINE_AA)
+        cv2.line(source, (172, 56), (232, 54), (39, 47, 57), 3, cv2.LINE_AA)
+        # This similarly faint residual is inside the painted area but is not
+        # continuous with the meteor direction, so it must still be rejected.
+        source[77:84, 104:156] = np.clip(
+            source[77:84, 104:156].astype(np.int16) + np.asarray((8, 2, 10)),
+            0, 255,
+        ).astype(np.uint8)
+        stroke = Stroke([(22 / 259, 62 / 119), (238 / 259, 53 / 119)], 34, 12)
+        result, _mask = compose_meteor_objects(
+            source, base, [stroke], False, False, 15, 25,
+            "自然融合", True, 100, 88, True,
+        )
+        residual = np.maximum(result.astype(np.int16) - base.astype(np.int16), 0)
+        self.assertGreater(int(residual[57:64, 36:72].max()), 2)
+        self.assertGreater(int(residual[51:59, 192:224].max()), 2)
+        self.assertLessEqual(int(residual[78:83, 112:148].max()), 1)
+
     def test_two_meteors_can_use_different_brightness(self):
         base = np.full((100, 180, 3), 20, dtype=np.uint8)
         source = base.copy()
@@ -731,6 +796,25 @@ class MeteorBrightnessTests(unittest.TestCase):
             "自然融合", True, 100, 0,
         )
         self.assertGreater(int(result[65:76, 100:160].max()), int(result[23:34, 20:80].max()))
+
+    def test_overlapping_meteors_are_independent_of_object_order(self):
+        base = np.full((64, 96, 3), 10000, dtype=np.uint16)
+        source = base.copy()
+        cv2.line(source, (12, 32), (84, 32), (19000, 19000, 19000), 9, cv2.LINE_AA)
+        first = Stroke(
+            [(12 / 95, 32 / 63), (84 / 95, 32 / 63)], 16, 3,
+            brightness_override=200, auto_blend_enabled=False,
+        )
+        second = Stroke(
+            [(12 / 95, 32 / 63), (84 / 95, 32 / 63)], 16, 3,
+            brightness_override=60, auto_blend_enabled=False,
+        )
+        settings = (False, False, 0, 0, "自然融合", True, 100, 0, False)
+        forward, forward_mask = compose_meteor_objects(source, base, [first, second], *settings)
+        reverse, reverse_mask = compose_meteor_objects(source, base, [second, first], *settings)
+        np.testing.assert_array_equal(forward, reverse)
+        np.testing.assert_array_equal(forward_mask, reverse_mask)
+        self.assertGreater(int(forward[32, 48, 0]), int(base[32, 48, 0]))
 
     def test_unrelated_star_inside_feather_is_not_pasted(self):
         base = np.full((100, 190, 3), 25, dtype=np.uint8)

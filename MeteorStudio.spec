@@ -1,15 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-import shutil
-
-
-ffmpeg_path = shutil.which('ffmpeg')
-
 
 a = Analysis(
     ['meteor_composer.py'],
     pathex=[],
-    binaries=[(ffmpeg_path, '.')] if ffmpeg_path else [],
+    binaries=[],
     datas=[('meteor_ranker.json', '.'), ('candidate_dataset.npz', '.')],
     hiddenimports=['meteor_learning', 'video_meteor', 'alignment_workspace', 'ptgui_pipeline', 'meteor_screening', 'gui_interaction_smoke', 'editable_composite_smoke'],
     hookspath=[],

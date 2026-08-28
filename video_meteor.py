@@ -8,6 +8,7 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 from dataclasses import asdict, dataclass, field
@@ -21,7 +22,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk
 from platform_utils import open_folder
-from error_dialog import show_copyable_error, show_runtime_log
+from error_dialog import append_runtime_log, show_copyable_error, show_runtime_log
 
 
 VIDEO_PROJECT_VERSION = 3
@@ -672,6 +673,8 @@ def render_video(
         command += ["-i", str(video_path), "-map", "0:v:0", "-map", "1:a?"]
     else:
         command += ["-map", "0:v:0", "-an"]
+    if info.width % 2 or info.height % 2:
+        command += ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
     command += [
         "-c:v", "libx264", "-profile:v", "main", "-bf", "0", "-refs", "1",
         "-g", str(max(1, round(info.fps))), "-keyint_min", str(max(1, round(info.fps))),
@@ -695,7 +698,8 @@ def render_video(
             command += ["-filter:a", atempo_filter(background_speed), "-c:a", "aac", "-b:a", "320k"]
         command += ["-shortest"]
     command += ["-movflags", "+faststart", str(output_path)]
-    encoder = subprocess.Popen(command, stdin=subprocess.PIPE)
+    stderr_file = tempfile.TemporaryFile(mode="w+b")
+    encoder = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=stderr_file)
     if encoder.stdin is None:
         raise RuntimeError("无法启动视频编码器")
     capture = cv2.VideoCapture(str(video_path))
@@ -726,6 +730,7 @@ def render_video(
                 del cache[old]
         return cache[source_index]
 
+    render_error: Exception | None = None
     try:
         for output_index in range(output_total):
             source_position = min(info.frames - 1, output_index * background_speed)
@@ -750,11 +755,22 @@ def render_video(
             encoder.stdin.write(frame.tobytes())
             if output_index % 20 == 0:
                 progress(25.0 + (output_index + 1) / output_total * 74.0, f"渲染视频 {output_index + 1}/{output_total}")
+    except Exception as exc:
+        render_error = exc
     finally:
         capture.release()
-        encoder.stdin.close()
-    if encoder.wait() != 0:
-        raise RuntimeError("FFmpeg 编码失败")
+        try:
+            encoder.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+    return_code = encoder.wait()
+    stderr_file.seek(0)
+    ffmpeg_details = stderr_file.read().decode("utf-8", errors="replace").strip()
+    stderr_file.close()
+    if render_error is not None or return_code != 0:
+        details = ffmpeg_details or str(render_error or "未知 FFmpeg 错误")
+        append_runtime_log("视频编码失败", details)
+        raise RuntimeError(f"FFmpeg 编码失败：\n{details}") from render_error
 
     progress(100.0, f"导出完成：{output_path.name}")
     return output_path
@@ -844,7 +860,7 @@ class VideoMeteorWindow(tk.Toplevel):
             header,
             text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
         ).pack(side="left", padx=14)
-        ttk.Button(header, text="返回图片合成工作区", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="返回流星合成工作区", command=self.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
@@ -1774,8 +1790,9 @@ class VideoMeteorWindow(tk.Toplevel):
             temporary = self.autosave_file.with_suffix(".writing.json")
             temporary.write_text(data, encoding="utf-8")
             temporary.replace(self.autosave_file)
-        except Exception:
-            pass
+        except Exception as exc:
+            append_runtime_log("视频项目自动保存失败", traceback.format_exc())
+            self.status.set(f"自动保存失败：{exc}")
 
     def _restore_autosave(self) -> None:
         if not self.autosave_file.is_file():
@@ -1784,7 +1801,8 @@ class VideoMeteorWindow(tk.Toplevel):
             self._apply_project_data(json.loads(self.autosave_file.read_text(encoding="utf-8")))
             self.status.set("已自动恢复上次视频项目")
         except Exception:
-            pass
+            append_runtime_log("视频项目自动恢复失败", traceback.format_exc())
+            self.status.set("自动恢复失败；可从运行日志复制详细信息")
 
     def save_project(self) -> None:
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("流星影像项目", "*.json")], initialfile="流星视频项目.json")

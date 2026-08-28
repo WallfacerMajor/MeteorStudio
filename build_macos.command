@@ -25,6 +25,7 @@ args=(
   --hidden-import video_meteor
   --hidden-import alignment_workspace
   --hidden-import ptgui_pipeline
+  --hidden-import meteor_screening
   --hidden-import gui_interaction_smoke
   --exclude-module torch
   --exclude-module torchvision

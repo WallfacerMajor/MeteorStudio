@@ -4,13 +4,26 @@ from __future__ import annotations
 
 import tkinter as tk
 import threading
+import os
+import sys
 from collections import deque
 from datetime import datetime
+from pathlib import Path
 from tkinter import ttk
 
 
 _LOG_ENTRIES: deque[str] = deque(maxlen=500)
 _LOG_LOCK = threading.Lock()
+
+
+def _runtime_log_path() -> Path:
+    if sys.platform == "win32":
+        root = Path(os.environ.get("APPDATA", str(Path.home())))
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support"
+    else:
+        root = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share")))
+    return root / "MeteorComposer" / "runtime.log"
 
 
 def append_runtime_log(message: object, details: object | None = None) -> None:
@@ -21,12 +34,30 @@ def append_runtime_log(message: object, details: object | None = None) -> None:
         entry += "\n" + detail_text
     with _LOG_LOCK:
         _LOG_ENTRIES.append(entry)
+        try:
+            path = _runtime_log_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(entry + "\n\n")
+            if path.stat().st_size > 2 << 20:
+                content = path.read_bytes()[-(1 << 20):]
+                path.write_bytes(content)
+        except OSError:
+            pass
 
 
 def runtime_log_text() -> str:
     with _LOG_LOCK:
+        try:
+            path = _runtime_log_path()
+            if path.is_file():
+                value = path.read_text(encoding="utf-8", errors="replace").strip()
+                if value:
+                    return value
+        except OSError:
+            pass
         values = list(_LOG_ENTRIES)
-    return "\n\n".join(values) if values else "当前还没有错误或诊断信息。"
+        return "\n\n".join(values) if values else "当前还没有错误或诊断信息。"
 
 
 def show_runtime_log(parent: tk.Misc, title: str = "运行日志／错误详情") -> None:
@@ -92,6 +123,10 @@ def show_runtime_log(parent: tk.Misc, title: str = "运行日志／错误详情"
     def clear_log():
         with _LOG_LOCK:
             _LOG_ENTRIES.clear()
+            try:
+                _runtime_log_path().unlink(missing_ok=True)
+            except OSError:
+                pass
         last_value[0] = None
 
     ttk.Button(buttons, text="清空日志", command=clear_log).pack(side="left")
