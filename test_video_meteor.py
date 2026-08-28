@@ -17,6 +17,7 @@ from video_meteor import (
     build_residual_layer,
     effect_strength,
     frame_candidates,
+    normalize_lsd_lines,
     prepare_layers,
     probe_video,
     render_video,
@@ -41,6 +42,17 @@ DEFAULTS = EventSettings(
 
 
 class VideoMeteorTests(unittest.TestCase):
+    def test_lsd_output_shape_is_cross_platform(self) -> None:
+        expected = np.asarray([[1, 2, 3, 4], [5, 6, 7, 8]], dtype=np.float32)
+        np.testing.assert_array_equal(
+            normalize_lsd_lines(expected.reshape(2, 1, 4)), expected
+        )
+        np.testing.assert_array_equal(normalize_lsd_lines(expected), expected)
+        np.testing.assert_array_equal(
+            normalize_lsd_lines(expected[0]), expected[:1]
+        )
+        self.assertEqual(normalize_lsd_lines(None).shape, (0, 4))
+
     def test_line_detection_and_residual(self) -> None:
         background = np.zeros((180, 320, 3), dtype=np.uint8)
         target = background.copy()

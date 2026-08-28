@@ -178,6 +178,18 @@ def line_metrics(
     return score, length
 
 
+def normalize_lsd_lines(lines: np.ndarray | None) -> np.ndarray:
+    """Return OpenCV LSD output as N x 4 on every supported OpenCV build."""
+    if lines is None:
+        return np.empty((0, 4), dtype=np.float32)
+    array = np.asarray(lines, dtype=np.float32)
+    if array.size == 0 or array.size % 4:
+        return np.empty((0, 4), dtype=np.float32)
+    # OpenCV wheels have returned both (N, 1, 4) and (N, 4), depending on
+    # platform/version.  A single segment may also arrive as a flat (4,) row.
+    return array.reshape(-1, 4)
+
+
 def frame_candidates(
     target: np.ndarray,
     background: np.ndarray,
@@ -207,10 +219,11 @@ def frame_candidates(
 
     detector = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
     detected = detector.detect(np.uint8(np.clip(spatial * 5.0, 0, 255)))[0]
-    if detected is None:
+    detected_lines = normalize_lsd_lines(detected)
+    if detected_lines.size == 0:
         return []
     ranked: list[tuple[float, np.ndarray, float]] = []
-    for raw in detected[:, 0, :]:
+    for raw in detected_lines:
         score, length = line_metrics(temporal, spatial, allowed, raw)
         if score > 0.8:
             ranked.append((score, raw.astype(np.float32), length))
