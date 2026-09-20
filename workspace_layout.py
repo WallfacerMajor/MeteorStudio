@@ -61,7 +61,7 @@ def scroll_controls(frame, width=340, reflow=True):
     children = list(frame.pack_slaves())
     for child in children:
         child.pack_forget()
-    canvas = tk.Canvas(frame, width=width, highlightthickness=0, background='#101824')
+    canvas = tk.Canvas(frame, width=width, highlightthickness=0, background='#292929')
     bar = ttk.Scrollbar(frame, orient='vertical', command=canvas.yview)
     bar.pack(side='right', fill='y')
     canvas.pack(fill='both', expand=True)
@@ -69,7 +69,7 @@ def scroll_controls(frame, width=340, reflow=True):
     content = ttk.Frame(canvas, padding=(4, 4, 8, 8))
     item = canvas.create_window(0, 0, window=content, anchor='nw')
     canvas.bind('<Configure>', lambda e: canvas.itemconfigure(item, width=e.width))
-    content.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+    content.bind('<Configure>', lambda e: canvas.configure(scrollregion=(0, 0, e.width, max(e.height, canvas.winfo_height()))))
     frame._inspector_canvas = canvas
     frame._inspector_scrolled_widgets = tuple(children)
     for child in children:

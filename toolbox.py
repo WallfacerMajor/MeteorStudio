@@ -70,7 +70,7 @@ def menu_level(path=(), nodes=TOOL_MENU):
 
 
 def tool_menu_button(parent, app):
-    button = ttk.Menubutton(parent, text="工具菜单 ▾")
+    button = ttk.Menubutton(parent, text="工具")
     menu = tk.Menu(button, tearoff=False)
     def populate(parent_menu, nodes, path=()):
         for node in nodes:
@@ -86,7 +86,7 @@ def tool_menu_button(parent, app):
 
 
 def settings_menu_button(parent):
-    button = ttk.Menubutton(parent, text="设置 ▾")
+    button = ttk.Menubutton(parent, text="设置")
     menu = tk.Menu(button, tearoff=False)
     owner = parent.winfo_toplevel()
     menu.add_command(label="外部软件与路径…", command=lambda: show_software_settings(owner))
@@ -257,7 +257,7 @@ def build_home(app, menu_path=()) -> ttk.Frame:
     ttk.Label(home, text=ancestors[-1].title if ancestors else PRODUCT_NAME, style="Hero.TLabel").pack(anchor="w", pady=(8, 4))
     ttk.Label(home, text=ancestors[-1].description if ancestors else "选择工具分类，开始处理你的星野作品。", style="Muted.TLabel").pack(anchor="w", pady=(0, 22))
     cards = ttk.Frame(home)
-    cards.pack(fill="both", expand=True)
+    cards.pack(fill="x")
     home.tool_buttons = {}
     for index, spec in enumerate(nodes):
         card = ttk.LabelFrame(cards, text=f"0{index + 1}   {spec.title}", padding=16)
@@ -271,5 +271,5 @@ def build_home(app, menu_path=()) -> ttk.Frame:
     for col in range(2):
         cards.columnconfigure(col, weight=1, uniform="tool")
     for row in range((len(nodes) + 1) // 2):
-        cards.rowconfigure(row, weight=1)
+        cards.rowconfigure(row, weight=0)
     return home

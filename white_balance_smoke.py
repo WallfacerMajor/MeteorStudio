@@ -19,15 +19,8 @@ def exercise_white_balance(root, window):
         assert predicate(), window.status.get()
         pump(root, 1.4)
     def reveal(widget):
-        for _ in range(100):
-            top = window.control_canvas.winfo_rooty()
-            bottom = top + window.control_canvas.winfo_height()
-            y = widget.winfo_rooty()
-            if top <= y and y + widget.winfo_height() <= bottom:
-                return
-            window.control_canvas.event_generate("<Button-4>" if y < top else "<Button-5>")
-            pump(root, .015)
-        raise AssertionError("Control is not reachable")
+        from toolbox_smoke import reveal_control
+        reveal_control(root, widget)
     with tempfile.TemporaryDirectory() as folder:
         source = Path(folder) / "source"
         source.mkdir()
@@ -154,15 +147,18 @@ def exercise_white_balance(root, window):
             if item["status"] == "complete":
                 np.testing.assert_array_equal(tifffile.imread(Path(item["output"]) / "result.tif"), result)
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        view = (window.zoom, window.center, window.canvas.bbox(window.image_item), window.canvas.winfo_width(), window.canvas.winfo_height())
+        reveal(window.sliders[0])
+        pump(root, 1.45)
+        assert view == (window.zoom, window.center, window.canvas.bbox(window.image_item), window.canvas.winfo_width(), window.canvas.winfo_height())
         capture(window, "white-balance.png")
         window.state("normal")
         window.geometry("850x600")
         pump(root, 1.5)
-        for _ in range(20):
-            window.control_canvas.event_generate("<Button-5>")
-        pump(root, .3)
-        top = window.control_canvas.winfo_rooty()
-        bottom = top + window.control_canvas.winfo_height()
+        reveal(window.load_button)
+        pump(root, 1.45)
+        top = window.calibration_canvas.winfo_rooty()
+        bottom = top + window.calibration_canvas.winfo_height()
         assert top <= window.load_button.winfo_rooty() < bottom
         assert window.export_button.winfo_ismapped() and window.canvas.winfo_height() > 100
         assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()

@@ -16,7 +16,7 @@ def exercise_settings(app):
         specs = tuple(SoftwareSpec(s.key, s.title, ()) for s in SOFTWARE)
         registry = lambda: SoftwareRegistry(folder/'software.json', specs)
         with patch('toolbox.SoftwareRegistry', side_effect=registry), patch('toolbox.filedialog.askopenfilename', return_value=str(executable)):
-            button = next(w for w in widgets(app.toolbox_home) if isinstance(w, ttk.Menubutton) and w.cget('text') == '设置 ▾')
+            button = next(w for w in widgets(app.toolbox_home) if isinstance(w, ttk.Menubutton) and w.cget('text') == '设置')
             assert not any(isinstance(w, ttk.LabelFrame) and '外部软件' in w.cget('text') for w in widgets(app.toolbox_home))
             def save_dialog():
                 try:
