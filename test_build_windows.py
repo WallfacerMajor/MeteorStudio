@@ -9,6 +9,7 @@ class WindowsBuildConfigurationTests(unittest.TestCase):
         self.assertIn("meteor_detection", HIDDEN_IMPORTS)
         arguments = pyinstaller_arguments(r"C:\tools\ffmpeg.exe")
         self.assertIn(r"C:\tools\ffmpeg.exe;.", arguments)
+        self.assertEqual(arguments[arguments.index('--collect-data') + 1], 'setuptools._vendor.jaraco.text')
 
     def test_build_without_ffmpeg_has_no_empty_binary_argument(self):
         arguments = pyinstaller_arguments(None)

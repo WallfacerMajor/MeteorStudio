@@ -22,6 +22,7 @@ args=(
   --windowed
   --name MeteorStudio
   --icon build/app-icons/nightscape.icns
+  --collect-data setuptools._vendor.jaraco.text
   --osx-bundle-identifier com.wallfacemajor.meteorstudio
   --hidden-import background_tasks
   --hidden-import meteor_detection

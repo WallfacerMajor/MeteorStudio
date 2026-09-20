@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_data_files
 import sys
 sys.path.insert(0, SPECPATH)
 from app_icon import build_icons
@@ -10,7 +11,8 @@ a = Analysis(
     ['meteor_composer.py'],
     pathex=[],
     binaries=[('C:/Users/meijie/AppData/Local/Microsoft/WinGet/Packages/Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/ffmpeg-7.1-full_build/bin/ffmpeg.EXE', '.')],
-    datas=[('meteor_ranker.json', '.'), ('candidate_dataset.npz', '.')],
+    datas=[('meteor_ranker.json', '.'), ('candidate_dataset.npz', '.')]
+          + collect_data_files('setuptools._vendor.jaraco.text'),
     hiddenimports=['background_tasks', 'meteor_detection', 'meteor_learning', 'video_meteor', 'alignment_workspace', 'ptgui_pipeline', 'meteor_screening', 'preview_viewer', 'gui_interaction_smoke', 'editable_composite_smoke'],
     hookspath=[],
     hooksconfig={},

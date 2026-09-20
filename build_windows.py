@@ -25,6 +25,7 @@ def pyinstaller_arguments(ffmpeg: str | None) -> list[str]:
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--windowed", "--name", "MeteorStudio",
         "--icon", str(ROOT / "build" / "app-icons" / "nightscape.ico"),
+        "--collect-data", "setuptools._vendor.jaraco.text",
     ]
     for module in HIDDEN_IMPORTS:
         arguments.extend(("--hidden-import", module))
@@ -53,6 +54,9 @@ def main() -> int:
     if ffmpeg is None:
         print("警告：未找到 FFmpeg，视频导出将要求目标电脑自行安装 FFmpeg。")
     subprocess.run(pyinstaller_arguments(ffmpeg), cwd=ROOT, check=True)
+    resource = ROOT / "dist" / "MeteorStudio" / "_internal" / "setuptools" / "_vendor" / "jaraco" / "text" / "Lorem ipsum.txt"
+    if not resource.is_file():
+        raise RuntimeError(f"打包缺少启动资源：{resource}")
     return 0
 
 
