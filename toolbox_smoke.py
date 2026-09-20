@@ -47,7 +47,30 @@ def run_smoke(app):
     pump(app, 0.4)
     assert app.toolbox_home.winfo_ismapped()
     capture(app, "toolbox.png")
-    assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points"}
+    assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points", "laboratory"}
+    click(app, app.toolbox_home.tool_buttons["laboratory"])
+    assert set(app.toolbox_home.tool_buttons) == {"trails", "mean", "quality"}
+    click(app, app.toolbox_home.tool_buttons["mean"])
+    lab = app.laboratory_window
+    with tempfile.TemporaryDirectory() as lab_folder:
+        import numpy as np
+        import tifffile
+        source = Path(lab_folder) / "source"
+        source.mkdir()
+        paths = [source / f"{i}.tif" for i in range(2)]
+        for path in paths:
+            tifffile.imwrite(path, np.full((48, 64, 3), 12345, np.uint16), photometric="rgb")
+        with patch("laboratory_workspace.filedialog.askopenfilenames", return_value=tuple(map(str, paths))):
+            click(app, lab.add_button)
+        lab.destination.set(str(Path(lab_folder) / "output"))
+        click(app, lab.start_button)
+        pump(app, 1.6)
+        assert not lab.busy and lab.result
+        assert np.all(tifffile.imread(lab.result / "result.tif") == 12345)
+        capture(lab, "laboratory.png")
+    lab._request_close()
+    pump(app, 1.4)
+    app.show_toolbox()
     click(app, app.toolbox_home.tool_buttons["control_points"])
     assert app._toolbox_path == ("control_points",)
     capture(app, "control-points-submenu.png")

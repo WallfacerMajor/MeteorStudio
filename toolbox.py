@@ -45,6 +45,11 @@ class ToolGroup:
 TOOL_MENU = (
     ToolGroup("meteor", "流星工具", "批量筛选、星空对齐、蒙版合成与视频动态", tuple(item for item in WORKSPACES if item.key != "control_points")),
     ToolGroup("control_points", "控制点生成", "连接外部软件，为星野照片自动生成控制点", (WORKSPACES[1],)),
+    ToolGroup("laboratory", "实验室", "探索星轨、降噪与画质分析 · 独立输出，保留原片", (
+        WorkspaceSpec("trails", "星轨叠加", "固定机位 · 取亮叠加 · 16 位 TIFF", "open_lab_trails"),
+        WorkspaceSpec("mean", "已对齐降噪", "平均叠加 · 保持原始尺寸 · 16 位 TIFF", "open_lab_mean"),
+        WorkspaceSpec("quality", "批量画质体检", "清晰度 · 背景亮度 · 过曝比例 · CSV", "open_lab_quality"),
+    )),
 )
 
 

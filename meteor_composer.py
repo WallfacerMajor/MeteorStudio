@@ -2628,7 +2628,7 @@ class MeteorComposer(tk.Tk):
     def navigate_tool(self, spec, menu_path) -> None:
         # A submenu can be used from any workspace. Honour its close/save and
         # cancellation flow before creating the next one.
-        for attribute in ("alignment_window", "screening_window", "video_window"):
+        for attribute in ("alignment_window", "screening_window", "video_window", "laboratory_window"):
             window = getattr(self, attribute, None)
             if window is not None and window.winfo_exists():
                 close = getattr(window, "_request_close", None) or getattr(window, "_close_window", None) or window.destroy
@@ -2640,6 +2640,20 @@ class MeteorComposer(tk.Tk):
 
     def open_control_points_workspace(self) -> None:
         self.open_alignment_workspace(control_points_only=True)
+
+    def open_lab_trails(self):
+        self._open_laboratory("trails")
+
+    def open_lab_mean(self):
+        self._open_laboratory("mean")
+
+    def open_lab_quality(self):
+        self._open_laboratory("quality")
+
+    def _open_laboratory(self, mode):
+        from laboratory_workspace import LaboratoryWindow
+        self.laboratory_window = LaboratoryWindow(self, mode)
+        self._activate_child_workspace(self.laboratory_window, "laboratory_window")
 
     def open_video_workspace(self) -> None:
         if self.video_window is not None:
@@ -2709,6 +2723,8 @@ class MeteorComposer(tk.Tk):
         close = getattr(window, "_request_close", None) or getattr(window, "_close_window", None) or window.destroy
         category = ("control_points",) if attribute == "alignment_window" and window.control_points_only.get() else ("meteor",)
         category_title = "控制点生成" if category[0] == "control_points" else "流星工具"
+        if attribute == "laboratory_window":
+            category, category_title = ("laboratory",), "实验室"
         def return_home():
             close()
             if not window.winfo_exists():
