@@ -4,12 +4,17 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from toolbox import SoftwareRegistry, SoftwareSpec, WORKSPACES, TOOL_MENU, ToolGroup, menu_level
+from toolbox import SoftwareRegistry, SoftwareSpec, WORKSPACES, TOOL_MENU, ToolGroup, menu_level, iter_tools
 from background_tasks import BackgroundTaskScheduler
 from ptgui_pipeline import run_alignment_pipeline
 
 
 class ToolboxTests(unittest.TestCase):
+    def test_all_tools_are_available_without_category_pages(self):
+        entries = list(iter_tools(TOOL_MENU))
+        self.assertEqual(len(entries), 10)
+        self.assertEqual(len({spec.key for spec, path in entries}), 10)
+
     def test_hierarchy_supports_nested_categories(self):
         nodes, ancestors = menu_level(("meteor",))
         self.assertEqual({node.key for node in nodes}, {"screening", "alignment", "composite", "video"})

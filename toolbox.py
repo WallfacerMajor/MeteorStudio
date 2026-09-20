@@ -69,18 +69,23 @@ def menu_level(path=(), nodes=TOOL_MENU):
     return nodes, ancestors
 
 
+def iter_tools(nodes, path=()):
+    for node in nodes:
+        if isinstance(node, ToolGroup):
+            yield from iter_tools(node.children, (*path, node.key))
+        else:
+            yield node, path
+
+
 def tool_menu_button(parent, app):
     button = ttk.Menubutton(parent, text="切换工具")
     menu = tk.Menu(button, tearoff=False)
-    def populate(parent_menu, nodes, path=()):
-        for node in nodes:
-            if isinstance(node, ToolGroup):
-                submenu = tk.Menu(parent_menu, tearoff=False)
-                populate(submenu, node.children, (*path, node.key))
-                parent_menu.add_cascade(label=node.title, menu=submenu)
-            else:
-                parent_menu.add_command(label=node.title, command=lambda spec=node, category=path: app.navigate_tool(spec, category))
-    populate(menu, TOOL_MENU)
+    for index, group in enumerate(TOOL_MENU):
+        if index:
+            menu.add_separator()
+        menu.add_command(label=group.title, state="disabled")
+        for spec, path in iter_tools(group.children, (group.key,)):
+            menu.add_command(label=spec.title, command=lambda item=spec, category=path: app.navigate_tool(item, category))
     button.configure(menu=menu)
     return button
 
@@ -241,33 +246,22 @@ class SoftwareRegistry:
 
 
 def build_home(app, menu_path=()) -> ttk.Frame:
-    nodes, ancestors = menu_level(menu_path)
-    home = ttk.Frame(app, padding=28)
+    """Keep categories visible, with one-click access to every workspace."""
+    home = ttk.Frame(app, padding=24)
     navigation = ttk.Frame(home)
-    navigation.pack(fill="x", pady=(0, 12))
-    settings_menu_button(navigation).pack(side="right", padx=8)
-    if menu_path:
-        ttk.Button(navigation, text="← 返回上级", command=lambda: app.show_toolbox(menu_path[:-1])).pack(side="left", padx=(0, 12))
-        ttk.Button(navigation, text=PRODUCT_NAME, command=app.show_toolbox).pack(side="left")
-        for index, group in enumerate(ancestors):
-            ttk.Label(navigation, text=" / ", style="Muted.TLabel").pack(side="left")
-            ttk.Button(navigation, text=group.title, command=lambda path=menu_path[:index + 1]: app.show_toolbox(path)).pack(side="left")
-    ttk.Label(home, text="N I G H T S C A P E   /   T O O L B O X", style="Muted.TLabel").pack(anchor="w")
-    ttk.Label(home, text=ancestors[-1].title if ancestors else PRODUCT_NAME, style="Hero.TLabel").pack(anchor="w", pady=(8, 4))
+    navigation.pack(fill="x", pady=(0, 18))
+    ttk.Label(navigation, text=PRODUCT_NAME, style="Hero.TLabel").pack(side="left")
+    settings_menu_button(navigation).pack(side="right")
     cards = ttk.Frame(home)
     cards.pack(fill="x")
     home.tool_buttons = {}
-    for index, spec in enumerate(nodes):
-        card = ttk.LabelFrame(cards, text=f"0{index + 1}   {spec.title}", padding=16)
-        card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=5, pady=5)
-        ttk.Label(card, text=spec.description, wraplength=270, style="Muted.TLabel").pack(anchor="w", pady=(0, 18))
-        group = isinstance(spec, ToolGroup)
-        callback = (lambda path=(*menu_path, spec.key): app.show_toolbox(path)) if group else (lambda item=spec: app.navigate_tool(item, menu_path))
-        button = ttk.Button(card, text="打开子菜单  →" if group else "进入工作区  →", style="Accent.TButton", command=callback)
-        button.pack(anchor="w", side="bottom")
-        home.tool_buttons[spec.key] = button
+    for index, group in enumerate(TOOL_MENU):
+        card = ttk.LabelFrame(cards, text=group.title, padding=14)
+        card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=5, pady=7)
+        for spec, path in iter_tools(group.children, (group.key,)):
+            button = ttk.Button(card, text=spec.title, command=lambda item=spec, category=path: app.navigate_tool(item, category))
+            button.pack(fill="x", pady=4)
+            home.tool_buttons[spec.key] = button
     for col in range(2):
         cards.columnconfigure(col, weight=1, uniform="tool")
-    for row in range((len(nodes) + 1) // 2):
-        cards.rowconfigure(row, weight=0)
     return home

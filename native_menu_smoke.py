@@ -68,7 +68,7 @@ def run_native_menu_smoke(root):
         assert sum(max(rgb)<140 for rgb in picture.getdata()) > picture.width*picture.height*.6, 'Hover background became light'
         assert sum(min(rgb)>160 for rgb in picture.getdata()) > 15, 'Hover text disappeared'
         reports[label+'_hover'] = 'passed'
-    for label, button, down in (('tools', tools, 1), ('settings', settings, 2), ('context', probe, 0)):
+    for label, button, down in (('tools', tools, 0), ('settings', settings, 2), ('context', probe, 0)):
         failures = []
         def observer():
             try:

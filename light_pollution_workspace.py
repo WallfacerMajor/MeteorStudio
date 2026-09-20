@@ -168,7 +168,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         identity, events = self.generation, self.events
         self.busy = True
         self.controls()
-        self.status.set('正在读取照片…' if kind == 'loaded' else '正在估计平滑背景…' if kind == 'modeled' else '正在从原始像素导出…')
+        self.status.set('正在读取照片…' if kind == 'loaded' else '正在估计平滑背景…' if kind == 'modeled' else '正在导出…')
         self.task_token = self.scheduler.submit('operation', work,
             on_result=lambda result: events.put((kind, identity, result)),
             on_error=lambda exc, detail: events.put(('error', identity, (str(exc), detail))))
@@ -326,5 +326,5 @@ class LightPollutionWindow(WhiteBalanceWindow):
         if self.busy and self.task_token.cancelled and self.scheduler.active_count('operation') == 0:
             self.busy = False
             self.controls()
-            self.status.set('已取消，原片未修改')
+            self.status.set('已取消')
         self.after(60, self.poll)

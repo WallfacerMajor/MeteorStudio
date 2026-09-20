@@ -2309,12 +2309,8 @@ class MeteorComposer(tk.Tk):
             ttk.Radiobutton(view_bar, **options, variable=self.view_mode, value=value, command=self._view_mode_changed).grid(row=0, column=index, sticky="w", padx=(0, 4))
         view_bar.columnconfigure(0, weight=1)
         view_bar.columnconfigure(1, weight=1)
-        quality_bar = ttk.Frame(inspector)
-        quality_bar.pack(fill="x")
         exact_bar = ttk.Frame(center)
         exact_bar.pack(fill="x", pady=(0, 4))
-        ttk.Label(quality_bar, textvariable=self.preview_quality_status, wraplength=200).pack(side="left")
-        ttk.Label(quality_bar, textvariable=self.exact_preview_status, wraplength=120).pack(side="left", padx=(8, 0))
         edit_history = ttk.Frame(inspector)
         edit_history.pack(fill="x", pady=4)
         self.undo_button = ttk.Button(edit_history, text="↶ 撤销", command=self.undo_stroke)
@@ -2419,14 +2415,13 @@ class MeteorComposer(tk.Tk):
         ttk.Label(mask_tools, textvariable=self.feather, width=4).grid(row=0, column=11)
 
         self.detect_current_button = ttk.Button(
-            mask_tools, text="本地模型分析当前单张", command=self.detect_current_candidates
+            mask_tools, text="检测当前照片", command=self.detect_current_candidates
         )
         self.detect_current_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0))
         ttk.Label(mask_tools, text="AI分数阈值").grid(row=1, column=2, pady=(7, 0))
         ttk.Scale(mask_tools, from_=1, to=100, variable=self.candidate_threshold, orient="horizontal", command=self._candidate_threshold_changed).grid(row=1, column=3, columnspan=2, sticky="ew", padx=5, pady=(7, 0))
         ttk.Label(mask_tools, textvariable=self.candidate_threshold, width=4).grid(row=1, column=5, pady=(7, 0))
         ttk.Label(mask_tools, textvariable=self.candidate_summary).grid(row=1, column=6, columnspan=3, sticky="w", padx=(12, 0), pady=(7, 0))
-        ttk.Label(mask_tools, textvariable=self.ai_model_status).grid(row=1, column=9, columnspan=3, sticky="e", pady=(7, 0))
 
         ttk.Button(mask_tools, text="撤销 Ctrl+Z", command=self.undo_stroke).grid(row=2, column=0, pady=(7, 0), sticky="ew")
         ttk.Button(mask_tools, text="清除此图蒙版", command=self.clear_strokes).grid(row=2, column=1, pady=(7, 0), padx=3, sticky="ew")
@@ -2602,7 +2597,7 @@ class MeteorComposer(tk.Tk):
         # frame submission and made the photograph appear to zoom by itself.
 
     def show_toolbox(self, menu_path=()) -> None:
-        self._toolbox_path = tuple(menu_path)
+        self._toolbox_path = ()
         self.composite_panel.pack_forget()
         if self.toolbox_home is not None:
             self.toolbox_home.destroy()
@@ -2610,7 +2605,7 @@ class MeteorComposer(tk.Tk):
         self.toolbox_home.pack(fill="both", expand=True)
 
     def show_composite_workspace(self) -> None:
-        self._toolbox_path = ("meteor",)
+        self._toolbox_path = ()
         if self.toolbox_home is not None:
             self.toolbox_home.pack_forget()
         self.composite_panel.pack(fill="both", expand=True)
@@ -2736,20 +2731,13 @@ class MeteorComposer(tk.Tk):
         navigation = ttk.Frame(window, padding=(12, 5))
         navigation.pack(side="top", fill="x", before=window.winfo_children()[0])
         close = getattr(window, "_request_close", None) or getattr(window, "_close_window", None) or window.destroy
-        category = ("control_points",) if attribute == "alignment_window" and window.control_points_only.get() else ("meteor",)
-        category_title = "控制点生成" if category[0] == "control_points" else "流星工具"
-        if attribute == "laboratory_window":
-            category, category_title = ("laboratory",), "实验室"
-        elif attribute in ("white_balance_window", "light_pollution_window"):
-            category, category_title = ("color",), "色彩工具"
         def return_home():
             close()
             if not window.winfo_exists():
-                self.show_toolbox(category)
-        ttk.Button(navigation, text=f"← 返回{category_title}", command=return_home).pack(side="left")
+                self.show_toolbox()
+        ttk.Button(navigation, text="← 工具箱", command=return_home).pack(side="left")
         tool_menu_button(navigation, self).pack(side="left", padx=8)
         settings_menu_button(navigation).pack(side="left")
-        ttk.Label(navigation, text=PRODUCT_NAME, style="Muted.TLabel").pack(side="right")
         def restore_main(event=None) -> None:
             if event is not None and event.widget is not window:
                 return
@@ -3031,7 +3019,7 @@ Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 
 右键所选流星：删除、重置或输入精确变换参数
 
 单张候选
-点击“本地模型分析当前单张”，再拖动候选评分阈值；阈值越低，加入的候选越多
+点击“检测当前照片”，再拖动候选评分阈值；阈值越低，加入的候选越多
 鼠标靠近候选轨迹：弹出“＋选中”按钮，点击后直接加入并锁定
 红色蒙版及候选分数默认显示；按住 H 可临时隐藏
 
@@ -4046,7 +4034,7 @@ F1：显示本快捷键表""")
         if hasattr(self, "auto_detect_button"):
             self.auto_detect_button.configure(state="normal", text="自动检测全部")
         if hasattr(self, "detect_current_button"):
-            self.detect_current_button.configure(state="normal", text="本地模型分析当前单张")
+            self.detect_current_button.configure(state="normal", text="检测当前照片")
 
     @staticmethod
     def _file_identity(path: Path) -> tuple[str, int, int]:
@@ -8772,7 +8760,7 @@ F1：显示本快捷键表""")
                         self.detect_current_button.configure(state="normal")
                     elif channel == "candidate_current":
                         self.detect_current_button.configure(
-                            state="normal", text="本地模型分析当前单张"
+                            state="normal", text="检测当前照片"
                         )
                     if failed:
                         error_kind, text, details = payload

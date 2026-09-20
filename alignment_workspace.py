@@ -121,7 +121,7 @@ class AlignmentWorkspace(tk.Toplevel):
         ttk.Label(settings, text="传感器对角线(mm)").grid(row=1, column=2, sticky="w", pady=(5, 0))
         ttk.Spinbox(settings, from_=1, to=100, increment=0.1, textvariable=self.sensor_diagonal, width=9).grid(row=1, column=3, padx=(5, 18), pady=(5, 0))
         ttk.Label(settings, text="星空区域").grid(row=1, column=4, sticky="w", pady=(5, 0))
-        ttk.Label(settings, text="逐张自动识别并生成星点蒙版").grid(row=1, column=5, columnspan=3, sticky="w", padx=5, pady=(5, 0))
+        ttk.Label(settings, text="自动识别").grid(row=1, column=5, columnspan=3, sticky="w", padx=5, pady=(5, 0))
         settings.columnconfigure(5, weight=1)
 
         laboratory = ttk.LabelFrame(lens_tab, text="对齐实验室", padding=8)

@@ -43,7 +43,7 @@ def run_smoke(app) -> dict:
     if tab_names != ["蒙版", "融合", "所选流星", "历史"]:
         raise AssertionError(f"Unexpected workspace tabs: {tab_names}")
     required_controls = {
-        "B ✎ 画笔", "E ▱ 橡皮擦", "本地模型分析当前单张", "自动检测全部",
+        "B ✎ 画笔", "E ▱ 橡皮擦", "检测当前照片", "自动检测全部",
         "保存项目", "载入项目", "自动优化当前流星", "自动优化全部流星",
         "重置底图曝光", "恢复自动值", "恢复原始融合", "导出合成结果",
         "↶ 撤销", "↷ 重做", "历史记录",

@@ -274,7 +274,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.schedule_render()
         self.busy = True
         self.controls()
-        self.status.set("读取原始像素并准备预览…")
+        self.status.set("正在读取照片…")
         self.load_id += 1
         identity, events = self.load_id, self.events
         path = Path(path)
@@ -327,7 +327,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         identity, events, pixels = self.candidate_id, self.events, self.levels[0]
         self.finding_candidates = True
         self.controls()
-        self.status.set("正在筛选平滑、未过曝的参考区域…")
+        self.status.set("正在推荐参考点…")
         self.scheduler.submit("candidates", lambda token: suggest_neutral_points(pixels, token),
             on_result=lambda result: events.put(("candidates", identity, result)),
             on_error=lambda exc, detail: events.put(("candidates_error", identity, (str(exc), detail))))
@@ -607,7 +607,7 @@ class WhiteBalanceWindow(tk.Toplevel):
                 self.controls()
                 self.canvas.itemconfigure(self.empty_item, state="hidden")
                 h, w = self.levels[0].shape[:2]
-                self.status.set(f"{self.source.name} · {w} × {h} · sRGB · 16 位处理")
+                self.status.set(f"{self.source.name} · {w} × {h}")
             elif kind == "preview" and data[0] is not None:
                 (pixels, position, clipped), zoom, original = data
                 self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
@@ -628,7 +628,7 @@ class WhiteBalanceWindow(tk.Toplevel):
                     self.folder_button.configure(state="normal")
                     self.status.set(f"{summary} · {self.result}")
                 else:
-                    self.status.set("已取消，原片未修改")
+                    self.status.set("已取消")
             elif kind.endswith("error"):
                 if kind == "candidates_error":
                     self.finding_candidates = False
@@ -644,7 +644,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         if self.busy and hasattr(self, "export_token") and self.export_token.cancelled and self.scheduler.active_count("export") == 0 and self.scheduler.active_count("load") == 0:
             self.busy = False
             self.controls()
-            self.status.set("已取消，原片未修改")
+            self.status.set("已取消")
         if self.winfo_exists():
             self.after(60, self.poll)
 

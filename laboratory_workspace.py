@@ -26,7 +26,6 @@ class LaboratoryWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         body = ttk.Frame(self, padding=(20, 16))
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="N I G H T S C A P E   /   L A B", style="Muted.TLabel").pack(anchor="w")
         ttk.Label(body, text=MODES[mode][0], style="Hero.TLabel").pack(anchor="w", pady=8)
         inspector = ttk.Frame(body, width=260)
         self.edit_inspector = inspector

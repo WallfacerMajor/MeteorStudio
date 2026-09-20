@@ -145,10 +145,18 @@ def run_smoke(app):
     pump(app, 0.3)
     assert app.toolbox_home.winfo_ismapped()
     capture(app, "toolbox.png")
-    assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points", "color", "laboratory"}
+    assert set(app.toolbox_home.tool_buttons) == {"screening", "alignment", "composite", "video", "control_points", "white_balance", "light_pollution", "trails", "mean", "quality"}
+    assert not any(isinstance(w, ttk.Button) and w.cget('text') in ('打开子菜单  →', '进入工作区  →') for w in widgets(app.toolbox_home))
+    app.geometry('1000x680+20+20')
+    pump(app, 1.4)
+    for button in app.toolbox_home.tool_buttons.values():
+        assert button.winfo_ismapped()
+        assert button.winfo_rooty()+button.winfo_height() <= app.winfo_rooty()+app.winfo_height()
+    capture(app, 'toolbox-small.png')
+    app.geometry('1280x820+20+20')
+    pump(app, .3)
     from software_settings_smoke import exercise_settings
     settings_checks = exercise_settings(app)
-    click(app, app.toolbox_home.tool_buttons["color"])
     click(app, app.toolbox_home.tool_buttons["white_balance"])
     from white_balance_smoke import exercise_white_balance
     white_balance_checks = exercise_white_balance(app, app.white_balance_window)
@@ -162,8 +170,6 @@ def run_smoke(app):
     pump(app, 1.4)
     assert app.light_pollution_window is None
     app.show_toolbox()
-    click(app, app.toolbox_home.tool_buttons["laboratory"])
-    assert set(app.toolbox_home.tool_buttons) == {"trails", "mean", "quality"}
     click(app, app.toolbox_home.tool_buttons["mean"])
     lab = app.laboratory_window
     from laboratory_smoke import exercise_laboratory
@@ -186,10 +192,33 @@ def run_smoke(app):
         capture(lab, "laboratory.png")
     lab._request_close()
     pump(app, 1.4)
+    for mode in ('trails', 'quality'):
+        click(app, app.toolbox_home.tool_buttons[mode])
+        lab = app.laboratory_window
+        assert lab.mode == mode
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder)/'input'
+            source.mkdir()
+            files = [source/f'{i}.tif' for i in range(2)]
+            for i, path in enumerate(files):
+                tifffile.imwrite(path, np.full((48,64,3), 1000+i*1000, np.uint16), photometric='rgb')
+            with patch('laboratory_workspace.filedialog.askopenfilenames', return_value=tuple(map(str,files))):
+                click(app, lab.add_button)
+            lab.destination.set(str(Path(folder)/'output'))
+            click(app, lab.start_button)
+            deadline = time.monotonic()+10
+            while lab.busy and time.monotonic()<deadline:
+                pump(app,.1)
+            assert lab.result and not lab.busy, lab.status.get()
+            if mode == 'trails':
+                assert np.all(tifffile.imread(lab.result/'result.tif') == 2000)
+            else:
+                assert list(lab.result.glob('*.csv'))
+            capture(lab, f'laboratory-{mode}.png')
+        back = next(w for w in widgets(lab) if isinstance(w, ttk.Button) and w.cget('text') == '← 工具箱')
+        click(app, back)
+        pump(app, 1.4)
     app.show_toolbox()
-    click(app, app.toolbox_home.tool_buttons["control_points"])
-    assert app._toolbox_path == ("control_points",)
-    capture(app, "control-points-submenu.png")
     click(app, app.toolbox_home.tool_buttons["control_points"])
     window = app.alignment_window
     assert app.state() == "withdrawn" and window.control_points_only.get()
@@ -232,17 +261,17 @@ def run_smoke(app):
             with patch("alignment_workspace.run_alignment_pipeline") as pipeline:
                 click(app, window.run_button)
                 assert not pipeline.called and errors
-    back = next(w for w in widgets(window) if isinstance(w, ttk.Button) and w.cget("text") == "← 返回控制点生成")
+    back = next(w for w in widgets(window) if isinstance(w, ttk.Button) and w.cget("text") == "← 工具箱")
     click(app, back)
     pump(app, 1.4)
     assert app.alignment_window is None and app.toolbox_home.winfo_ismapped()
-    assert app._toolbox_path == ("control_points",)
-    back = next(w for w in widgets(app.toolbox_home) if isinstance(w, ttk.Button) and w.cget("text") == "← 返回上级")
-    click(app, back)
     assert app._toolbox_path == ()
-    click(app, app.toolbox_home.tool_buttons["meteor"])
-    assert set(app.toolbox_home.tool_buttons) == {"screening", "alignment", "composite", "video"}
-    capture(app, "meteor-submenu.png")
+    click(app, app.toolbox_home.tool_buttons["alignment"])
+    assert app.alignment_window and not app.alignment_window.control_points_only.get()
+    capture(app.alignment_window, "alignment.png")
+    back = next(w for w in widgets(app.alignment_window) if isinstance(w, ttk.Button) and w.cget("text") == "← 工具箱")
+    click(app, back)
+    pump(app, 1.4)
     click(app, app.toolbox_home.tool_buttons["composite"])
     assert app.composite_panel.winfo_ismapped() and not app.toolbox_home.winfo_ismapped()
     capture(app, "composite.png")
@@ -253,7 +282,6 @@ def run_smoke(app):
         ("video", VideoMeteorWindow, "_restore_autosave", "_write_autosave", "video_window"),
     ):
         app.show_toolbox()
-        click(app, app.toolbox_home.tool_buttons["meteor"])
         with patch.object(cls, restore), patch.object(cls, save):
             click(app, app.toolbox_home.tool_buttons[key])
             child = getattr(app, attr)
@@ -288,7 +316,7 @@ def run_smoke(app):
             assert not (owned_timers & remaining), (attr, owned_timers & remaining)
             pump(app, 1.4)
             assert getattr(app, attr) is None and app.composite_panel.winfo_ismapped()
-    return {**settings_checks, **white_balance_checks, **light_pollution_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
+    return {**settings_checks, **white_balance_checks, **light_pollution_checks, **laboratory_checks, "direct_tool_entries": "passed", "return_to_toolbox": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
 
 
 if __name__ == "__main__":
