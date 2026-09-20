@@ -1,9 +1,12 @@
 """Shared right-side inspector layout; scrolling never resizes the image canvas."""
 import tkinter as tk
 from tkinter import ttk
+from itertools import count
+
+_gradient_ids = count()
 
 
-def parameter_slider(parent, title, variable, lower, upper, command=None):
+def parameter_slider(parent, title, variable, lower, upper, command=None, colors=None):
     """Compact editor row with aligned numeric readout above the slider."""
     row = ttk.Frame(parent)
     row.pack(fill='x', pady=(8, 4))
@@ -16,6 +19,29 @@ def parameter_slider(parent, title, variable, lower, upper, command=None):
     scale = ttk.Scale(row, from_=lower, to=upper, variable=variable,
                       command=command, style='Editor.Horizontal.TScale')
     scale.pack(fill='x', pady=(5, 0))
+    if colors:
+        style = ttk.Style(parent)
+        name = f'Gradient{next(_gradient_ids)}'
+        track = tk.PhotoImage(master=parent, width=1, height=14)
+        scale._gradient_image = track
+        style.element_create(name+'.trough', 'image', track, sticky='we')
+        style.layout(name+'.Horizontal.TScale', [(name+'.trough', {'sticky': 'we', 'children': [
+            ('Editor.Scale.slider', {'side': 'left', 'sticky': ''})]})])
+        scale.configure(style=name+'.Horizontal.TScale')
+        stops = [tuple(int(color[i:i+2], 16) for i in (1, 3, 5)) for color in colors]
+        def paint(event):
+            width = max(2, event.width)
+            track.configure(width=width)
+            track.put('#292929', to=(0, 0, width, 14))
+            row = []
+            for x in range(width):
+                position = x/(width-1)*(len(stops)-1)
+                index = min(len(stops)-2, int(position))
+                fraction = position-index
+                rgb = [round(a+(b-a)*fraction) for a, b in zip(stops[index], stops[index+1])]
+                row.append('#%02x%02x%02x' % tuple(rgb))
+            track.put('{'+' '.join(row)+'}', to=(0, 4, width, 10))
+        scale.bind('<Configure>', paint, add=True)
     return scale
 
 

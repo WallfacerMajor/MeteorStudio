@@ -4,7 +4,7 @@ import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 from background_tasks import BackgroundTaskScheduler
 from error_dialog import show_copyable_error, show_runtime_log, append_runtime_log
 from platform_utils import open_folder
@@ -30,6 +30,8 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.candidate_id = 0
         self.candidates = []
         self.candidate_preview = None
+        self.pending_point = self.applied_point = None
+        self.preview_original = False
         self.finding_candidates = False
         self.neutral = [1, 1, 1]
         self.zoom, self.center, self.fit_mode = 1., (0., 0.), True
@@ -106,22 +108,37 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.output_button.pack(side="right")
         ttk.Label(controls, text="相对调整", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         self.sliders = []
-        for title, var, lower in (("色温偏移  ·  冷 ← → 暖", self.warmth, -100), ("色调  ·  绿 ← → 洋红", self.tint, -100), ("中性校准强度  ·  0–100%", self.strength, 0)):
+        for title, var, lower, colors in (("色温", self.warmth, -100, ("#4c88e8", "#c6c6c6", "#edb94f")), ("色调", self.tint, -100, ("#59ba82", "#c6c6c6", "#cc78c9")), ("校准强度", self.strength, 0, ("#555555", "#dddddd"))):
             from workspace_layout import parameter_slider
-            scale = parameter_slider(controls, title, var, lower, 100)
+            scale = parameter_slider(controls, title, var, lower, 100, colors=colors)
             self.sliders.append(scale)
             var.trace_add("write", lambda *_: self.schedule_render())
-        self.pick_button = ttk.Checkbutton(controls, text="取中性点（点击照片）", variable=self.picker, command=self.pick_mode)
-        self.pick_button.pack(anchor="w", pady=(12, 6))
-        ttk.Label(controls, textvariable=self.gain_info, style="Muted.TLabel", wraplength=220).pack(anchor="w", pady=10)
-        self.reset_button = ttk.Button(controls, text="重置白平衡", command=self.reset)
-        self.reset_button.pack(fill="x", pady=5)
-        self.suggest_button = ttk.Button(controls, text="自动推荐参考点", command=self.suggest_points)
-        self.suggest_button.pack(fill="x", pady=5)
-        self.confirm_point_button = ttk.Button(controls, text="应用此参考点", command=self.confirm_point)
-        self.confirm_point_button.pack(fill="x", pady=5)
-        self.cancel_point_button = ttk.Button(controls, text="取消参考点预览", command=self.cancel_point)
-        self.cancel_point_button.pack(fill="x")
+        self.reset_button = ttk.Button(controls, text="↺ 重置", command=self.reset)
+        self.reset_button.pack(fill="x", pady=(8, 12))
+        ttk.Separator(controls).pack(fill="x")
+        ttk.Label(controls, text="中性参考", style="Section.TLabel").pack(anchor="w", pady=(12, 6))
+        reference_tools = ttk.Frame(controls)
+        reference_tools.pack(fill="x")
+        self.pick_button = ttk.Checkbutton(reference_tools, text="取样", style="Toolbutton",
+                                           variable=self.picker, command=self.pick_mode)
+        icon = Image.new('RGBA', (60, 60))
+        pen = ImageDraw.Draw(icon)
+        pen.line([(12, 48), (13, 35), (37, 11), (49, 23), (25, 47), (12, 48)], fill='#eeeeee', width=5)
+        pen.line([(28, 13), (47, 32)], fill='#eeeeee', width=5)
+        self.picker_icon = ImageTk.PhotoImage(icon.resize((20, 20), Image.Resampling.LANCZOS), master=self)
+        self.pick_button.configure(image=self.picker_icon, compound="left")
+        self.pick_button.pack(side="left", fill="x", expand=True)
+        self.suggest_button = ttk.Button(reference_tools, text="✦ 推荐", command=self.suggest_points)
+        self.suggest_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.preview_actions = ttk.Frame(controls)
+        self.preview_label = ttk.Label(self.preview_actions, text="参考点预览", style="Section.TLabel")
+        self.preview_label.pack(anchor="w", pady=(8, 4))
+        actions = ttk.Frame(self.preview_actions)
+        actions.pack(fill="x")
+        self.confirm_point_button = ttk.Button(actions, text="✓ 应用", style="Primary.TButton", command=self.confirm_point)
+        self.confirm_point_button.pack(side="left", fill="x", expand=True)
+        self.cancel_point_button = ttk.Button(actions, text="× 取消", command=self.cancel_point)
+        self.cancel_point_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
         controls = calibration_controls
         ttk.Label(controls, text="改机与滤镜校准", style="Section.TLabel").pack(anchor="w")
         self.equipment_widgets = []
@@ -197,6 +214,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.destination.trace_add("write", lambda *_: self.controls())
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.controls()
+        self.bind('<Escape>', self.cancel_reference)
         self.after(60, self.poll)
 
     def _build_empty_action(self):
@@ -221,6 +239,10 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.suggest_button.configure(state="normal" if editable and not self.finding_candidates else "disabled")
         for widget in (self.confirm_point_button, self.cancel_point_button):
             widget.configure(state="normal" if editable and pending else "disabled")
+        if pending:
+            self.preview_actions.pack(fill="x", pady=(4, 0))
+        else:
+            self.preview_actions.pack_forget()
         if pending:
             for widget in (*self.sliders, self.pick_button, self.save_button, self.load_button, self.baseline_combo):
                 widget.configure(state="disabled")
@@ -247,6 +269,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.candidate_id += 1
         self.scheduler.cancel("candidates")
         self.candidates, self.candidate_preview, self.finding_candidates = [], None, False
+        self.pending_point = self.applied_point = None
         self.draw_candidates()
         self.schedule_render()
         self.busy = True
@@ -278,6 +301,8 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def apply_settings(self, settings):
         self.candidate_preview = None
+        self.pending_point = self.applied_point = None
+        self.draw_candidates()
         data = validate_settings(settings)
         self.neutral = data["neutral"]
         self.warmth.set(data["warmth"])
@@ -313,24 +338,69 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def draw_candidates(self):
         self.canvas.delete("reference")
-        for index, point in enumerate(self.candidates):
+        points = list(enumerate(self.candidates))
+        if self.candidate_preview == -1 and self.pending_point:
+            points.append((-1, self.pending_point))
+        elif self.applied_point and self.applied_point not in self.candidates:
+            points.append((-1, self.applied_point))
+        for index, point in points:
             x, y = self.point_position(point)
-            color = "#ffcf70" if self.candidate_preview == index else "#70ded2"
-            self.canvas.create_oval(x-12, y-12, x+12, y+12, outline=color, width=2, tags="reference")
-            self.canvas.create_text(x+18, y-16, text=str(index+1), fill=color, tags="reference")
+            selected = self.candidate_preview == index
+            applied = self.candidate_preview is None and point == self.applied_point
+            color = "#ffcf70" if selected else "#90dab0" if applied else "#c2d3e5"
+            radius = 18 if selected or applied else 12
+            tags = ("reference", "reference-selected") if selected else ("reference",)
+            self.canvas.create_oval(x-radius, y-radius, x+radius, y+radius,
+                                    outline=color, width=3 if selected else 2, tags=tags)
+            if selected:
+                self.canvas.create_oval(x-22, y-22, x+22, y+22, outline="#181818", width=2, tags=tags)
+            self.canvas.create_rectangle(x+10, y-32, x+36, y-10, fill=color, outline="#181818", tags=tags)
+            self.canvas.create_text(x+23, y-21, text="✓" if applied else str(index+1) if index >= 0 else "+",
+                                    fill="#181818", font="TkDefaultFont", tags=tags)
 
-    def cancel_point(self):
-        self.candidate_preview = None
+    def preview_point(self, point, index):
+        if self.candidate_preview is None:
+            self.preview_original = self.original.get()
+        self.candidate_preview, self.pending_point = index, point
+        self.original.set(False)
+        self.picker.set(False)
+        self.drag = None
+        self.pick_mode()
+        self.preview_label.configure(text=f"参考点 {index+1} · 预览" if index >= 0 else "手动取样 · 预览")
+        self.draw_candidates()
         self.controls()
         self.schedule_render()
+        self.status.set("参考点预览")
+
+    def cancel_point(self):
+        if self.candidate_preview is None:
+            return
+        self.candidate_preview = self.pending_point = None
+        self.original.set(self.preview_original)
+        self.draw_candidates()
+        self.controls()
+        self.schedule_render()
+        self.status.set("已取消预览")
+
+    def cancel_reference(self, event=None):
+        if self.candidate_preview is not None:
+            self.cancel_point()
+            return 'break'
+        if self.picker.get():
+            self.picker.set(False)
+            self.pick_mode()
+            self.status.set('')
+            return 'break'
 
     def confirm_point(self):
-        if self.candidate_preview is None or self.busy:
+        if self.pending_point is None or self.busy:
             return
-        point = self.candidates[self.candidate_preview]
+        point = self.pending_point
         self.original.set(False)
         self.apply_settings(dict(self.settings(), neutral=point['gains'], warmth=0, tint=0, neutral_strength=100))
-        self.status.set("已应用所选参考点；可降低校准强度，保留自然星野色彩")
+        self.applied_point = point
+        self.draw_candidates()
+        self.status.set("已应用参考点")
 
     def reset(self):
         self.apply_settings(dict(self.settings(), warmth=0, tint=0, neutral=[1, 1, 1], neutral_strength=100))
@@ -403,23 +473,16 @@ class WhiteBalanceWindow(tk.Toplevel):
         if not self.busy and not self.picker.get():
             for index, point in enumerate(self.candidates):
                 x, y = self.point_position(point)
-                if (event.x-x)**2 + (event.y-y)**2 <= 20**2:
-                    self.candidate_preview = index
-                    self.original.set(False)
-                    self.controls()
-                    self.schedule_render()
-                    self.status.set(f"参考点 {index+1} 预览 · 尚未应用；此处是否本应中性需人工确认")
+                if (event.x-x)**2 + (event.y-y)**2 <= 22**2 or (x+10 <= event.x <= x+36 and y-32 <= event.y <= y-10):
+                    self.preview_point(point, index)
                     return
         if self.picker.get() and not self.busy:
             x, y = self.image_position(event.x, event.y)
             try:
                 if x < 0 or y < 0:
                     raise ValueError("请在照片内取样")
-                self.apply_settings(dict(self.settings(), neutral=sample_neutral(self.levels[0], int(x), int(y)), warmth=0, tint=0, neutral_strength=100))
-                self.original.set(False)
-                self.picker.set(False)
-                self.pick_mode()
-                self.status.set("已取中性点；可继续微调冷暖和色调")
+                gains = sample_neutral(self.levels[0], int(x), int(y))
+                self.preview_point(dict(x=int(x), y=int(y), gains=gains), -1)
             except ValueError as exc:
                 self.status.set(str(exc))
         else:
@@ -456,7 +519,7 @@ class WhiteBalanceWindow(tk.Toplevel):
             return
         levels, settings, zoom, center = self.levels, self.settings(), self.zoom, self.center
         if self.candidate_preview is not None:
-            settings = dict(settings, neutral=self.candidates[self.candidate_preview]['gains'], warmth=0, tint=0, neutral_strength=100)
+            settings = dict(settings, neutral=self.pending_point['gains'], warmth=0, tint=0, neutral_strength=100)
         size = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         original, identity, events = self.original.get(), self.render_id, self.events
         self.scheduler.submit("preview", lambda token: render_view(levels, settings, zoom, center, size, original),

@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import tifffile
+from PIL import ImageTk
 from white_balance import apply_lut, make_lut
 
 
@@ -46,17 +47,41 @@ def exercise_white_balance(root, window):
         click(root, window.suggest_button)
         wait_for(lambda: not window.finding_candidates and bool(window.candidates))
         assert window.settings() == before
+        baseline_pixels = np.asarray(ImageTk.getimage(window.photo)).copy()
         point = window.candidates[0]
         px, py = window.point_position(point)
         window.canvas.event_generate("<ButtonPress-1>", x=round(px), y=round(py))
         window.canvas.event_generate("<ButtonRelease-1>", x=round(px), y=round(py))
         pump(root, 1.5)
         assert window.candidate_preview == 0 and window.settings() == before
+        assert window.canvas.find_withtag('reference-selected')
+        preview_pixels = np.asarray(ImageTk.getimage(window.photo)).copy()
+        assert np.max(np.abs(preview_pixels.astype(int)-baseline_pixels.astype(int))) > 2
+        capture(window, 'white-balance-reference-preview.png')
         assert str(window.export_button['state']) == 'disabled'
         reveal(window.cancel_point_button)
         click(root, window.cancel_point_button)
         pump(root, 1.5)
         assert window.candidate_preview is None and window.settings() == before
+        assert not window.canvas.find_withtag('reference-selected')
+        assert not window.preview_actions.winfo_ismapped()
+        np.testing.assert_array_equal(np.asarray(ImageTk.getimage(window.photo)), baseline_pixels)
+        # Cancel also restores an existing original-image comparison, even
+        # when an older preview completion arrives after the cancel action.
+        click(root, window.compare_button)
+        pump(root, 1.5)
+        original_pixels = np.asarray(ImageTk.getimage(window.photo)).copy()
+        window.canvas.event_generate('<ButtonPress-1>', x=round(px+23), y=round(py-21))
+        window.canvas.event_generate('<ButtonRelease-1>', x=round(px+23), y=round(py-21))
+        stale_identity = window.render_id
+        assert window.candidate_preview == 0 and not window.original.get()
+        reveal(window.cancel_point_button)
+        click(root, window.cancel_point_button)
+        window.events.put(('preview', stale_identity, ((preview_pixels, (0, 0), 0), window.zoom, False)))
+        pump(root, 1.5)
+        assert window.original.get() and window.candidate_preview is None
+        np.testing.assert_array_equal(np.asarray(ImageTk.getimage(window.photo)), original_pixels)
+        click(root, window.compare_button)
         window.canvas.event_generate("<ButtonPress-1>", x=round(px), y=round(py))
         window.canvas.event_generate("<ButtonRelease-1>", x=round(px), y=round(py))
         reveal(window.confirm_point_button)
@@ -73,9 +98,10 @@ def exercise_white_balance(root, window):
         assert abs((outline[0]+outline[2])/2-expected[0]) < 1
         assert abs((outline[1]+outline[3])/2-expected[1]) < 1
         cw, ch = window.canvas.winfo_width(), window.canvas.winfo_height()
-        window.canvas.event_generate("<ButtonPress-1>", x=cw//2, y=ch//2)
-        window.canvas.event_generate("<B1-Motion>", x=cw//2-35, y=ch//2-20)
-        window.canvas.event_generate("<ButtonRelease-1>", x=cw//2-35, y=ch//2-20)
+        # Pan from blank sky rather than the reference point near the center.
+        window.canvas.event_generate("<ButtonPress-1>", x=70, y=70)
+        window.canvas.event_generate("<B1-Motion>", x=35, y=50)
+        window.canvas.event_generate("<ButtonRelease-1>", x=35, y=50)
         pump(root, .4)
         view = (window.zoom, window.center, window.canvas.bbox(window.image_item), window.canvas.winfo_width(), window.canvas.winfo_height())
         scale = window.sliders[0]
@@ -96,7 +122,20 @@ def exercise_white_balance(root, window):
         window.canvas.event_generate("<ButtonPress-1>", x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
         window.canvas.event_generate("<ButtonRelease-1>", x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
         pump(root, 1.5)
-        assert window.neutral != [1, 1, 1] and not window.picker.get()
+        assert window.candidate_preview == -1 and not window.picker.get()
+        sampled_settings = window.settings()
+        window.focus_force()
+        pump(root, .1)
+        window.event_generate('<Escape>')
+        pump(root, 1.5)
+        assert window.candidate_preview is None and window.settings() == sampled_settings
+        click(root, window.pick_button)
+        window.canvas.event_generate('<ButtonPress-1>', x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
+        window.canvas.event_generate('<ButtonRelease-1>', x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
+        reveal(window.confirm_point_button)
+        click(root, window.confirm_point_button)
+        pump(root, 1.5)
+        assert window.neutral != [1, 1, 1] and window.candidate_preview is None
         balanced = apply_lut(pixels[600:601,900:901], make_lut(window.settings()))[0,0].astype(int)
         assert balanced.max() - balanced.min() <= 2
         window.equipment["camera"].set("Test camera")
