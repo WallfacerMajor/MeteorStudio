@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -28,12 +29,13 @@ def run_smoke(app) -> dict:
         app.control_notebook.tab(index, "text")
         for index in range(app.control_notebook.index("end"))
     ]
-    if tab_names != ["3  蒙版与候选", "4  融合与底图", "5  所选流星"]:
+    if tab_names != ["3  蒙版与候选", "4  融合与底图", "5  所选流星", "6  操作历史"]:
         raise AssertionError(f"Unexpected workspace tabs: {tab_names}")
     required_controls = {
         "B ✎ 画笔", "E ▱ 橡皮擦", "本地模型分析当前单张", "自动检测全部",
         "保存项目", "载入项目", "自动优化当前流星", "自动优化全部流星",
         "重置底图曝光", "恢复自动值", "恢复原始融合", "导出合成结果",
+        "↶ 撤销", "↷ 重做", "历史记录",
     }
     available_controls = set()
     pending = [app]
@@ -54,6 +56,8 @@ def run_smoke(app) -> dict:
     } & available_controls
     if removed_exact_controls:
         raise AssertionError(f"Obsolete exact-preview controls remain: {sorted(removed_exact_controls)}")
+    app._set_paths_panel_visible(True)
+    app.update_idletasks()
     app._toggle_paths_panel()
     app.update_idletasks()
     if app.paths_panel.winfo_manager():
@@ -108,6 +112,15 @@ def run_smoke(app) -> dict:
     app.view_mode.set("source")
     app._render_preview()
     app.update()
+    # Match the ordinary application entry point instead of testing only an
+    # off-screen fixed geometry. Windows performs another layout settlement
+    # when the real workspace enters its native maximized state.
+    app.geometry("1280x820+0+0")
+    app.update_idletasks()
+    app.maximize_for_normal_launch()
+    app.update_idletasks()
+    app.update()
+    app._canvas_fit()
     x0, y0, x1, y1 = app.display_box
     before_manual = len(app.strokes[key])
     first_manual = None
@@ -305,7 +318,15 @@ def run_smoke(app) -> dict:
         separate_drag_global_calls += 1
         return real_separate_drag_invalidate()
     app._invalidate_global_preview = count_separate_drag_global
+    separate_committed_frame = app.preview_rgb
+    drag_press_started = time.perf_counter()
     app.canvas.event_generate("<ButtonPress-1>", x=int(center[0]), y=int(center[1]))
+    app.update()
+    drag_press_elapsed = time.perf_counter() - drag_press_started
+    if app.object_drag_live_background is not separate_committed_frame:
+        raise AssertionError("Drag start copied the complete committed frame instead of borrowing it")
+    if app.object_drag_live_frame is not None:
+        raise AssertionError("Drag start allocated a second complete live frame")
     app.canvas.event_generate("<B1-Motion>", x=int(center[0] + 42), y=int(center[1] + 21), state=0x0100)
     app.update()
     moving = app.strokes[key][0]
@@ -315,8 +336,32 @@ def run_smoke(app) -> dict:
     moved_midpoint = original_midpoint + np.asarray([moving.offset_x, moving.offset_y])
     mx, my = int(round(moved_midpoint[0])), int(round(moved_midpoint[1]))
     ox, oy = int(round(original_midpoint[0])), int(round(original_midpoint[1]))
-    live_new_peak = int(app.preview_rgb[max(0, my - 6):my + 7, max(0, mx - 6):mx + 7].max())
-    live_old_peak = int(app.preview_rgb[max(0, oy - 6):oy + 7, max(0, ox - 6):ox + 7].max())
+    live_patches = app.object_drag_live_last_patches
+    if not live_patches:
+        raise AssertionError("Live drag did not produce a sparse display patch")
+    live_patch_bytes = sum(patch.nbytes for patch, _box in live_patches)
+    largest_live_patch = max(patch.nbytes for patch, _box in live_patches)
+    if (
+        largest_live_patch >= separate_committed_frame.nbytes // 2
+        or live_patch_bytes >= separate_committed_frame.nbytes * 3 // 4
+    ):
+        raise AssertionError(
+            f"Live drag patch unexpectedly approached full-frame size: "
+            f"patches={live_patch_bytes}, frame={separate_committed_frame.shape}/{separate_committed_frame.nbytes}"
+        )
+    if drag_press_elapsed > 0.25:
+        raise AssertionError(f"Drag press feedback was not immediate: {drag_press_elapsed:.3f}s")
+    def live_peak(px: int, py: int, patches) -> int:
+        for patch, (px0, py0, px1, py1) in reversed(patches):
+            if px0 <= px < px1 and py0 <= py < py1:
+                local_x, local_y = px - px0, py - py0
+                return int(patch[
+                    max(0, local_y - 6):local_y + 7,
+                    max(0, local_x - 6):local_x + 7,
+                ].max())
+        return 0
+    live_new_peak = live_peak(mx, my, live_patches)
+    live_old_peak = live_peak(ox, oy, live_patches)
     if live_new_peak < 140 or live_old_peak > 100:
         raise AssertionError(
             f"Live drag moved only the mask, not meteor pixels: old={live_old_peak}, new={live_new_peak}"
@@ -357,7 +402,10 @@ def run_smoke(app) -> dict:
     )
     shared_new = shared_midpoint + np.asarray([shared_moving.offset_x, shared_moving.offset_y])
     sx, sy = int(round(shared_new[0])), int(round(shared_new[1]))
-    shared_peak = int(app.preview_rgb[max(0, sy - 6):sy + 7, max(0, sx - 6):sx + 7].max())
+    shared_patches = app.object_drag_live_last_patches
+    if not shared_patches:
+        raise AssertionError("Combined drag did not produce a sparse display patch")
+    shared_peak = live_peak(sx, sy, shared_patches)
     if shared_peak < 140 or shared_moving.offset_x == shared_before.offset_x:
         raise AssertionError("Combined preview did not move meteor pixels during drag")
     app.canvas.event_generate(
@@ -506,9 +554,24 @@ def run_smoke(app) -> dict:
 
     candidate = Stroke([(0.74, 0.12), (0.80, 0.15)], 24, 9, auto_score=73)
     app.candidates[key].append(candidate)
-    app.hover_candidate_index = len(app.candidates[key]) - 1
-    app._pick_hover_candidate()
+    x0, y0, x1, y1 = app.display_box
+    cx, cy = round(x0 + 0.77 * (x1 - x0)), round(y0 + 0.135 * (y1 - y0))
+    app.canvas.event_generate("<Motion>", x=cx, y=cy)
     app.update()
+    button_box = app.canvas.bbox("candidate_pick")
+    if button_box is None:
+        raise AssertionError("Candidate hover did not expose the real pick button")
+    bx, by = (button_box[0] + button_box[2]) // 2, (button_box[1] + button_box[3]) // 2
+    pick_started = time.perf_counter()
+    app.canvas.event_generate("<ButtonPress-1>", x=bx, y=by)
+    app.canvas.event_generate("<ButtonRelease-1>", x=bx, y=by)
+    app.update()
+    pick_elapsed = time.perf_counter() - pick_started
+    print(f"Candidate pick response: {pick_elapsed:.3f}s", flush=True)
+    deadline = time.monotonic() + 1.4
+    while time.monotonic() < deadline:
+        app.update()
+        time.sleep(0.01)
     app._invalidate_global_preview = real_mask_add_invalidate
     app._schedule_global_exact_validation = real_mask_add_validation
     if candidate not in app.strokes[key] or not candidate.locked:
@@ -792,19 +855,35 @@ def run_smoke(app) -> dict:
 
     # Seed the exact shared-preview cache as it exists when the user deletes
     # from the visible final composite.
+    # Give this regression its own non-overlapping meteor so another accumulated
+    # brush stroke cannot legitimately keep the same source pixels visible.
+    cv2.line(source, (1010, 700), (1140, 635), (250, 250, 255), 10, cv2.LINE_AA)
+    history_meteor = Stroke(
+        [(1010 / width, 700 / height), (1140 / width, 635 / height)],
+        30, 11, locked=True, auto_score=97,
+    )
+    history_candidate = replace(history_meteor, points=history_meteor.points.copy())
+    app.strokes[key].append(history_meteor)
+    app.candidates[key].append(history_candidate)
+    app.selected_object = (key, len(app.strokes[key]) - 1)
     delete_cached, _delete_mask = compose_meteor_objects(
-        source, base, app.strokes[key], False, False, 15, 25,
-        "自然融合", True, 100, 70,
+        source, base, app.strokes[key], *app._object_composite_settings(key),
     )
     app.output_mode.set("combined")
-    app.global_preview_rgb = delete_cached
+    app.global_preview_rgb = delete_cached.copy()
     app.global_labeled_preview_rgb = delete_cached.copy()
     app.global_preview_signature = app._global_preview_state_signature()
     count = len(app.strokes[key])
+    candidate_count = len(app.candidates[key])
     full_rebuild_calls = 0
     exact_validation_calls = 0
+    history_worker_calls = []
     real_invalidate = app._invalidate_global_preview
     real_exact_validation = app._schedule_global_exact_validation
+    real_request_global = app._request_global_preview
+    real_auto_exact = app._schedule_automatic_exact_preview
+    real_begin_exact = app._begin_exact_preview
+    real_scheduler_submit = app.background_tasks.submit
     def count_full_rebuild():
         nonlocal full_rebuild_calls
         full_rebuild_calls += 1
@@ -812,12 +891,34 @@ def run_smoke(app) -> dict:
     def count_exact_validation(_signature):
         nonlocal exact_validation_calls
         exact_validation_calls += 1
+    def count_history_submit(channel, _function, **_kwargs):
+        if channel in {"global_preview_task", "exact_preview_task"}:
+            history_worker_calls.append(channel)
+            return None
+        return real_scheduler_submit(channel, _function, **_kwargs)
+    def click_history_button(button):
+        app.update_idletasks()
+        x = max(1, button.winfo_width() // 2)
+        y = max(1, button.winfo_height() // 2)
+        button.event_generate("<Enter>", x=x, y=y)
+        button.event_generate("<ButtonPress-1>", x=x, y=y)
+        button.event_generate("<ButtonRelease-1>", x=x, y=y)
+        app.update()
     app._invalidate_global_preview = count_full_rebuild
     app._schedule_global_exact_validation = count_exact_validation
+    app._request_global_preview = lambda signature: history_worker_calls.append(
+        ("request_global", signature)
+    )
+    app._schedule_automatic_exact_preview = lambda: history_worker_calls.append(
+        ("schedule_exact", "")
+    )
+    app._begin_exact_preview = lambda signature, open_when_ready=False: history_worker_calls.append(
+        ("begin_exact", signature, open_when_ready)
+    )
+    app.background_tasks.submit = count_history_submit
     app._delete_selected_object()
-    app._invalidate_global_preview = real_invalidate
-    app._schedule_global_exact_validation = real_exact_validation
-    if len(app.strokes[key]) != count - 1 or app.candidates[key]:
+    deleted_pixels = app.global_preview_rgb.copy()
+    if len(app.strokes[key]) != count - 1 or len(app.candidates[key]) != candidate_count - 1:
         raise AssertionError("Delete did not remove the locked candidate object")
     if full_rebuild_calls or exact_validation_calls:
         raise AssertionError(
@@ -827,9 +928,66 @@ def run_smoke(app) -> dict:
         )
     if app.global_preview_signature != app._global_preview_state_signature():
         raise AssertionError("Incremental delete did not commit the new composite state")
-    app.undo_stroke()
-    if len(app.strokes[key]) != count or len(app.candidates[key]) != 1:
+    if np.array_equal(deleted_pixels, delete_cached):
+        raise AssertionError("Delete changed mask metadata but not the meteor pixels")
+
+    # Exercise the actual visible buttons. Undo must restore both the candidate
+    # metadata and its pixels; redo must remove both again. Keep every full-frame
+    # entry point monitored beyond the old 320/1200 ms deferred windows.
+    click_history_button(app.undo_button)
+    if len(app.strokes[key]) != count or len(app.candidates[key]) != candidate_count:
         raise AssertionError("Undo did not restore object and candidate metadata")
+    undo_difference = np.abs(
+        app.global_preview_rgb.astype(np.int16) - delete_cached.astype(np.int16)
+    )
+    if int(undo_difference.max()) > 1:
+        max_y, max_x, max_channel = np.unravel_index(
+            int(np.argmax(undo_difference)), undo_difference.shape
+        )
+        raise AssertionError(
+            f"Undo restored the mask but not its meteor pixels (max delta {undo_difference.max()} "
+            f"at {(max_x, max_y, max_channel)}, dirty={app.last_incremental_box})"
+        )
+    click_history_button(app.redo_button)
+    if len(app.strokes[key]) != count - 1 or len(app.candidates[key]) != candidate_count - 1:
+        raise AssertionError("Redo did not remove object and candidate metadata")
+    redo_difference = np.abs(
+        app.global_preview_rgb.astype(np.int16) - deleted_pixels.astype(np.int16)
+    )
+    if int(redo_difference.max()) > 1:
+        raise AssertionError(
+            f"Redo changed the mask but did not remove its meteor pixels (max delta {redo_difference.max()})"
+        )
+    click_history_button(app.undo_button)
+    deadline = time.monotonic() + 1.45
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        time.sleep(0.01)
+    app._invalidate_global_preview = real_invalidate
+    app._schedule_global_exact_validation = real_exact_validation
+    app._request_global_preview = real_request_global
+    app._schedule_automatic_exact_preview = real_auto_exact
+    app._begin_exact_preview = real_begin_exact
+    app.background_tasks.submit = real_scheduler_submit
+    if full_rebuild_calls or exact_validation_calls or history_worker_calls:
+        raise AssertionError(
+            "Undo/redo launched full-frame work: "
+            f"invalidate={full_rebuild_calls}, validation={exact_validation_calls}, "
+            f"workers={history_worker_calls}"
+        )
+    if any((
+        app.global_preview_request_after_id,
+        app.exact_preview_request_after_id,
+        app.global_exact_after_id,
+    )):
+        raise AssertionError("Undo/redo left a delayed full-preview job queued")
+
+    app.strokes[key] = [item for item in app.strokes[key] if item is not history_meteor]
+    app.candidates[key] = [item for item in app.candidates[key] if item is not history_candidate]
+    delete_cached, _delete_mask = compose_meteor_objects(
+        source, base, app.strokes[key], *app._object_composite_settings(key),
+    )
 
     # Deletion must also remain local when the fast global cache was evicted but
     # the exact canvas currently visible to the user is still available.
@@ -851,6 +1009,76 @@ def run_smoke(app) -> dict:
 
     app.view_mode.set("source")
     app._render_preview()
+    app.update()
+
+    def click_and_assert_viewport(widget, x: int, y: int, label: str) -> None:
+        before = (
+            round(float(app.canvas_zoom), 12),
+            round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+            round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+            tuple(round(float(value), 4) for value in app.display_box),
+            app.canvas.winfo_width(), app.canvas.winfo_height(),
+            app.canvas_image_shape, app.preview_request_id,
+        )
+        widget.event_generate("<ButtonPress-1>", x=x, y=y)
+        widget.event_generate("<ButtonRelease-1>", x=x, y=y)
+        deadline = time.monotonic() + 1.45
+        while time.monotonic() < deadline:
+            app.update_idletasks()
+            app.update()
+            time.sleep(0.01)
+        after = (
+            round(float(app.canvas_zoom), 12),
+            round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+            round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+            tuple(round(float(value), 4) for value in app.display_box),
+            app.canvas.winfo_width(), app.canvas.winfo_height(),
+            app.canvas_image_shape, app.preview_request_id,
+        )
+        if after != before:
+            raise AssertionError(f"{label} changed the viewport: {before} -> {after}")
+
+    # Exact user-reported point 1: the empty header strip immediately to the
+    # right of "流星合成工作区", before the right-aligned workspace buttons.
+    title_right = app.workspace_title_label.winfo_rootx() + app.workspace_title_label.winfo_width()
+    controls_left = app.paths_toggle_button.winfo_rootx()
+    if controls_left - title_right < 6:
+        raise AssertionError("No real header blank space exists at the reported coordinate")
+    header_root_x = (title_right + controls_left) // 2
+    header_root_y = app.header_panel.winfo_rooty() + app.header_panel.winfo_height() // 2
+    header_target = app.header_panel
+    header_local_x = header_root_x - header_target.winfo_rootx()
+    header_local_y = header_root_y - header_target.winfo_rooty()
+    for child in header_target.winfo_children():
+        if (
+            child.winfo_x() <= header_local_x < child.winfo_x() + child.winfo_width()
+            and child.winfo_y() <= header_local_y < child.winfo_y() + child.winfo_height()
+        ):
+            raise AssertionError(f"Reported header blank coordinate overlaps {child}")
+    click_and_assert_viewport(
+        header_target,
+        header_local_x,
+        header_local_y,
+        "Clicking blank space beside 流星合成工作区",
+    )
+
+    # Exact user-reported point 2: blank padding directly below 载入项目.
+    load_center_x = app.load_project_button.winfo_rootx() + app.load_project_button.winfo_width() // 2
+    load_bottom = app.load_project_button.winfo_rooty() + app.load_project_button.winfo_height()
+    tools_bottom = app.mask_tools_tab.winfo_rooty() + app.mask_tools_tab.winfo_height()
+    lower_root_y = min(tools_bottom - 2, load_bottom + max(1, (tools_bottom - load_bottom) // 2))
+    lower_target = app.mask_tools_tab
+    if lower_root_y <= load_bottom:
+        raise AssertionError("No real blank padding exists below 载入项目")
+    click_and_assert_viewport(
+        lower_target,
+        load_center_x - lower_target.winfo_rootx(),
+        lower_root_y - lower_target.winfo_rooty(),
+        "Clicking blank space below 载入项目",
+    )
+    app.state("normal")
+    app.geometry("1280x820+10000+10000")
+    app.update_idletasks()
     app.update()
 
     # A preview worker may replace a quick frame with the full-resolution
@@ -902,7 +1130,7 @@ def run_smoke(app) -> dict:
     click_target.event_generate("<ButtonRelease-1>", x=local_x, y=local_y)
     # Let focus, Configure and delayed preview callbacks run.  The old test only
     # sampled immediately and missed the user-visible jump after the click.
-    deadline = time.monotonic() + 0.25
+    deadline = time.monotonic() + 1.45
     while time.monotonic() < deadline:
         app.update_idletasks()
         app.update()
@@ -920,6 +1148,111 @@ def run_smoke(app) -> dict:
         )
     if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
         raise AssertionError("Clicking blank space inside the bottom panel changed zoom")
+    # Panel layout changes may alter how much of the photograph is visible, but
+    # they are not preview zoom controls and must never rewrite pixel scale.
+    before_paths_toggle_zoom = float(app.canvas_zoom)
+    before_paths_toggle_allocation = (app.canvas.winfo_width(), app.canvas.winfo_height())
+    app._toggle_paths_panel()
+    app.update_idletasks()
+    app.update()
+    after_paths_toggle_allocation = (app.canvas.winfo_width(), app.canvas.winfo_height())
+    if after_paths_toggle_allocation == before_paths_toggle_allocation:
+        raise AssertionError("Path-panel toggle did not exercise a real canvas allocation change")
+    if abs(app.canvas_zoom - before_paths_toggle_zoom) > 1e-9:
+        raise AssertionError(
+            "Opening the upper material panel changed preview zoom without using a preview control: "
+            f"{before_paths_toggle_zoom} -> {app.canvas_zoom}"
+        )
+    upper_x = max(1, app.paths_panel.winfo_width() - 4)
+    upper_y = max(1, app.paths_panel.winfo_height() - 4)
+    upper_root_x = app.paths_panel.winfo_rootx() + upper_x
+    upper_root_y = app.paths_panel.winfo_rooty() + upper_y
+    upper_target = app.winfo_containing(upper_root_x, upper_root_y) or app.paths_panel
+    upper_local_x = upper_root_x - upper_target.winfo_rootx()
+    upper_local_y = upper_root_y - upper_target.winfo_rooty()
+    before_upper_click = (
+        round(float(app.canvas_zoom), 12),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        app.preview_request_id,
+    )
+    upper_target.event_generate("<ButtonPress-1>", x=upper_local_x, y=upper_local_y)
+    upper_target.event_generate("<ButtonRelease-1>", x=upper_local_x, y=upper_local_y)
+    deadline = time.monotonic() + 1.45
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        time.sleep(0.01)
+    after_upper_click = (
+        round(float(app.canvas_zoom), 12),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        app.preview_request_id,
+    )
+    if after_upper_click != before_upper_click:
+        raise AssertionError(
+            f"Clicking upper-panel blank space changed the viewport: "
+            f"{before_upper_click} -> {after_upper_click}"
+        )
+    # Reproduce the reported layout with the TIFF/material path panel expanded,
+    # one selected file row, and blank Treeview space below it.
+    app._canvas_fit()
+    app.tree.unbind("<<TreeviewSelect>>")
+    app.tree.delete(*app.tree.get_children())
+    app.tree.insert("", "end", iid="0", text="synthetic_meteor.tif", values=("已锁定",))
+    app.tree.selection_set("0")
+    app.update_idletasks()
+    app.update()
+    app.tree.bind("<<TreeviewSelect>>", app._tree_selection_changed)
+    app.update_idletasks()
+    tree_x = max(2, app.tree.winfo_width() // 2)
+    tree_y = max(2, app.tree.winfo_height() - 4)
+    if app.tree.identify_row(tree_y):
+        raise AssertionError("TIFF material-list test coordinate unexpectedly hits a file row")
+    before_tree_blank = (
+        app.canvas_fit_mode,
+        round(float(app.canvas_zoom), 12),
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+        app.canvas_image_shape,
+    )
+    before_tree_request = app.preview_request_id
+    app.tree.event_generate("<ButtonPress-1>", x=tree_x, y=tree_y)
+    app.tree.event_generate("<ButtonRelease-1>", x=tree_x, y=tree_y)
+    deadline = time.monotonic() + 1.45
+    while time.monotonic() < deadline:
+        app.update_idletasks()
+        app.update()
+        time.sleep(0.01)
+    after_tree_blank = (
+        app.canvas_fit_mode,
+        round(float(app.canvas_zoom), 12),
+        tuple(round(float(value), 4) for value in app.display_box),
+        app.canvas.winfo_width(), app.canvas.winfo_height(),
+        round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+        round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+        app.canvas_image_shape,
+    )
+    if after_tree_blank != before_tree_blank:
+        raise AssertionError(
+            "Clicking blank TIFF material-list space changed the visible viewport: "
+            f"{before_tree_blank} -> {after_tree_blank}"
+        )
+    if app.tree.selection() != ("0",):
+        raise AssertionError("Blank TIFF-list click cleared the current file selection")
+    if app.preview_request_id != before_tree_request or app.preview_selection_after_id is not None:
+        raise AssertionError("Blank TIFF-list click enqueued a redundant preview load")
+    app._toggle_paths_panel()
+    app.update_idletasks()
+    app.update()
+    app._canvas_fit()
+    main_fit_zoom = app.canvas_zoom
     x0, y0, x1, y1 = app.display_box
     canvas_w, canvas_h = app.canvas.winfo_width(), app.canvas.winfo_height()
     blank_canvas_points = [
@@ -940,9 +1273,20 @@ def run_smoke(app) -> dict:
         if abs(app.canvas_zoom - main_fit_zoom) > 1e-9:
             raise AssertionError("Clicking outside the displayed photograph changed zoom")
     main_center = (app.canvas_center_x, app.canvas_center_y)
+    zoom_started = time.perf_counter()
     app._canvas_zoom_by(1.25, (app.canvas.winfo_width() // 3, app.canvas.winfo_height() // 3))
+    app.update_idletasks()
+    app.update()
+    zoom_elapsed = time.perf_counter() - zoom_started
     if app.canvas_zoom <= main_fit_zoom or app.preview_photo is None:
         raise AssertionError("Main mask canvas did not zoom without recompositing")
+    if app.last_viewport_render_source != "cached-ancestor":
+        raise AssertionError(
+            f"Interactive zoom reread the source instead of reusing the visible viewport: "
+            f"{app.last_viewport_render_source}"
+        )
+    if zoom_elapsed > 0.20:
+        raise AssertionError(f"Interactive zoom frame was not immediate: {zoom_elapsed:.3f}s")
     pan_event = type("PanEvent", (), {"x": 300, "y": 260})()
     app._canvas_pan_start_event(pan_event)
     pan_event.x, pan_event.y = 350, 290
@@ -972,7 +1316,20 @@ def run_smoke(app) -> dict:
     exact_viewer.update()
     exact_viewer.fit()
     fit_zoom = exact_viewer.zoom
+    exact_viewer.geometry("1000x700+10000+10000")
+    exact_viewer.update()
+    resized_fit_zoom = exact_viewer.zoom
+    if not exact_viewer.fit_mode or resized_fit_zoom <= fit_zoom:
+        raise AssertionError("Exact-preview fit mode did not follow a real window resize")
     exact_viewer.actual_size()
+    exact_viewer.center_x = source.shape[1] / 2.0
+    exact_viewer.center_y = source.shape[0] / 2.0
+    exact_viewer._render()
+    reusable_photo = exact_viewer.photo
+    exact_viewer.center_x += 12
+    exact_viewer._render()
+    if exact_viewer.photo is not reusable_photo:
+        raise AssertionError("Exact-preview pan recreated an unchanged-size viewport image")
     exact_viewer._zoom_by(1.25)
     exact_viewer.mode.set("labeled")
     exact_viewer._render()
@@ -981,12 +1338,84 @@ def run_smoke(app) -> dict:
         raise AssertionError("Full-resolution viewer did not fit, zoom, and render")
     exact_viewer.destroy()
 
+    # Exercise the visible undo/redo controls and select a version through the
+    # real Treeview row bindings. A new canvas edit after that jump must discard
+    # the abandoned redo branch.
+    app.view_mode.set("source")
+    app._view_mode_changed()
+    app.update()
+    history_key = str(app.current_path)
+    app.strokes[history_key] = []
+    app.edit_history[history_key] = []
+    app.edit_redo.pop(history_key, None)
+    history_first = Stroke([(0.20, 0.30), (0.25, 0.34)], 12, 4)
+    history_second = Stroke([(0.35, 0.42), (0.40, 0.46)], 12, 4)
+    app.strokes[history_key].append(history_first)
+    app._record_edit(history_key, ("add", 0, history_first))
+    app.strokes[history_key].append(history_second)
+    app._record_edit(history_key, ("add", 1, history_second))
+    app.update_idletasks()
+    history_button_x = max(1, app.history_button.winfo_width() // 2)
+    history_button_y = max(1, app.history_button.winfo_height() // 2)
+    app.history_button.event_generate("<Enter>", x=history_button_x, y=history_button_y)
+    app.history_button.event_generate(
+        "<ButtonPress-1>", x=history_button_x, y=history_button_y
+    )
+    app.history_button.event_generate(
+        "<ButtonRelease-1>", x=history_button_x, y=history_button_y
+    )
+    app.update()
+    if app.control_notebook.select() != str(app.history_tools_tab):
+        raise AssertionError("Visible history button did not open the operation-history panel")
+    app._refresh_history_ui(history_key)
+    app.update_idletasks()
+    app.update()
+    if str(app.undo_button.cget("state")) == "disabled" or len(app.history_tree.get_children()) != 3:
+        raise AssertionError("Visible history controls did not expose the current two-step timeline")
+    row_box = app.history_tree.bbox("1")
+    if not row_box:
+        raise AssertionError("History version row is not visible/clickable")
+    row_x = row_box[0] + max(2, row_box[2] // 2)
+    row_y = row_box[1] + max(2, row_box[3] // 2)
+    app.history_tree.event_generate("<ButtonPress-1>", x=row_x, y=row_y)
+    app.history_tree.event_generate("<ButtonRelease-1>", x=row_x, y=row_y)
+    app.update_idletasks()
+    app.update()
+    if len(app.strokes[history_key]) != 1 or len(app.edit_redo.get(history_key, [])) != 1:
+        raise AssertionError("Clicking a history version did not restore that version")
+
+    app.control_notebook.select(app.mask_tools_tab)
+    app._clear_candidate_hover()
+    app.update()
+    x0, y0, x1, y1 = app.display_box
+    draw_x = int(round(x0 + (x1 - x0) * 0.62))
+    draw_y = int(round(y0 + (y1 - y0) * 0.58))
+    app.canvas.event_generate("<ButtonPress-1>", x=draw_x, y=draw_y)
+    app.canvas.event_generate("<B1-Motion>", x=draw_x + 22, y=draw_y + 10, state=0x0100)
+    app.canvas.event_generate("<ButtonRelease-1>", x=draw_x + 22, y=draw_y + 10)
+    app.update_idletasks()
+    app.update()
+    if app.edit_redo.get(history_key):
+        raise AssertionError("A new edit after history navigation kept the abandoned future branch")
+    branch_count = len(app.strokes[history_key])
+    app.undo_button.invoke()
+    app.update()
+    if len(app.strokes[history_key]) != branch_count - 1 or str(app.redo_button.cget("state")) == "disabled":
+        raise AssertionError("Visible undo button did not move backward or enable redo")
+    app.redo_button.invoke()
+    app.update()
+    if len(app.strokes[history_key]) != branch_count:
+        raise AssertionError("Visible redo button did not restore the undone edit")
+
     app.open_video_workspace()
     app.update()
     if app.state() != "withdrawn" or app.video_window is None:
         raise AssertionError("Opening video workspace did not replace the main workspace")
+    video_scheduler = app.video_window.background_tasks
     app.video_window.destroy()
     app.update()
+    if not video_scheduler.closed:
+        raise AssertionError("Closing video workspace left its background scheduler running")
     if app.state() == "withdrawn" or app.video_window is not None:
         raise AssertionError("Closing video workspace did not restore the main workspace")
 
@@ -994,10 +1423,93 @@ def run_smoke(app) -> dict:
     app.update()
     if app.state() != "withdrawn" or app.alignment_window is None:
         raise AssertionError("Opening alignment workspace did not replace the main workspace")
-    app.alignment_window.destroy()
+    alignment_window = app.alignment_window
+    with tempfile.TemporaryDirectory() as alignment_folder:
+        reference = Path(alignment_folder) / "reference_without_exif.png"
+        cv2.imwrite(str(reference), np.zeros((40, 60, 3), dtype=np.uint8))
+        alignment_window._refresh_reference_focal_ui(reference)
+        app.update_idletasks()
+        app.update()
+        if str(alignment_window.reference_focal_input.cget("state")) == "disabled":
+            raise AssertionError("Reference focal input stayed disabled for an EXIF-free base")
+        if alignment_window.reference_focal_length.get().strip():
+            raise AssertionError("EXIF-free base silently received a guessed focal length")
+        if "请" not in alignment_window.reference_focal_status.get():
+            raise AssertionError("EXIF-free base did not visibly request a focal length")
+        alignment_window.reference_focal_length.set("20")
+        focal, focal_source = alignment_window._reference_focal(reference)
+        if focal != 20.0 or "用户填写" not in focal_source:
+            raise AssertionError("User-entered reference focal length was not accepted")
+    alignment_scheduler = alignment_window.background_tasks
+    alignment_window.destroy()
     app.update()
+    if not alignment_scheduler.closed:
+        raise AssertionError("Closing alignment workspace left its background scheduler running")
     if app.state() == "withdrawn" or app.alignment_window is not None:
         raise AssertionError("Closing alignment workspace did not restore the main workspace")
+    app.open_screening_workspace()
+    app.update()
+    if app.state() != "withdrawn" or app.screening_window is None:
+        raise AssertionError("Opening screening workspace did not replace the main workspace")
+    # Reproduce the start-button freeze: capture-time sorting deliberately
+    # blocks for each file. A real click must return before that metadata work,
+    # because discovery/sorting now belongs to the submitted background task.
+    import meteor_screening as screening_module
+    screening_window = app.screening_window
+    original_screening_source = screening_window.source_dir.get()
+    real_capture_sort_key = screening_module.capture_sort_key
+    real_screening_submit = screening_window.background_tasks.submit
+    submitted_analysis = []
+    with tempfile.TemporaryDirectory() as screening_folder:
+        for index in range(3):
+            Path(screening_folder, f"frame_{index}.jpg").touch()
+        screening_module.capture_sort_key = lambda path: (
+            time.sleep(0.20) or ("", path.name)
+        )
+        screening_window.background_tasks.submit = (
+            lambda channel, function, **kwargs: submitted_analysis.append(
+                (channel, function, kwargs)
+            )
+        )
+        screening_window._restoring_autosave = True
+        screening_window.source_dir.set(screening_folder)
+        screening_window._restoring_autosave = False
+        app.update_idletasks()
+        analyze_x = max(1, screening_window.analyze_button.winfo_width() // 2)
+        analyze_y = max(1, screening_window.analyze_button.winfo_height() // 2)
+        analyze_started = time.perf_counter()
+        screening_window.analyze_button.event_generate("<Enter>", x=analyze_x, y=analyze_y)
+        screening_window.analyze_button.event_generate(
+            "<ButtonPress-1>", x=analyze_x, y=analyze_y
+        )
+        screening_window.analyze_button.event_generate(
+            "<ButtonRelease-1>", x=analyze_x, y=analyze_y
+        )
+        app.update()
+        analyze_click_elapsed = time.perf_counter() - analyze_started
+        if analyze_click_elapsed > 0.15:
+            raise AssertionError(
+                f"Screening start button blocked Tk during metadata scan: {analyze_click_elapsed:.3f}s"
+            )
+        if not submitted_analysis or submitted_analysis[0][0] != "analysis":
+            raise AssertionError("Screening start did not dispatch metadata scanning to background work")
+        if not screening_window.analysis_running:
+            raise AssertionError("Screening start did not enter the visible background-running state")
+        screening_window.analysis_generation += 1
+        screening_window.analysis_running = False
+        screening_window.analyze_button.configure(state="normal", text="开始分析")
+        screening_window._restoring_autosave = True
+        screening_window.source_dir.set(original_screening_source)
+        screening_window._restoring_autosave = False
+    screening_module.capture_sort_key = real_capture_sort_key
+    screening_window.background_tasks.submit = real_screening_submit
+    screening_scheduler = app.screening_window.background_tasks
+    app.screening_window.destroy()
+    app.update()
+    if not screening_scheduler.closed:
+        raise AssertionError("Closing screening workspace left its background scheduler running")
+    if app.state() == "withdrawn" or app.screening_window is not None:
+        raise AssertionError("Closing screening workspace did not restore the main workspace")
     return {
         "editable_composite": "passed", "move": "passed", "stretch": "passed",
         "clean_base_has_no_mask": "passed",
@@ -1010,6 +1522,9 @@ def run_smoke(app) -> dict:
         "direct_single_image_transform": "passed",
         "live_drag_moves_meteor_pixels": "passed",
         "combined_live_drag_moves_pixels": "passed",
+        "drag_start_borrows_full_frame": "passed",
+        "live_drag_uses_sparse_patch": "passed",
+        "drag_press_latency": "passed",
         "incremental_shared_preview": "passed",
         "instant_transform_restore": "passed",
         "drag_undo_preserves_mask": "passed",
@@ -1031,14 +1546,132 @@ def run_smoke(app) -> dict:
         "no_render_loop": "passed",
         "single_workspace_navigation": "passed",
         "exact_preview_viewer": "passed",
+        "exact_preview_resize_keeps_fit": "passed",
+        "exact_preview_pan_reuses_image": "passed",
         "main_canvas_zoom_pan": "passed",
+        "interactive_zoom_reuses_viewport": "passed",
+        "interactive_zoom_latency": "passed",
         "view_switch_preserves_zoom": "passed",
         "panel_click_preserves_zoom": "passed",
         "blank_panel_click_preserves_zoom": "passed",
+        "header_workspace_blank_click_preserves_viewport": "passed",
+        "below_load_project_blank_click_preserves_viewport": "passed",
+        "blank_tiff_list_click_preserves_viewport": "passed",
         "outside_image_click_preserves_zoom": "passed",
         "workspace_tabs": "passed",
         "all_controls_reachable": "passed",
         "collapsible_material_panel": "passed",
+        "visible_undo_redo_buttons": "passed",
+        "selectable_history_versions": "passed",
+        "history_branch_truncation": "passed",
+        "history_limit_100": "passed",
+        "reference_focal_required_without_exif": "passed",
+        "screening_start_is_nonblocking": "passed",
+        "child_workspace_tasks_close_cleanly": "passed",
+    }
+
+
+def run_real_pointer_smoke(app) -> dict:
+    """Drive the two reported blank areas with the real Windows mouse cursor."""
+    import ctypes
+
+    if not hasattr(ctypes, "windll"):
+        raise RuntimeError("Real pointer smoke requires Windows")
+    user32 = ctypes.windll.user32
+    app._schedule_autosave = lambda: None
+    app.autosave_suspended = True
+    app.geometry("1280x820+0+0")
+    app.deiconify()
+    app.update_idletasks()
+    app.update()
+    app.maximize_for_normal_launch()
+    app.update_idletasks()
+    app.update()
+
+    height, width = 800, 1200
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    image[:] = (12, 18, 30)
+    cv2.line(image, (280, 430), (810, 285), (235, 245, 255), 8, cv2.LINE_AA)
+    app.current_path = Path("real_pointer_meteor.tif")
+    app.files = [app.current_path]
+    app.preview_source = image
+    app.preview_base = image.copy()
+    app.preview_rgb = image
+    app.current_dims = (width, height)
+    app.canvas_image_shape = None
+    app.view_mode.set("source")
+    app.control_notebook.select(app.mask_tools_tab)
+    app._present_preview_image(image, False, True)
+    app._canvas_fit()
+    app.update_idletasks()
+    app.update()
+
+    try:
+        app.lift()
+        app.focus_force()
+        user32.SetForegroundWindow(int(app.winfo_id()))
+    except Exception:
+        pass
+    app.update()
+
+    def snapshot() -> tuple:
+        return (
+            round(float(app.canvas_zoom), 12),
+            round(app.canvas_center_x / app.preview_rgb.shape[1], 8),
+            round(app.canvas_center_y / app.preview_rgb.shape[0], 8),
+            tuple(round(float(value), 4) for value in app.display_box),
+            app.canvas.winfo_width(), app.canvas.winfo_height(),
+            app.canvas_image_shape, app.preview_request_id,
+            getattr(app, "canvas_zoom_reason", "unknown"),
+        )
+
+    def real_click_and_check(screen_x: int, screen_y: int, expected, label: str) -> None:
+        if expected is None:
+            raise AssertionError(f"{label}: test coordinate is outside the application")
+        if not user32.SetCursorPos(int(screen_x), int(screen_y)):
+            raise AssertionError(f"{label}: SetCursorPos failed")
+        app.update_idletasks()
+        app.update()
+        pointer_x, pointer_y = app.winfo_pointerxy()
+        hit = app.winfo_containing(pointer_x, pointer_y)
+        if hit is not expected:
+            raise AssertionError(
+                f"{label}: real cursor hit {hit}, expected {expected}; "
+                f"pointer=({pointer_x},{pointer_y}) requested=({screen_x},{screen_y})"
+            )
+        before = snapshot()
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        time.sleep(0.04)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        deadline = time.monotonic() + 1.55
+        while time.monotonic() < deadline:
+            app.update_idletasks()
+            app.update()
+            time.sleep(0.01)
+        after = snapshot()
+        if after != before:
+            raise AssertionError(f"{label}: viewport changed: {before} -> {after}")
+
+    title_right = app.workspace_title_label.winfo_rootx() + app.workspace_title_label.winfo_width()
+    controls_left = app.paths_toggle_button.winfo_rootx()
+    header_x = (title_right + controls_left) // 2
+    header_y = app.header_panel.winfo_rooty() + app.header_panel.winfo_height() // 2
+    real_click_and_check(header_x, header_y, app.header_panel, "真实鼠标点击工作区标题旁空白")
+
+    load_x = app.load_project_button.winfo_rootx() + app.load_project_button.winfo_width() // 2
+    load_bottom = app.load_project_button.winfo_rooty() + app.load_project_button.winfo_height()
+    tools_bottom = app.mask_tools_tab.winfo_rooty() + app.mask_tools_tab.winfo_height()
+    below_y = min(tools_bottom - 2, load_bottom + max(1, (tools_bottom - load_bottom) // 2))
+    below_hit = app.winfo_containing(load_x, below_y)
+    if below_hit is app.load_project_button:
+        raise AssertionError("真实鼠标测试坐标仍落在载入项目按钮上")
+    real_click_and_check(load_x, below_y, below_hit, "真实鼠标点击载入项目下方空白")
+
+    return {
+        "real_windows_pointer": "passed",
+        "header_workspace_blank": "passed",
+        "below_load_project_blank": "passed",
+        "delay_seconds_each": 1.55,
     }
 
 

@@ -6,18 +6,23 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+import time
+from datetime import datetime
+from toolbox import SoftwareRegistry
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
 import cv2
 import numpy as np
+import psutil
 import tifffile
 from PIL import Image, ImageOps
 
 
 IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 Progress = Callable[[float, str], None]
+CancelCheck = Callable[[], None]
 PANORAMA_PROJECTIONS = {"rectilinear", "mercator", "equirectangular", "stereographic"}
 
 
@@ -33,6 +38,8 @@ class AlignmentItem:
     focal_length: float | None = None
     focal_source: str = ""
     sky_coverage: float | None = None
+    confirmed_tracks: list[dict] = field(default_factory=list)
+    aligned_tracks: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -59,28 +66,72 @@ class AlignmentResult:
     canvas_scale: float = 1.0
 
 
+def load_confirmed_meteor_tracks(folder: Path) -> dict[str, list[dict]]:
+    """Load screening-confirmed tracks by exported filename and stem."""
+    path = folder / "confirmed_meteor_tracks.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("format") != "meteor-confirmed-tracks-v1":
+            return {}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return {}
+    result: dict[str, list[dict]] = {}
+    for item in payload.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        tracks = [track for track in item.get("tracks", []) if isinstance(track, dict)]
+        for name in (item.get("exported_name"), item.get("source_name")):
+            if name:
+                key = str(name).casefold()
+                result[key] = tracks
+                result[Path(str(name)).stem.casefold()] = tracks
+    return result
+
+
+def project_confirmed_tracks(
+    tracks: list[dict], pairs: list[tuple[np.ndarray, np.ndarray]],
+    width: int, height: int,
+) -> list[dict]:
+    """Map normalized screening tracks through the accepted star homography."""
+    if not tracks or len(pairs) < 4:
+        return []
+    source = np.asarray([pair[0] for pair in pairs], np.float32)
+    target = np.asarray([pair[1] for pair in pairs], np.float32)
+    transform, _mask = cv2.findHomography(source, target, cv2.USAC_MAGSAC, 3.0)
+    if transform is None:
+        return []
+    projected_tracks = []
+    for track in tracks:
+        try:
+            normalized = np.asarray([
+                track["start_normalized"], track["end_normalized"],
+            ], np.float32)
+            points = normalized * np.asarray((max(1, width - 1), max(1, height - 1)), np.float32)
+            projected = cv2.perspectiveTransform(points[:, None, :], transform)[:, 0, :]
+        except (KeyError, TypeError, ValueError, cv2.error):
+            continue
+        mapped = dict(track)
+        mapped["aligned_start_normalized"] = [
+            float(projected[0, 0] / max(1, width - 1)),
+            float(projected[0, 1] / max(1, height - 1)),
+        ]
+        mapped["aligned_end_normalized"] = [
+            float(projected[1, 0] / max(1, width - 1)),
+            float(projected[1, 1] / max(1, height - 1)),
+        ]
+        mapped["mapping"] = "star_homography_reference"
+        projected_tracks.append(mapped)
+    return projected_tracks
+
+
 def default_ptgui_path() -> Path | None:
-    candidates = []
-    if sys.platform == "win32":
-        candidates += [Path(r"C:\Program Files\PTGui\PTGui.exe")]
-    elif sys.platform == "darwin":
-        candidates += [Path("/Applications/PTGui Pro.app/Contents/MacOS/PTGui Pro")]
-    return next((p for p in candidates if p.is_file()), None)
+    return SoftwareRegistry().resolve("ptgui")
 
 
 def default_siril_path() -> Path | None:
-    candidates = []
-    if sys.platform == "win32":
-        candidates += [
-            Path(r"C:\Program Files\Siril\bin\siril-cli.exe"),
-            Path(r"C:\Program Files\Siril\siril-cli.exe"),
-        ]
-    elif sys.platform == "darwin":
-        candidates += [Path("/Applications/Siril.app/Contents/MacOS/siril-cli")]
-    resolved = shutil.which("siril-cli")
-    if resolved:
-        candidates.append(Path(resolved))
-    return next((p for p in candidates if p.is_file()), None)
+    return SoftwareRegistry().resolve("siril")
 
 
 def list_images(folder: Path) -> list[Path]:
@@ -178,7 +229,7 @@ def make_sky_proxy(
     scale: float = 0.25,
     sky_fraction: float | None = None,
 ) -> tuple[int, int]:
-    rgb = _read_rgb8(source).copy()
+    rgb = _read_rgb8(source)
     height, width = rgb.shape[:2]
     proxy = cv2.resize(rgb, (max(32, round(width * scale)), max(32, round(height * scale))), interpolation=cv2.INTER_AREA)
     # ``sky_fraction`` is retained only as a legacy/fallback safety cap. The
@@ -251,7 +302,7 @@ def make_ptgui_sky_proxy(
     destination: Path,
     proxy_mask: np.ndarray,
 ) -> None:
-    rgb = _read_rgb8(source).copy()
+    rgb = _read_rgb8(source)
     mask = cv2.resize(proxy_mask, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LINEAR)
     feather = cv2.GaussianBlur(mask, (0, 0), max(2.0, min(rgb.shape[:2]) / 900.0)).astype(np.float32) / 255.0
     rgb = np.clip(rgb.astype(np.float32) * feather[:, :, None], 0, 255).astype(np.uint8)
@@ -273,7 +324,10 @@ def _script_path_text(path: Path) -> str:
     return str(path.resolve()).replace("\\", "/")
 
 
-def siril_find_stars(siril: Path, proxy: Path, work_dir: Path, name: str, max_stars: int = 1600) -> tuple[np.ndarray, str]:
+def siril_find_stars(
+    siril: Path, proxy: Path, work_dir: Path, name: str, max_stars: int = 1600,
+    cancel_check: CancelCheck | None = None,
+) -> tuple[np.ndarray, str]:
     work_dir.mkdir(parents=True, exist_ok=True)
     list_name = f"{name}_stars.lst"
     script = work_dir / f"{name}_findstars.ssf"
@@ -290,20 +344,15 @@ def siril_find_stars(siril: Path, proxy: Path, work_dir: Path, name: str, max_st
         ),
         encoding="utf-8",
     )
-    completed = subprocess.run(
+    return_code, output = _run_cancellable_process(
         [str(siril), "-o", "-d", str(work_dir), "-s", str(script)],
-        cwd=work_dir,
-        text=True,
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        work_dir, cancel_check,
     )
-    if completed.returncode != 0:
-        raise RuntimeError(f"Siril星点检测失败：{proxy.name}\n{completed.stdout[-1200:]}")
+    if return_code != 0:
+        raise RuntimeError(f"Siril星点检测失败：{proxy.name}\n{output[-1200:]}")
     star_file = work_dir / list_name
     if not star_file.is_file():
-        raise RuntimeError(f"Siril没有生成星表：{proxy.name}")
+        raise RuntimeError(f"Siril没有生成星表：{proxy.name}\n{output[-2000:]}")
     proxy_image = cv2.imdecode(np.fromfile(proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if proxy_image is None:
         raise RuntimeError(f"无法读取Siril星点代理：{proxy.name}")
@@ -337,7 +386,7 @@ def siril_find_stars(siril: Path, proxy: Path, work_dir: Path, name: str, max_st
     # geometric acceptance rule on sparse early frames.
     if len(rows) < 3:
         raise RuntimeError(f"Siril仅找到{len(rows)}个可用星点：{proxy.name}")
-    return np.asarray(rows, dtype=np.float32), completed.stdout
+    return np.asarray(rows, dtype=np.float32), output
 
 
 def _star_mask(shape: tuple[int, int], stars: np.ndarray, radius: int = 12) -> np.ndarray:
@@ -368,6 +417,7 @@ def match_star_pairs(
     meteor_stars: np.ndarray,
     base_stars: np.ndarray,
     full_scale: float,
+    excluded_tracks: list[dict] | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], float]:
     meteor = cv2.imdecode(np.fromfile(meteor_proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     base = cv2.imdecode(np.fromfile(base_proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
@@ -381,6 +431,25 @@ def match_star_pairs(
     sift = cv2.SIFT_create(nfeatures=16000, contrastThreshold=0.006, edgeThreshold=15, sigma=1.2)
     meteor_feature_mask = make_star_sky_mask(meteor.shape, meteor_stars, radius=max(12, round(min(meteor.shape) / 70)))
     base_feature_mask = make_star_sky_mask(base.shape, base_stars, radius=max(12, round(min(base.shape) / 70)))
+    # User-confirmed meteors are not stars and must never contribute SIFT
+    # control points. Coordinates are normalized, so the sidecar remains valid
+    # for RAW/JPEG/TIFF proxies of different sizes.
+    for track in excluded_tracks or []:
+        try:
+            start = track["start_normalized"]
+            end = track["end_normalized"]
+            p1 = (
+                round(float(start[0]) * max(1, meteor.shape[1] - 1)),
+                round(float(start[1]) * max(1, meteor.shape[0] - 1)),
+            )
+            p2 = (
+                round(float(end[0]) * max(1, meteor.shape[1] - 1)),
+                round(float(end[1]) * max(1, meteor.shape[0] - 1)),
+            )
+            thickness = max(12, round(min(meteor.shape) * 0.025))
+            cv2.line(meteor_feature_mask, p1, p2, 0, thickness, cv2.LINE_AA)
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
     mk, md = sift.detectAndCompute(meteor_features, meteor_feature_mask)
     bk, bd = sift.detectAndCompute(base_features, base_feature_mask)
     if md is None or bd is None:
@@ -428,36 +497,99 @@ def match_star_pairs(
 
 
 def alignment_solution_quality(control_points: int, median_error: float) -> tuple[bool, bool, str]:
-    """Classify a projective star solution without discarding usable 4–5 point fits."""
-    if control_points < 4:
-        return False, True, f"控制点不足：单应性对齐至少需要4组，当前{control_points}组"
+    """Reject exact-looking but unverified four/five-point homographies."""
+    if control_points < 6:
+        return False, True, f"控制点不足：可靠对齐至少需要6组，当前{control_points}组"
     if median_error > 8.0:
         return False, True, f"星点误差过大：{median_error:.2f}px，{control_points}组"
-    review = control_points < 6 or median_error > 3.0
+    review = median_error > 3.0
     reasons = []
-    if control_points < 6:
-        reasons.append(f"仅{control_points}组控制点")
     if median_error > 3.0:
         reasons.append(f"星点误差 {median_error:.2f}px")
     message = "、".join(reasons)
     return True, review, message
 
 
-def _run(command: list[str], cwd: Path, log_file: Path) -> str:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        text=True,
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-    )
-    output = completed.stdout or ""
+def ptgui_solution_sanity(project: dict) -> tuple[bool, str]:
+    """Reject a numerically fitted pose that sends most of the frame away."""
+    groups = project.get("imagegroups", [])
+    if len(groups) != 2:
+        return False, "PTGui单张工程结构异常"
+
+    def delta(key: str) -> float:
+        base = float(groups[0]["position"]["params"].get(key, 0.0))
+        source = float(groups[1]["position"]["params"].get(key, 0.0))
+        return (source - base + 180.0) % 360.0 - 180.0
+
+    yaw, pitch, roll = delta("yaw"), delta("pitch"), delta("roll")
+    panorama = project.get("panoramaparams", {})
+    hfov = max(1.0, float(panorama.get("hfov", 90.0)))
+    vfov = max(1.0, float(panorama.get("vfov", 60.0)))
+    if abs(roll) > 45.0:
+        return False, f"PTGui姿态异常：相对旋转 {roll:.1f}°"
+    if abs(yaw) > hfov * 0.8 + 5.0 or abs(pitch) > vfov * 0.8 + 5.0:
+        return False, f"PTGui姿态超出公共画布：yaw {yaw:.1f}° / pitch {pitch:.1f}°"
+    for lens in project.get("globallenses", []):
+        params = lens.get("lens", {}).get("params", {})
+        distortion = max(abs(float(params.get(key, 0.0))) for key in ("a", "b", "c"))
+        if distortion > 0.25:
+            return False, f"PTGui镜头畸变参数失控：{distortion:.3f}"
+    return True, ""
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    try:
+        parent = psutil.Process(process.pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            child.terminate()
+        parent.terminate()
+        _gone, alive = psutil.wait_procs([*children, parent], timeout=2.0)
+        for item in alive:
+            item.kill()
+    except (psutil.Error, OSError):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _run_cancellable_process(
+    command: list[str], cwd: Path, cancel_check: CancelCheck | None = None,
+) -> tuple[int, str]:
+    import tempfile
+
+    with tempfile.TemporaryFile(mode="w+b") as output_file:
+        process = subprocess.Popen(
+            command, cwd=cwd, stdout=output_file, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        try:
+            while True:
+                try:
+                    return_code = process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    if cancel_check is not None:
+                        cancel_check()
+        except BaseException:
+            _terminate_process_tree(process)
+            process.wait()
+            raise
+        output_file.seek(0)
+        output = output_file.read().decode("utf-8", errors="replace")
+    return return_code, output
+
+
+def _run(
+    command: list[str], cwd: Path, log_file: Path,
+    cancel_check: CancelCheck | None = None,
+) -> str:
+    return_code, output = _run_cancellable_process(command, cwd, cancel_check)
     with log_file.open("a", encoding="utf-8") as handle:
         handle.write("\n$ " + " ".join(command) + "\n" + output + "\n")
-    if completed.returncode != 0:
-        raise RuntimeError(f"命令失败（{completed.returncode}）：{Path(command[0]).name}\n{output[-1600:]}")
+    if return_code != 0:
+        raise RuntimeError(f"命令失败（{return_code}）：{Path(command[0]).name}\n{output[-1600:]}")
     return output
 
 
@@ -513,7 +645,7 @@ def configure_blog_project(
     align = project["projectsettings"]["alignsettings"]
     align.update(
         {
-            "generatecp": True,
+            "generatecp": False,
             "optimize": True,
             "roughlyalign": True,
             "straighten": False,
@@ -606,7 +738,11 @@ def configure_single_star_project(
         [base_lens, meteor_lens],
         image_width,
         image_height,
-        optimize_distortion=len(pairs) >= 16,
+        # A single base/source pair does not constrain lens distortion safely.
+        # Even dozens of accurate star correspondences can trade yaw/pitch for
+        # extreme a/b/c values and produce a low CP error but a visibly folded
+        # frame. EXIF fixes the physical lens; solve orientation only.
+        optimize_distortion=False,
         panorama_projection=panorama_projection,
         canvas_scale=canvas_scale,
     )
@@ -630,6 +766,9 @@ def configure_single_star_project(
     ]
     project["projectsettings"]["alignsettings"].update(
         {
+            # PTGui's single-project batch "align" gate must remain enabled
+            # even with explicit control points. ``autocpdone`` below prevents
+            # a new CP search; this flag lets -stitchnogui run the optimizer.
             "generatecp": True,
             "optimize": True,
             "roughlyalign": initial_position is None,
@@ -674,13 +813,24 @@ def transfer_single_solution(full_project_file: Path, proxy_project_file: Path) 
     full_project_file.write_text(json.dumps(full_data, ensure_ascii=False, indent="\t") + "\n", encoding="utf-8")
 
 
-def configure_layer_export(project_file: Path, output_base: Path) -> None:
+def configure_layer_export(
+    project_file: Path, output_base: Path, *, export_reference: bool = True,
+) -> None:
     data = json.loads(project_file.read_text(encoding="utf-8"))
     project = data["project"]
     project["outputcomponents"].update({"ldrpanorama": False, "ldrlayers": True, "ldrblendplanes": False})
+    if not export_reference:
+        for image in project["imagegroups"][0].get("images", []):
+            image["include"] = False
+            image["includeinpreview"] = False
     project["panoramaparams"]["outputfile"] = str(output_base)
     project["panoramaparams"]["fileformat"] = "tiff"
-    project["panoramaparams"]["tiffparams"].update({"datatype": "u16", "compression": "deflate", "alphatype": "unassociated"})
+    # These are short-lived editable layers, not the final delivery files.
+    # Deflate is especially expensive on noisy night photographs and can even
+    # make them larger than the raw pixel stream.  An uncompressed 16-bit TIFF
+    # is still lossless, opens faster, and removes a long CPU-bound step from
+    # every independently aligned photograph.
+    project["panoramaparams"]["tiffparams"].update({"datatype": "u16", "compression": "none", "alphatype": "unassociated"})
     project["panoramaparams"]["outputcrop"] = [0, 0, 1, 1]
     project["projectsettings"]["alignsettings"].update({"generatecp": False, "optimize": False, "optimizeexposure": False})
     project["projectsettings"]["batchstitchersettings"].update({"align": False, "stitch": True, "stitchonlyifcontrolpoints": True})
@@ -798,9 +948,19 @@ def run_alignment_pipeline(
     laboratory: bool = False,
     panorama_projection: str = "rectilinear",
     canvas_scale: float = 1.0,
+    cancel_check: CancelCheck | None = None,
+    confirmed_tracks_by_file: dict[str, list[dict]] | None = None,
+    reference_focal_length: float | None = None,
 ) -> AlignmentResult:
     if not base.is_file() or not meteor_files:
         raise ValueError("请选择对齐参考图和至少一张流星原图")
+    names: set[str] = set()
+    for source in meteor_files:
+        if source.stem.casefold() in names:
+            raise ValueError(f"同名素材会覆盖控制点工程：{source.name}。请将不同格式放入独立输入文件夹。")
+        names.add(source.stem.casefold())
+        if not source.is_file():
+            raise FileNotFoundError(source)
     for executable, label in ((ptgui, "PTGui"), (siril, "Siril")):
         if not executable.is_file():
             raise FileNotFoundError(f"找不到{label}：{executable}")
@@ -812,6 +972,7 @@ def run_alignment_pipeline(
         f"MeteorStudio_PTGui_Lab_{panorama_projection}_{round(canvas_scale * 100)}"
         if laboratory else "MeteorStudio_PTGui"
     )
+    task_name += "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     task_dir = output_root / task_name
     counter = 2
     while task_dir.exists():
@@ -829,14 +990,30 @@ def run_alignment_pipeline(
     log_file = task_dir / "pipeline.log"
     manifest_file = task_dir / "alignment_manifest.json"
     scale = 0.25
-    notify = progress or (lambda _value, _text: None)
-    base_lens = read_lens_info(base, focal_length, sensor_diagonal)
+    report = progress or (lambda _value, _text: None)
+
+    def notify(value: float, text: str) -> None:
+        if cancel_check is not None:
+            cancel_check()
+        report(value, text)
+    base_lens = read_lens_info(
+        base,
+        focal_length if reference_focal_length is None else reference_focal_length,
+        sensor_diagonal,
+    )
+    if reference_focal_length is not None and base_lens.source.startswith("兜底值"):
+        base_lens = ImageLensInfo(
+            float(reference_focal_length), base_lens.sensor_diagonal,
+            base_lens.equivalent_35mm, "用户填写（参考图EXIF缺失）",
+        )
     notify(1, f"生成对齐参考图星点代理（{base_lens.focal_length:.1f}mm，{base_lens.source}）…")
     base_proxy = proxy_dir / "base_sky.png"
     # Automatic mode always examines the full frame. A non-None value remains
     # available only for callers explicitly requesting the legacy safety cap.
     base_width, base_height = make_sky_proxy(base, base_proxy, scale, sky_fraction)
-    base_stars, siril_log = siril_find_stars(siril, base_proxy, siril_dir, "base")
+    base_stars, siril_log = siril_find_stars(
+        siril, base_proxy, siril_dir, "base", cancel_check=cancel_check
+    )
     base_proxy_image = cv2.imdecode(np.fromfile(base_proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if base_proxy_image is None:
         raise RuntimeError("无法读取对齐参考图星点代理")
@@ -851,7 +1028,13 @@ def run_alignment_pipeline(
     accepted_proxies: list[Path] = []
     accepted_lenses: list[ImageLensInfo] = []
     for sequence, source in enumerate(meteor_files, start=1):
-        item = AlignmentItem(str(source))
+        track_lookup = confirmed_tracks_by_file or {}
+        source_tracks = list(
+            track_lookup.get(source.name.casefold())
+            or track_lookup.get(source.stem.casefold())
+            or []
+        )
+        item = AlignmentItem(str(source), confirmed_tracks=source_tracks)
         try:
             lens_info = read_lens_info(source, focal_length, sensor_diagonal)
             item.focal_length = lens_info.focal_length
@@ -862,9 +1045,9 @@ def run_alignment_pipeline(
             )
             proxy = proxy_dir / f"{source.stem}_sky.png"
             width, height = make_sky_proxy(source, proxy, scale, sky_fraction)
-            if (width, height) != (base_width, base_height):
-                raise ValueError(f"尺寸{width}×{height}与对齐参考图{base_width}×{base_height}不同")
-            stars, star_log = siril_find_stars(siril, proxy, siril_dir, source.stem)
+            stars, star_log = siril_find_stars(
+                siril, proxy, siril_dir, source.stem, cancel_check=cancel_check
+            )
             siril_log += "\n" + star_log
             proxy_image = cv2.imdecode(np.fromfile(proxy, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
             if proxy_image is None:
@@ -873,9 +1056,15 @@ def run_alignment_pipeline(
             sky_mask = make_star_sky_mask(proxy_image.shape, stars)
             item.sky_coverage = float(np.count_nonzero(sky_mask) / sky_mask.size)
             cv2.imencode(".png", sky_mask)[1].tofile(mask_dir / f"{source.stem}_sky_mask.png")
-            pairs, median_error = match_star_pairs(proxy, base_proxy, stars, base_stars, scale)
+            pairs, median_error = match_star_pairs(
+                proxy, base_proxy, stars, base_stars, scale,
+                excluded_tracks=source_tracks,
+            )
             item.control_points = len(pairs)
             item.median_error = median_error
+            item.aligned_tracks = project_confirmed_tracks(
+                source_tracks, pairs, width, height,
+            )
             accepted_solution, needs_review, quality_message = alignment_solution_quality(
                 len(pairs), median_error,
             )
@@ -892,6 +1081,9 @@ def run_alignment_pipeline(
                 item.status = "可对齐"
             lens_note = f"焦距 {lens_info.focal_length:.1f}mm（{lens_info.source}），自动星点有效区 {item.sky_coverage * 100:.1f}%"
             item.message = f"{item.message}；{lens_note}" if item.message else lens_note
+            if source_tracks:
+                track_note = f"已继承筛选确认流星 {len(source_tracks)} 条，并从星点控制区排除"
+                item.message = f"{item.message}；{track_note}"
             item.layer_index = len(accepted) + 2
             accepted.append(source)
             ptgui_proxy = ptgui_proxy_dir / f"{source.stem}_sky_full.jpg"
@@ -900,29 +1092,41 @@ def run_alignment_pipeline(
             accepted_lenses.append(lens_info)
             matched.append((item.layer_index, pairs))
         except Exception as exc:
+            if cancel_check is not None:
+                cancel_check()
             item.status = "需处理"
             item.message = str(exc)
         items.append(item)
         manifest_file.write_text(json.dumps({"items": [asdict(x) for x in items]}, ensure_ascii=False, indent=2), encoding="utf-8")
     if not accepted:
         for item in items:
-            item.status = "已输出（原始状态）"
-            item.output_layer = item.source
-            item.message = (item.message + "；" if item.message else "") + "自动对齐无法建立，已保留原始素材供手动放置"
+            if export_layers:
+                item.status = "已输出（原始状态）"
+                item.output_layer = item.source
+                item.message = (item.message + "；" if item.message else "") + "自动对齐无法建立，已保留原始素材供手动放置"
         result = AlignmentResult(
             str(task_dir), "", str(base), None, items, str(log_file),
             siril_log.splitlines()[1] if len(siril_log.splitlines()) > 1 else "Siril",
             str(ptgui), str(siril), laboratory, panorama_projection, canvas_scale,
         )
         manifest_file.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
-        notify(100, "无可靠对齐；已输出全部原始状态")
+        notify(100, "无可靠对齐；已保留原始状态" if export_layers else "未生成可靠控制点，请查看逐张失败原因")
         return result
     notify(52, "按每张EXIF焦距创建独立镜头模型…")
     sky_projects = project_dir / "sky_projects"
     ready_projects = project_dir / "ready_projects"
     sky_projects.mkdir(exist_ok=True)
     ready_projects.mkdir(exist_ok=True)
-    base_layer = None
+    # With the normal rectilinear 100% canvas, PTGui's reference layer has the
+    # same geometry as the selected reference photograph. Reuse that read-only
+    # input directly instead of rendering an identical 16-bit RGBA TIFF. Lab
+    # projections still need one rendered reference because their canvas and
+    # projection genuinely differ.
+    reuse_input_reference = (
+        not laboratory and panorama_projection == "rectilinear"
+        and abs(canvas_scale - 1.0) < 1e-9
+    )
+    base_layer = str(base) if reuse_input_reference else None
     duplicate_layer = None
     first_ready_project: Path | None = None
     previous_position: dict[str, float] | None = None
@@ -933,47 +1137,70 @@ def run_alignment_pipeline(
         item = by_source[str(source)]
         needs_review = item.status == "需复查"
         try:
-            notify(58 + index / len(accepted) * 34, f"PTGui单张对齐 {index}/{len(accepted)}：{source.name}")
+            item_started = time.perf_counter()
+            notify(58 + index / len(accepted) * 34, f"PTGui优化位置 {index}/{len(accepted)}：{source.name}")
             sky_project = sky_projects / f"{source.stem}_sky.pts"
-            _run([str(ptgui), "-createproject", str(base_ptgui_proxy), str(proxy), "-output", str(sky_project)], project_dir, log_file)
+            _run([str(ptgui), "-createproject", str(base_ptgui_proxy), str(proxy), "-output", str(sky_project)], project_dir, log_file, cancel_check)
             configure_single_star_project(
                 sky_project, pairs, base_lens, source_lens, base_width, base_height,
                 initial_position=previous_position if needs_review else None,
                 panorama_projection=panorama_projection, canvas_scale=canvas_scale,
             )
-            _run([str(ptgui), "-stitchnogui", str(sky_project)], project_dir, log_file)
+            _run([str(ptgui), "-stitchnogui", str(sky_project)], project_dir, log_file, cancel_check)
             optimized = json.loads(sky_project.read_text(encoding="utf-8"))["project"]
             if not optimized.get("hasbeenoptimized"):
                 raise RuntimeError("PTGui没有完成单张优化")
+            sane, sanity_message = ptgui_solution_sanity(optimized)
+            if not sane:
+                raise RuntimeError(sanity_message)
             solved_position = optimized["imagegroups"][1]["position"]["params"]
             previous_position = {key: float(solved_position[key]) for key in ("yaw", "pitch", "roll")}
             ready_project = ready_projects / f"{source.stem}_READY.pts"
-            _run([str(ptgui), "-createproject", str(base), str(source), "-output", str(ready_project)], project_dir, log_file)
+            _run([str(ptgui), "-createproject", str(base), str(source), "-output", str(ready_project)], project_dir, log_file, cancel_check)
             configure_input_lenses(
                 ready_project, [base_lens, source_lens], base_width, base_height,
                 panorama_projection=panorama_projection, canvas_scale=canvas_scale,
             )
             transfer_single_solution(ready_project, sky_project)
+            if not export_layers:
+                item.status = "工程已生成（需复查）" if needs_review else "工程已生成"
+                item.message += f"；{ready_project}"
             first_ready_project = first_ready_project or ready_project
             if export_layers:
                 output_base = layer_dir / f"{source.stem}_aligned.tif"
-                configure_layer_export(ready_project, output_base)
-                _run([str(ptgui), "-stitchnogui", str(ready_project)], project_dir, log_file)
-                generated_base = layer_dir / f"{source.stem}_aligned0000.tif"
-                generated_meteor = layer_dir / f"{source.stem}_aligned0001.tif"
-                if not generated_base.is_file() or not generated_meteor.is_file():
+                export_reference = base_layer is None
+                configure_layer_export(
+                    ready_project, output_base, export_reference=export_reference
+                )
+                notify(
+                    58 + index / len(accepted) * 34,
+                    f"PTGui导出16位流星层 {index}/{len(accepted)}：{source.name}"
+                    + (
+                        "（同时生成一次投影参考层）" if export_reference
+                        else "（直接复用参考图，不重复导出）"
+                    ),
+                )
+                _run([str(ptgui), "-stitchnogui", str(ready_project)], project_dir, log_file, cancel_check)
+                generated = sorted(layer_dir.glob(f"{source.stem}_aligned*.tif"))
+                if export_reference and len(generated) != 2:
                     raise RuntimeError("PTGui缺少单张导出图层")
-                if base_layer is None:
+                if not export_reference and len(generated) != 1:
+                    raise RuntimeError("PTGui没有按预期只导出流星图层")
+                if export_reference:
+                    generated_base, generated_meteor = generated
                     base_target = reference_dir / "alignment_reference.tif"
                     os.replace(generated_base, base_target)
                     base_layer = str(base_target)
                 else:
-                    generated_base.unlink()
+                    generated_meteor = generated[0]
                 target = layer_dir / f"{source.stem}.tif"
                 os.replace(generated_meteor, target)
                 item.output_layer = str(target)
                 item.status = "已导出（需复查）" if needs_review else "已导出"
+                item.message += f"；本张优化与导出 {time.perf_counter() - item_started:.1f}秒"
         except Exception as exc:
+            if cancel_check is not None:
+                cancel_check()
             item.status = "需处理"
             item.message = str(exc)
     project_file = first_ready_project or project_dir
@@ -994,5 +1221,5 @@ def run_alignment_pipeline(
         str(ptgui), str(siril), laboratory, panorama_projection, canvas_scale,
     )
     manifest_file.write_text(json.dumps(asdict(result), ensure_ascii=False, indent=2), encoding="utf-8")
-    notify(100, "对齐图层已返回MeteorStudio")
+    notify(100, "对齐图层处理完成" if export_layers else "独立控制点工程处理完成")
     return result

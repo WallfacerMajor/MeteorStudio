@@ -9,7 +9,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import traceback
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -23,6 +22,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from PIL import Image, ImageTk
 from platform_utils import open_folder
 from error_dialog import append_runtime_log, show_copyable_error, show_runtime_log
+from background_tasks import (
+    BackgroundTaskScheduler, CancellationToken, TaskCancelledError,
+)
 
 
 VIDEO_PROJECT_VERSION = 3
@@ -636,6 +638,11 @@ def sample_clip(clip: EventClip, age: int, fps: float) -> list[tuple[ResidualLay
 
 
 def ffmpeg_executable() -> str | None:
+    from toolbox import SoftwareRegistry
+    registry = SoftwareRegistry()
+    resolved = registry.resolve("ffmpeg")
+    if resolved is not None or registry.paths.get("ffmpeg"):
+        return str(resolved) if resolved is not None else None
     name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
     candidates: list[Path] = []
     bundle_root = getattr(sys, "_MEIPASS", None)
@@ -780,6 +787,12 @@ def render_video(
     stderr_file.seek(0)
     ffmpeg_details = stderr_file.read().decode("utf-8", errors="replace").strip()
     stderr_file.close()
+    if isinstance(render_error, TaskCancelledError):
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise render_error
     if render_error is not None or return_code != 0:
         details = ffmpeg_details or str(render_error or "未知 FFmpeg 错误")
         append_runtime_log("视频编码失败", details)
@@ -803,7 +816,7 @@ def video_autosave_path() -> Path:
 class VideoMeteorWindow(tk.Toplevel):
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
-        self.title("流星影像工坊 — 视频动态")
+        self.title("星野工具箱 — 视频动态")
         self.geometry("1420x900")
         self.minsize(1120, 720)
 
@@ -853,14 +866,27 @@ class VideoMeteorWindow(tk.Toplevel):
         self.cursor_item: int | None = None
         self.context_stroke_index: int | None = None
         self.work_queue: queue.Queue = queue.Queue()
+        self.background_tasks = BackgroundTaskScheduler(
+            max_workers=1, thread_name_prefix="meteor-video"
+        )
         self.busy = False
         self.autosave_file = video_autosave_path()
         self.autosave_after_id: str | None = None
 
         self._build_ui()
         self._bind_shortcuts()
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.after(150, self._poll_queue)
         self.after(300, self._restore_autosave)
+
+    def destroy(self) -> None:
+        from ui_navigation import cancel_widget_timers
+        cancel_widget_timers(self)
+        scheduler = getattr(self, "background_tasks", None)
+        if scheduler is not None:
+            scheduler.shutdown(wait=False)
+            self.background_tasks = None
+        super().destroy()
 
     def _build_ui(self) -> None:
         root = ttk.Frame(self, padding=10)
@@ -868,12 +894,12 @@ class VideoMeteorWindow(tk.Toplevel):
 
         header = ttk.Frame(root)
         header.pack(fill="x", pady=(0, 8))
-        ttk.Label(header, text="视频流星动态", font=("TkDefaultFont", 15, "bold")).pack(side="left")
+        ttk.Label(header, text="视频流星动态", style="Title.TLabel").pack(side="left")
         ttk.Label(
             header,
             text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
         ).pack(side="left", padx=14)
-        ttk.Button(header, text="返回流星合成工作区", command=self.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(header, text="返回流星合成工作区", command=self._return_to_composer).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
@@ -1027,7 +1053,7 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Label(
             right,
             text="流星速度和背景速度互相独立。\n背景减速不会拉长流星动态。\n匹配源视频默认使用兼容编码。",
-            foreground="#555555",
+            foreground="#9aafc5",
             justify="left",
         ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
         right.columnconfigure(1, weight=1)
@@ -1140,7 +1166,7 @@ class VideoMeteorWindow(tk.Toplevel):
         output.mkdir(parents=True, exist_ok=True)
         return video, clean, output
 
-    def _start_worker(self, worker: Callable[[], tuple], label: str) -> None:
+    def _start_worker(self, worker: Callable[[CancellationToken], tuple], label: str) -> None:
         if self.busy:
             messagebox.showwarning(self.title(), "当前任务尚未完成")
             return
@@ -1148,13 +1174,14 @@ class VideoMeteorWindow(tk.Toplevel):
         self.progress["value"] = 0
         self.status.set(label)
 
-        def run() -> None:
-            try:
-                self.work_queue.put(worker())
-            except Exception as exc:
-                self.work_queue.put(("error", str(exc), traceback.format_exc()))
+        def failed(exc: Exception, details: str) -> None:
+            if not isinstance(exc, TaskCancelledError):
+                self.work_queue.put(("error", str(exc), details))
 
-        threading.Thread(target=run, daemon=True).start()
+        self.background_tasks.submit(
+            "operation", worker, on_result=self.work_queue.put,
+            on_error=failed, replace=True,
+        )
 
     def analyze(self) -> None:
         try:
@@ -1164,13 +1191,18 @@ class VideoMeteorWindow(tk.Toplevel):
             show_copyable_error(self.title(), str(exc), parent=self)
             return
 
-        def worker() -> tuple:
+        def worker(token: CancellationToken) -> tuple:
+            def progress(value: float, text: str) -> None:
+                token.raise_if_cancelled()
+                self.work_queue.put(("progress", value, text))
+
             info, events = analyze_video(
                 video,
                 clean,
                 ignore_bottom,
-                lambda value, text: self.work_queue.put(("progress", value, text)),
+                progress,
             )
+            token.raise_if_cancelled()
             return "analysis_done", info, events
 
         self._start_worker(worker, "开始分析视频…")
@@ -1807,6 +1839,29 @@ class VideoMeteorWindow(tk.Toplevel):
             append_runtime_log("视频项目自动保存失败", traceback.format_exc())
             self.status.set(f"自动保存失败：{exc}")
 
+    def _return_to_composer(self) -> None:
+        master = self.master
+        self._request_close()
+        if not self.winfo_exists() and hasattr(master, "show_composite_workspace"):
+            master.show_composite_workspace()
+
+    def _request_close(self) -> None:
+        if self.busy and not messagebox.askyesno(
+            "视频任务正在运行",
+            "分析或导出尚未完成。关闭会取消任务，并移除未完成的视频文件。确定关闭吗？",
+            parent=self,
+        ):
+            return
+        if self.autosave_after_id is not None:
+            try:
+                self.after_cancel(self.autosave_after_id)
+            except tk.TclError:
+                pass
+            self.autosave_after_id = None
+        self._write_autosave()
+        self.background_tasks.shutdown(wait=False)
+        self.destroy()
+
     def _restore_autosave(self) -> None:
         if not self.autosave_file.is_file():
             return
@@ -1853,18 +1908,23 @@ class VideoMeteorWindow(tk.Toplevel):
             return
         output_path = output_dir / f"{video.stem}_meteor_dynamic_{datetime.now():%Y%m%d_%H%M%S}.mp4"
 
-        def worker() -> tuple:
+        def worker(token: CancellationToken) -> tuple:
+            def progress(value: float, text: str) -> None:
+                token.raise_if_cancelled()
+                self.work_queue.put(("progress", value, text))
+
             info, clips = prepare_layers(
                 video, clean, events_snapshot, defaults,
-                lambda value, text: self.work_queue.put(("progress", value, text)),
+                progress,
             )
             if len(clips) != len(accepted):
                 self.work_queue.put(("progress", 24.0, f"警告：{len(accepted) - len(clips)} 个候选没有提取到有效亮度层"))
             result = render_video(
                 video, output_path, info, clips, speed, keep_audio,
-                lambda value, text: self.work_queue.put(("progress", value, text)),
+                progress,
                 encoding_quality,
             )
+            token.raise_if_cancelled()
             return "export_done", result, len(clips)
 
         self._start_worker(worker, "开始准备流星亮度层…")

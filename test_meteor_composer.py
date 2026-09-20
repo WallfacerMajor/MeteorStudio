@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import cv2
 import tifffile
+from background_tasks import CancellationToken
 
 from meteor_composer import (
     MeteorComposer, Stroke, content_distance_map, line_inside_valid_content,
@@ -25,7 +26,22 @@ from meteor_composer import (
     strokes_for_composite_crop, preview_memory_budgets,
     estimate_trail_mask_geometry,
     to_uint16, place_source_on_canvas,
+    alignment_tracks_to_strokes,
 )
+
+
+class AlignmentTrackImportTests(unittest.TestCase):
+    def test_confirmed_alignment_track_becomes_locked_stroke(self):
+        strokes = alignment_tracks_to_strokes([{
+            "aligned_start_normalized": [0.2, 0.3],
+            "aligned_end_normalized": [0.7, 0.6],
+            "score": 93,
+        }], 7952, 5304)
+        self.assertEqual(len(strokes), 1)
+        self.assertTrue(strokes[0].locked)
+        self.assertEqual(strokes[0].auto_score, 93)
+        self.assertEqual(strokes[0].source_mode, "aligned")
+        self.assertGreater(strokes[0].width, 12)
 
 
 class FakeVar:
@@ -52,6 +68,40 @@ class SourceCanvasPlacementTests(unittest.TestCase):
         placed = place_source_on_canvas(source, 6, 6)
         self.assertEqual(placed.shape, (6, 6, 3))
         self.assertTrue(np.any(placed))
+
+    def test_preview_worker_places_a_different_size_source_on_the_base_canvas(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            paths = {
+                name: root / f"{name}.tif"
+                for name in ("source", "aligned", "original", "base")
+            }
+            for path in paths.values():
+                path.write_bytes(b"test")
+            source = np.full((20, 30, 3), 9000, dtype=np.uint16)
+            base = np.zeros((40, 70, 3), dtype=np.uint16)
+            decoded = {
+                paths["source"]: source,
+                paths["aligned"]: source,
+                paths["original"]: source,
+                paths["base"]: base,
+            }
+            fake = SimpleNamespace(
+                preview_cache_lock=threading.Lock(), preview_cache=OrderedDict(),
+                _file_identity=lambda path: (str(path),),
+                _cached_display_with_precision=lambda path: decoded[path],
+                _store_layer_preview_locked=lambda _key, _value: None,
+                _store_preview_payload_locked=lambda key, value: fake.preview_cache.__setitem__(key, value),
+            )
+            result = MeteorComposer._load_preview_worker(
+                fake, paths["source"], paths["source"], paths["aligned"],
+                paths["original"], paths["base"], "signature", 7,
+            )
+        shown = result[3]
+        self.assertEqual(shown.shape[:2], (40, 70))
+        np.testing.assert_array_equal(shown[10:30, 20:50], source)
+        self.assertFalse(np.any(shown[:, :20]))
+        self.assertEqual(result[7], (70, 40))
 
 
 class FloatTiffDisplayTests(unittest.TestCase):
@@ -90,6 +140,21 @@ class FullResolutionPreviewTests(unittest.TestCase):
             second = MeteorComposer._cached_full_image(fake, path, False)
             self.assertEqual(first.shape, (40, 60, 3))
             self.assertIs(first, second)
+
+    def test_real_project_8k_stroke_keeps_a_small_export_roi(self):
+        width, height = 7952, 5304
+        stroke = Stroke(
+            [(3950 / (width - 1), 2630 / (height - 1)),
+             (4000 / (width - 1), 2660 / (height - 1))],
+            18, 10,
+        )
+        cropped_strokes, (x0, y0, x1, y1) = strokes_for_composite_crop(
+            [stroke], width, height, True
+        )
+        self.assertEqual(len(cropped_strokes), 1)
+        self.assertLessEqual(x1 - x0, 320)
+        self.assertLessEqual(y1 - y0, 260)
+        self.assertLess((x1 - x0) * (y1 - y0), width * height // 500)
 
     def test_transformed_mask_is_limited_to_affected_crop(self):
         source = np.zeros((600, 900, 3), dtype=np.uint8)
@@ -423,7 +488,7 @@ class BaseSelectionInvalidationTests(unittest.TestCase):
             image = np.zeros((24, 32, 3), dtype=np.uint16)
             tifffile.imwrite(source, image, photometric="rgb")
             cv2.imencode(".jpg", np.zeros((24, 32, 3), dtype=np.uint8))[1].tofile(old_base)
-            cv2.imencode(".jpg", np.full((24, 32, 3), 180, dtype=np.uint8))[1].tofile(new_base)
+            cv2.imencode(".jpg", np.full((30, 45, 3), 180, dtype=np.uint8))[1].tofile(new_base)
             fake = SimpleNamespace(
                 current_path=source, source_dir=FakeVar(str(source_dir)),
                 base_dir=FakeVar(str(new_base)), output_dir=FakeVar(str(output_dir)),
@@ -445,6 +510,7 @@ class BaseSelectionInvalidationTests(unittest.TestCase):
             self.assertEqual(fake.pairs[str(source)], new_base)
             self.assertEqual(fake.tree.selected, "0")
             self.assertEqual(reloads, [True])
+            self.assertIn("尺寸不同 1 张，已按比例居中适配", fake.status.get())
 
 
 class LiveBrushPerformanceTests(unittest.TestCase):
@@ -460,6 +526,152 @@ class LiveBrushPerformanceTests(unittest.TestCase):
         )
         MeteorComposer._refresh_live_mask(fake, force=True)
         self.assertEqual(calls, ["overlay"])
+
+
+class TiffMaterialTreeInteractionTests(unittest.TestCase):
+    def test_empty_selection_cancels_pending_load_without_scheduling_another(self):
+        cancelled = []
+        fake = SimpleNamespace(
+            preview_selection_after_id="pending-preview",
+            tree=SimpleNamespace(selection=lambda: ()),
+            after_cancel=lambda callback_id: cancelled.append(callback_id),
+            after=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("empty TIFF selection scheduled a preview load")
+            ),
+            load_selected=lambda: None,
+        )
+
+        MeteorComposer._tree_selection_changed(fake)
+
+        self.assertEqual(cancelled, ["pending-preview"])
+        self.assertIsNone(fake.preview_selection_after_id)
+
+    def test_blank_tree_pointer_is_consumed_before_class_binding(self):
+        tree = SimpleNamespace(
+            identify_row=lambda _y: "",
+            identify_region=lambda _x, _y: "nothing",
+        )
+        fake = SimpleNamespace(tree=tree, tree_blank_pointer_active=False)
+
+        result = MeteorComposer._tree_pointer_press(fake, SimpleNamespace(x=40, y=220))
+
+        self.assertEqual(result, "break")
+        self.assertTrue(fake.tree_blank_pointer_active)
+        self.assertEqual(MeteorComposer._tree_pointer_release(fake), "break")
+        self.assertFalse(fake.tree_blank_pointer_active)
+
+
+class PreviewCanvasInteractionTests(unittest.TestCase):
+    def test_numeric_zoom_shortcuts_are_key_events_not_mouse_button_events(self):
+        class BindingTarget:
+            def __init__(self):
+                self.sequences = []
+
+            def bind_all(self, sequence, _callback, **_kwargs):
+                self.sequences.append(sequence)
+
+            def __getattr__(self, _name):
+                return lambda *_args, **_kwargs: None
+
+        fake = BindingTarget()
+        MeteorComposer._bind_shortcuts(fake)
+
+        self.assertIn("<Control-KeyPress-1>", fake.sequences)
+        self.assertIn("<Command-KeyPress-1>", fake.sequences)
+        self.assertNotIn("<Control-1>", fake.sequences)
+        self.assertNotIn("<Command-1>", fake.sequences)
+
+    def test_configure_updates_allocation_without_changing_zoom(self):
+        calls = []
+        fake = SimpleNamespace(
+            preview_rgb=np.zeros((100, 160, 3), dtype=np.uint8),
+            canvas_zoom=0.575,
+            canvas_center_x=80.0,
+            canvas_center_y=50.0,
+            canvas_last_allocation=(640, 480),
+            canvas=SimpleNamespace(winfo_width=lambda: 640, winfo_height=lambda: 480),
+            _clamp_canvas_center=lambda: calls.append("clamp"),
+            _redraw_canvas_only=lambda: calls.append("redraw"),
+        )
+
+        MeteorComposer._canvas_configure(fake, SimpleNamespace(width=800, height=360))
+
+        self.assertEqual(fake.canvas_zoom, 0.575)
+        self.assertEqual(fake.canvas_last_allocation, (800, 360))
+        self.assertEqual(calls, ["clamp", "redraw"])
+
+
+class LocalTransformFallbackTests(unittest.TestCase):
+    def test_cache_miss_keeps_local_drag_frame_without_global_rebuild(self):
+        before = Stroke([(0.1, 0.2), (0.3, 0.4)], 12, 4, offset_x=0)
+        current = Stroke([(0.1, 0.2), (0.3, 0.4)], 12, 4, offset_x=18)
+        calls = []
+        fake = SimpleNamespace(
+            object_drag_original=before,
+            object_drag_live_source=np.zeros((2, 2, 3), dtype=np.uint8),
+            object_drag_live_box=(1, 1, 3, 3),
+            object_drag_mode="move", object_drag_start=(0.0, 0.0),
+            preview_rgb=np.zeros((4, 4, 3), dtype=np.uint8),
+            last_incremental_box=None,
+            _selected_stroke=lambda: current,
+            _incremental_selected_object_image=lambda _before: None,
+            _materialize_live_drag_image=lambda: np.zeros((4, 4, 3), dtype=np.uint8),
+            _clear_live_object_drag=lambda: calls.append("clear-live"),
+            _record_object_transform=lambda _before: calls.append("record"),
+            _commit_incremental_global_preview=lambda image, **kwargs: calls.append(
+                ("local-commit", image, kwargs)
+            ),
+            _cancel_deferred_full_preview_work=lambda: calls.append("cancel-full"),
+            _draw_selected_object_overlay=lambda: calls.append("overlay"),
+            _invalidate_global_preview=lambda: self.fail("cache miss invalidated globally"),
+            _render_preview=lambda: self.fail("cache miss rendered the full preview"),
+            status=FakeVar(),
+        )
+
+        MeteorComposer._object_pointer_end(fake)
+
+        local = next(item for item in calls if isinstance(item, tuple))
+        self.assertEqual(local[0], "local-commit")
+        self.assertTrue(local[2]["realtime"])
+        self.assertFalse(local[2]["validate"])
+        self.assertEqual(local[2]["dirty_box"], (1, 1, 3, 3))
+        self.assertIn("未启动全图重建", fake.status.get())
+
+
+class EditHistoryTests(unittest.TestCase):
+    def test_history_keeps_latest_one_hundred_actions(self):
+        fake = SimpleNamespace(
+            edit_history={}, edit_redo={}, last_edit_key=None,
+            _refresh_history_ui=lambda _key=None: None,
+            _schedule_autosave=lambda: None,
+        )
+        key = "frame.tif"
+        actions = []
+        for index in range(101):
+            action = ("add", index, Stroke([(0.1, 0.2)], 8, 2))
+            actions.append(action)
+            MeteorComposer._record_edit(fake, key, action)
+
+        self.assertEqual(len(fake.edit_history[key]), 100)
+        self.assertIs(fake.edit_history[key][0], actions[1])
+        self.assertIs(fake.edit_history[key][-1], actions[-1])
+
+    def test_new_edit_after_undo_discards_future_branch(self):
+        previous = ("add", 0, Stroke([(0.1, 0.2)], 8, 2))
+        future = ("delete", 0, previous[2])
+        fake = SimpleNamespace(
+            edit_history={"frame.tif": [previous]},
+            edit_redo={"frame.tif": [future]},
+            last_edit_key="frame.tif",
+            _refresh_history_ui=lambda _key=None: None,
+            _schedule_autosave=lambda: None,
+        )
+        replacement = ("add", 1, Stroke([(0.3, 0.4)], 10, 3))
+
+        MeteorComposer._record_edit(fake, "frame.tif", replacement)
+
+        self.assertEqual(fake.edit_history["frame.tif"], [previous, replacement])
+        self.assertNotIn("frame.tif", fake.edit_redo)
 
 
 class CandidateButtonGeometryTests(unittest.TestCase):
@@ -1021,6 +1233,34 @@ class ExportModeTests(unittest.TestCase):
             self.assertFalse(report["items"][1]["original_state"])
             self.assertEqual(report["items"][0]["outputs"], report["items"][1]["outputs"])
 
+    def test_combined_mode_accepts_a_larger_different_aspect_base(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            base = root / "wide_base.tif"
+            source = root / "small_source.tif"
+            self.write_tiff(base, np.zeros((80, 140, 3), dtype=np.uint16))
+            material = np.zeros((40, 60, 3), dtype=np.uint16)
+            material[17:23, 10:50] = 52000
+            self.write_tiff(source, material)
+            # The 60x40 source is placed without stretching at x=40, y=20 on
+            # the 140x80 output canvas. Strokes therefore remain canvas based.
+            stroke = Stroke([(50 / 139, 40 / 79), (90 / 139, 40 / 79)], 10, 0)
+            fake = SimpleNamespace(work_queue=queue.Queue())
+            result = MeteorComposer._export_worker(
+                fake, root / "out", {source: [stroke]}, {str(source): base}, {},
+                {"match_exposure": False, "curve_enabled": False,
+                 "curve_shadows": 15, "curve_highlights": 25},
+                True, False, "普通粘贴", {str(source): source}, "combined",
+            )
+            run_dir = Path(result[1])
+            clean = next(
+                path for path in (run_dir / "final_tiff").glob("*.tif")
+                if "来源标注" not in path.name
+            )
+            exported = tifffile.imread(clean)
+            self.assertEqual(exported.shape[:2], (80, 140))
+            self.assertGreater(int(exported[40, 70].max()), 20000)
+
     def test_separate_mode_writes_unique_source_names(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -1076,6 +1316,19 @@ class ExportModeTests(unittest.TestCase):
             "普通粘贴", {},
         )
         self.assertEqual(result, ("global_preview_cancelled", "old-signature"))
+
+    def test_cancelled_global_preview_stops_before_decoding_sources(self):
+        fake = SimpleNamespace(work_queue=queue.Queue(), global_preview_generation=1)
+        token = CancellationToken("global_preview_task", 1)
+        token.cancel()
+        result = MeteorComposer._global_preview_worker(
+            fake, "signature", 1, np.zeros((20, 30, 3), dtype=np.uint8),
+            {Path("must-not-be-read.tif"): [Stroke([(0.1, 0.1), (0.8, 0.8)], 5, 1)]},
+            {}, {"match_exposure": False, "curve_enabled": False,
+                 "curve_shadows": 15, "curve_highlights": 25},
+            "普通粘贴", {}, cancellation_token=token,
+        )
+        self.assertEqual(result, ("global_preview_cancelled", "signature"))
 
 
 

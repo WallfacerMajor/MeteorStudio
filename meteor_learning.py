@@ -11,6 +11,7 @@ import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
+from meteor_detection import ML_FEATURE_NAMES
 
 
 PARAMETERS = {
@@ -85,6 +86,12 @@ def build_feedback_dataset(
     rows, labels, groups, legacy, metadata = [], [], [], [], []
     total = max(1, len(marked))
     for index, (source_path, strokes) in enumerate(marked.items(), start=1):
+        # Auto-selected masks are predictions, not labels. A manual stroke or
+        # explicitly locked candidate is evidence; unreviewed candidates are not.
+        strokes = [item for item in strokes
+                   if item.erase or item.locked or item.auto_score is None]
+        if not any(not item.erase for item in strokes):
+            continue
         base_path = pairs.get(str(source_path))
         if base_path is None or not source_path.is_file() or not base_path.is_file():
             continue
@@ -110,14 +117,18 @@ def build_feedback_dataset(
             xs = np.linspace(start[0], end[0], samples).clip(0, width - 1).astype(np.int32)
             ys = np.linspace(start[1], end[1], samples).clip(0, height - 1).astype(np.int32)
             overlap = float(np.mean(dilated[ys, xs] > 0))
+            # Missing annotation is not an explicit rejection. Negatives come
+            # from the screening workspace's per-candidate "not meteor" label.
+            if overlap < 0.18:
+                continue
             rows.append(toolkit["candidate_feature_vector"](maps, start, end, old_score))
-            labels.append(int(overlap >= 0.18))
+            labels.append(1)
             groups.append(source_path.name)
             legacy.append(old_score / 100.0)
             metadata.append(f"{source_path.name}:{candidate_index}")
         progress(index / total * 70.0, f"AI 学习样本 {index}/{total}：{source_path.name}")
     return {
-        "x": np.asarray(rows, dtype=np.float32),
+        "x": np.asarray(rows, dtype=np.float32).reshape(-1, len(toolkit.get("ML_FEATURE_NAMES", ML_FEATURE_NAMES))),
         "y": np.asarray(labels, dtype=np.int8),
         "groups": np.asarray(groups),
         "legacy": np.asarray(legacy, dtype=np.float32),

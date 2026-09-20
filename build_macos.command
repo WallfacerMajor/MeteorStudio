@@ -21,12 +21,16 @@ args=(
   --windowed
   --name MeteorStudio
   --osx-bundle-identifier com.wallfacemajor.meteorstudio
+  --hidden-import background_tasks
+  --hidden-import meteor_detection
   --hidden-import meteor_learning
   --hidden-import video_meteor
   --hidden-import alignment_workspace
   --hidden-import ptgui_pipeline
   --hidden-import meteor_screening
+  --hidden-import preview_viewer
   --hidden-import gui_interaction_smoke
+  --hidden-import editable_composite_smoke
   --exclude-module torch
   --exclude-module torchvision
   --exclude-module transformers

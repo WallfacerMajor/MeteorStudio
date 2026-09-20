@@ -1,5 +1,9 @@
 import tempfile
+import json
+import sys
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -8,17 +12,92 @@ from PIL import Image, TiffImagePlugin
 from ptgui_pipeline import (
     ImageLensInfo,
     _set_independent_lenses,
+    _run_cancellable_process,
     alignment_solution_quality,
+    configure_layer_export,
     filter_sky_stars,
     make_star_sky_mask,
+    load_confirmed_meteor_tracks,
+    project_confirmed_tracks,
+    ptgui_solution_sanity,
     read_lens_info,
+    siril_find_stars,
 )
+from background_tasks import TaskCancelledError
+
+
+class ExternalProcessCancellationTests(unittest.TestCase):
+    def test_siril_success_returns_cancellable_runner_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            proxy = root / "proxy.png"
+            Image.new("RGB", (100, 80)).save(proxy)
+            rows = []
+            for x, y in ((10, 20), (30, 40), (50, 60)):
+                columns = ['0'] * 16
+                columns[5:9] = [str(x), str(y), '2', '2']
+                rows.append(' '.join(columns))
+            (root / 'case_stars.lst').write_text('\n'.join(rows), encoding='utf-8')
+            with patch('ptgui_pipeline._run_cancellable_process', return_value=(0, 'Siril success log')):
+                stars, log = siril_find_stars(Path('siril'), proxy, root, 'case')
+            np.testing.assert_array_equal(stars, [[10, 59], [30, 39], [50, 19]])
+            self.assertEqual(stars.dtype, np.float32)
+            self.assertEqual(log, 'Siril success log')
+
+    def test_siril_failure_preserves_process_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('ptgui_pipeline._run_cancellable_process', return_value=(1, 'specific failure')):
+                with self.assertRaisesRegex(RuntimeError, 'specific failure'):
+                    siril_find_stars(Path('siril'), Path('proxy.png'), Path(folder), 'case')
+
+    def test_screening_tracks_load_and_project_through_star_solution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "confirmed_meteor_tracks.json").write_text(json.dumps({
+                "format": "meteor-confirmed-tracks-v1",
+                "items": [{
+                    "exported_name": "frame.arw",
+                    "tracks": [{
+                        "start_normalized": [0.1, 0.2],
+                        "end_normalized": [0.8, 0.7], "score": 91,
+                    }],
+                }],
+            }), encoding="utf-8")
+            loaded = load_confirmed_meteor_tracks(root)
+        pairs = [
+            (np.array((0, 0), np.float32), np.array((10, 20), np.float32)),
+            (np.array((99, 0), np.float32), np.array((109, 20), np.float32)),
+            (np.array((99, 49), np.float32), np.array((109, 69), np.float32)),
+            (np.array((0, 49), np.float32), np.array((10, 69), np.float32)),
+        ]
+        projected = project_confirmed_tracks(loaded["frame.arw"], pairs, 100, 50)
+        self.assertEqual(len(projected), 1)
+        self.assertAlmostEqual(projected[0]["aligned_start_normalized"][0], 0.1 + 10 / 99, places=4)
+        self.assertAlmostEqual(projected[0]["aligned_start_normalized"][1], 0.2 + 20 / 49, places=4)
+
+    def test_cancellation_terminates_running_process(self):
+        checks = 0
+
+        def cancel() -> None:
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise TaskCancelledError("cancel test")
+
+        with tempfile.TemporaryDirectory() as folder:
+            started = time.monotonic()
+            with self.assertRaises(TaskCancelledError):
+                _run_cancellable_process(
+                    [sys.executable, "-c", "import time; time.sleep(10)"],
+                    Path(folder), cancel,
+                )
+        self.assertLess(time.monotonic() - started, 3.0)
 
 
 class AlignmentSolutionQualityTests(unittest.TestCase):
-    def test_five_control_points_continue_as_review(self):
+    def test_five_control_points_are_rejected_as_unverified(self):
         accepted, review, message = alignment_solution_quality(5, 1.2)
-        self.assertTrue(accepted)
+        self.assertFalse(accepted)
         self.assertTrue(review)
         self.assertIn("5组", message)
 
@@ -26,13 +105,26 @@ class AlignmentSolutionQualityTests(unittest.TestCase):
         accepted, review, message = alignment_solution_quality(3, 1.0)
         self.assertFalse(accepted)
         self.assertTrue(review)
-        self.assertIn("至少需要4组", message)
+        self.assertIn("至少需要6组", message)
 
     def test_six_accurate_control_points_are_normal(self):
         accepted, review, message = alignment_solution_quality(6, 1.0)
         self.assertTrue(accepted)
         self.assertFalse(review)
         self.assertEqual(message, "")
+
+    def test_extreme_ptgui_roll_is_rejected(self):
+        project = {
+            "imagegroups": [
+                {"position": {"params": {"yaw": 0, "pitch": 0, "roll": 0}}},
+                {"position": {"params": {"yaw": -9, "pitch": 14, "roll": -59}}},
+            ],
+            "panoramaparams": {"hfov": 84, "vfov": 62},
+            "globallenses": [],
+        }
+        accepted, message = ptgui_solution_sanity(project)
+        self.assertFalse(accepted)
+        self.assertIn("旋转", message)
 
 
 class LensMetadataTests(unittest.TestCase):
@@ -107,6 +199,42 @@ class LensMetadataTests(unittest.TestCase):
             lens["lens"]["params"]["projection"] == "rectilinear"
             for lens in project["globallenses"]
         ))
+
+
+class LayerExportConfigurationTests(unittest.TestCase):
+    def test_following_projects_export_only_the_meteor_layer_without_compression(self):
+        project = {
+            "outputcomponents": {},
+            "imagegroups": [
+                {"images": [{"include": True, "includeinpreview": True}]},
+                {"images": [{"include": True, "includeinpreview": True}]},
+            ],
+            "panoramaparams": {
+                "tiffparams": {"compression": "deflate"},
+                "outputcrop": [0.1, 0.1, 0.9, 0.9],
+            },
+            "projectsettings": {
+                "alignsettings": {}, "batchstitchersettings": {},
+            },
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            project_file = root / "single.pts"
+            project_file.write_text(
+                json.dumps({"project": project}), encoding="utf-8"
+            )
+            configure_layer_export(
+                project_file, root / "aligned.tif", export_reference=False,
+            )
+            configured = json.loads(
+                project_file.read_text(encoding="utf-8")
+            )["project"]
+        self.assertFalse(configured["imagegroups"][0]["images"][0]["include"])
+        self.assertFalse(configured["imagegroups"][0]["images"][0]["includeinpreview"])
+        self.assertTrue(configured["imagegroups"][1]["images"][0]["include"])
+        self.assertEqual(configured["panoramaparams"]["tiffparams"]["datatype"], "u16")
+        self.assertEqual(configured["panoramaparams"]["tiffparams"]["compression"], "none")
+        self.assertFalse(configured["projectsettings"]["alignsettings"]["generatecp"])
 
 
 class AutomaticSkyMaskTests(unittest.TestCase):
