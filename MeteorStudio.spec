@@ -1,4 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
+import sys
+sys.path.insert(0, SPECPATH)
+from app_icon import build_icons
+icon_dir = build_icons(Path(SPECPATH) / 'build' / 'app-icons')
 
 
 a = Analysis(
@@ -22,6 +27,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name='MeteorStudio',
+    icon=str(icon_dir / 'nightscape.ico'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

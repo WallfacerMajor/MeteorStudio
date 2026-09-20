@@ -4,6 +4,8 @@ from tkinter import font as tkfont
 
 
 def apply_theme(root):
+    from app_icon import install_icon
+    install_icon(root)
     families = set(tkfont.families(root))
     family = next((name for name in ("Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Segoe UI") if name in families), "TkDefaultFont")
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):

@@ -14,12 +14,14 @@ python_bin="$venv_dir/bin/python"
 
 "$python_bin" -m pip install --upgrade pip wheel
 "$python_bin" -m pip install -r requirements.txt pyinstaller
+"$python_bin" app_icon.py
 
 args=(
   --noconfirm
   --clean
   --windowed
   --name MeteorStudio
+  --icon build/app-icons/nightscape.icns
   --osx-bundle-identifier com.wallfacemajor.meteorstudio
   --hidden-import background_tasks
   --hidden-import meteor_detection

@@ -24,6 +24,7 @@ def pyinstaller_arguments(ffmpeg: str | None) -> list[str]:
     arguments = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--windowed", "--name", "MeteorStudio",
+        "--icon", str(ROOT / "build" / "app-icons" / "nightscape.ico"),
     ]
     for module in HIDDEN_IMPORTS:
         arguments.extend(("--hidden-import", module))
@@ -47,6 +48,8 @@ def main() -> int:
         cwd=ROOT, check=True,
     )
     ffmpeg = shutil.which("ffmpeg")
+    from app_icon import build_icons
+    build_icons(ROOT / "build" / "app-icons")
     if ffmpeg is None:
         print("警告：未找到 FFmpeg，视频导出将要求目标电脑自行安装 FFmpeg。")
     subprocess.run(pyinstaller_arguments(ffmpeg), cwd=ROOT, check=True)
