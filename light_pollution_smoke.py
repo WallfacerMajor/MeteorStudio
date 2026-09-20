@@ -82,11 +82,18 @@ def exercise_light_pollution(root, window):
         window.events.put(('modeled', window.generation-1, {'amplitude':[.5]*3, 'samples':99}))
         pump(root, 1.45)
         assert window.model is model
+        view = (window.zoom, window.center, window.canvas.bbox(window.image_item), window.canvas.winfo_width(), window.canvas.winfo_height())
+        for _ in range(18):
+            window.edit_inspector._inspector_canvas.event_generate('<Button-4>')
+        pump(root, 1.45)
+        assert view == (window.zoom, window.center, window.canvas.bbox(window.image_item), window.canvas.winfo_width(), window.canvas.winfo_height())
         capture(window, 'light-pollution.png')
         window.geometry('850x600')
         pump(root, 1.45)
         reveal_control(root, window.export_button)
         assert window.canvas.winfo_height() > 200
+        assert window.export_button.winfo_rooty()+window.export_button.winfo_height() < window.winfo_rooty()+window.winfo_height()
+        assert window.export_button.winfo_ismapped()
         assert window.edit_inspector.winfo_rootx() >= window.canvas.winfo_rootx()+window.canvas.winfo_width()
         capture(window, 'light-pollution-small.png')
         click(root, window.clear_button)

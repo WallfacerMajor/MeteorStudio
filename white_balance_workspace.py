@@ -73,7 +73,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.control_canvas.bind("<Button-5>", lambda e: self.control_canvas.yview_scroll(1, "units"))
         footer = ttk.Frame(sidebar)
         footer.pack(side="bottom", fill="x", pady=(10, 0))
-        self.export_button = ttk.Button(footer, text="导出 16 位 TIFF", style="Accent.TButton", command=self.export)
+        self.export_button = ttk.Button(footer, text="导出 16 位 TIFF", style="Primary.TButton", command=self.export)
         self.export_button.pack(side="left")
         self.cancel_button = ttk.Button(footer, text="取消导出", state="disabled", command=self.cancel_export)
         self.cancel_button.pack(side="left", padx=6)
@@ -94,16 +94,13 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.output_entry.pack(side="left", fill="x", expand=True, padx=8)
         self.output_button = ttk.Button(output, text="选择…", command=self.choose_output)
         self.output_button.pack(side="right")
-        ttk.Label(controls, text="相对调整", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(controls, text="相对调整", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
         self.sliders = []
         for title, var, lower in (("色温偏移  ·  冷 ← → 暖", self.warmth, -100), ("色调  ·  绿 ← → 洋红", self.tint, -100), ("中性校准强度  ·  0–100%", self.strength, 0)):
-            ttk.Label(controls, text=title).pack(anchor="w", pady=(8, 0))
-            value = ttk.Label(controls, text=f"{var.get():+.1f}", style="Muted.TLabel")
-            value.pack(anchor="e")
-            scale = ttk.Scale(controls, from_=lower, to=100, variable=var)
-            scale.pack(fill="x", pady=(0, 8))
+            from workspace_layout import parameter_slider
+            scale = parameter_slider(controls, title, var, lower, 100)
             self.sliders.append(scale)
-            var.trace_add("write", lambda *_, v=var, label=value: (label.configure(text=f"{v.get():+.1f}"), self.schedule_render()))
+            var.trace_add("write", lambda *_: self.schedule_render())
         self.pick_button = ttk.Checkbutton(controls, text="取中性点（点击照片）", variable=self.picker, command=self.pick_mode)
         self.pick_button.pack(anchor="w", pady=(12, 6))
         ttk.Label(controls, text="选择本来应呈灰／白色的区域。\n不要将彩色星云、光污染或\n有色星点当作中性点。", style="Muted.TLabel", wraplength=220).pack(anchor="w")
@@ -118,7 +115,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.cancel_point_button = ttk.Button(controls, text="取消参考点预览", command=self.cancel_point)
         self.cancel_point_button.pack(fill="x")
         ttk.Separator(controls).pack(fill="x", pady=12)
-        ttk.Label(controls, text="改机与滤镜校准", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(controls, text="改机与滤镜校准", style="Section.TLabel").pack(anchor="w")
         ttk.Label(controls, text="打开灰卡参考 → 取中性点 →\n保存设备预设，再用于同组照片。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
         self.equipment_widgets = []
         for key, title in (("camera", "机身"), ("modification", "改机方式"), ("filter", "滤镜 / 光学组合"), ("reference", "参考光源 / 拍摄条件")):

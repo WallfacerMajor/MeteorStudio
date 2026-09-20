@@ -30,6 +30,7 @@ def click(app, widget):
 
 def reveal_control(app, widget):
     owners = []
+    branch = widget
     ancestor = widget.master
     while ancestor is not None:
         if isinstance(getattr(ancestor, 'master', None), ttk.Notebook):
@@ -46,8 +47,9 @@ def reveal_control(app, widget):
                         notebook.event_generate('<ButtonRelease-1>', x=x, y=10)
                         app.update()
                         break
-        if hasattr(ancestor, '_inspector_canvas'):
+        if hasattr(ancestor, '_inspector_canvas') and branch in getattr(ancestor, '_inspector_scrolled_widgets', (branch,)):
             owners.append(ancestor._inspector_canvas)
+        branch = ancestor
         ancestor = getattr(ancestor, 'master', None)
     for canvas in reversed(owners):
         for _ in range(160):

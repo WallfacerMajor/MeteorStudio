@@ -3,6 +3,22 @@ import tkinter as tk
 from tkinter import ttk
 
 
+def parameter_slider(parent, title, variable, lower, upper, command=None):
+    """Compact editor row with aligned numeric readout above the slider."""
+    row = ttk.Frame(parent)
+    row.pack(fill='x', pady=(8, 4))
+    heading = ttk.Frame(row)
+    heading.pack(fill='x')
+    ttk.Label(heading, text=title).pack(side='left')
+    value = ttk.Label(heading, text=f'{variable.get():.1f}', style='Value.TLabel', width=6)
+    value.pack(side='right')
+    variable.trace_add('write', lambda *_: value.configure(text=f'{variable.get():.1f}'))
+    scale = ttk.Scale(row, from_=lower, to=upper, variable=variable,
+                      command=command, style='Editor.Horizontal.TScale')
+    scale.pack(fill='x', pady=(5, 0))
+    return scale
+
+
 def stack_controls(frame, width=320):
     """Reflow existing controls without replacing widgets or their event bindings."""
     children = list(frame.winfo_children())
@@ -55,6 +71,7 @@ def scroll_controls(frame, width=340, reflow=True):
     canvas.bind('<Configure>', lambda e: canvas.itemconfigure(item, width=e.width))
     content.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
     frame._inspector_canvas = canvas
+    frame._inspector_scrolled_widgets = tuple(children)
     for child in children:
         child.pack(in_=content, fill='x', pady=3)
         child.lift()

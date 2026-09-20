@@ -2,7 +2,7 @@
 import queue
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 from background_tasks import BackgroundTaskScheduler
 from error_dialog import show_copyable_error, show_runtime_log
@@ -10,7 +10,7 @@ from platform_utils import open_folder
 from white_balance import read_source, make_pyramid, render_view
 from white_balance_workspace import WhiteBalanceWindow
 from light_pollution import DIRECTIONS, estimate, correct, export_image
-from workspace_layout import scroll_controls
+from workspace_layout import scroll_controls, parameter_slider
 
 
 class LightPollutionWindow(WhiteBalanceWindow):
@@ -38,7 +38,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.protect_mode = tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
         self.status = tk.StringVar(value='打开照片 → 框选需保护的地景／星云 → 估计背景 → 调整强度')
-        self.info = tk.StringVar(value='原片只读 · 默认由底部向上减弱 · 不等于天空语义识别')
+        self.info = tk.StringVar(value='原片只读 · 默认校正底部渐变')
         root = ttk.Frame(self, padding=14)
         root.pack(fill='both', expand=True)
         header = ttk.Frame(root)
@@ -46,7 +46,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         ttk.Label(header, text='光污染渐变校正', style='Title.TLabel').pack(side='left')
         self.open_button = ttk.Button(header, text='打开照片…', command=self.open_image)
         self.open_button.pack(side='right')
-        self.progress = ttk.Progressbar(root, maximum=100)
+        self.progress = ttk.Progressbar(root, maximum=100, style='Thin.Horizontal.TProgressbar')
         self.progress.pack(side='bottom', fill='x', pady=5)
         ttk.Label(root, textvariable=self.status, wraplength=780).pack(side='bottom', fill='x')
         inspector = ttk.Frame(root, width=300)
@@ -54,51 +54,65 @@ class LightPollutionWindow(WhiteBalanceWindow):
         inspector.pack(side='right', fill='y', padx=(12, 0))
         inspector.pack_propagate(False)
         self.editor_widgets = []
-        ttk.Label(inspector, text='背景模型', style='Title.TLabel').pack(fill='x')
-        ttk.Label(inspector, text='光污染最强的方向').pack(fill='x')
-        direction = ttk.Combobox(inspector, textvariable=self.direction, values=tuple(DIRECTIONS), state='readonly')
-        direction.pack(fill='x')
+        def section(title):
+            group = ttk.Frame(inspector, padding=(8, 8))
+            group.pack(fill='x')
+            ttk.Label(group, text=title, style='Section.TLabel').pack(anchor='w', pady=(0, 8))
+            return group
+        background = section('01   背景渐变')
+        direction_row = ttk.Frame(background)
+        direction_row.pack(fill='x', pady=(0, 4))
+        ttk.Label(direction_row, text='光源方向').pack(side='left')
+        direction = ttk.Combobox(direction_row, width=9, textvariable=self.direction, values=tuple(DIRECTIONS), state='readonly')
+        direction.pack(side='right')
         direction.bind('<<ComboboxSelected>>', lambda e: self.invalidate())
         self.editor_widgets.append(direction)
         self.sliders = []
         for label, variable, lo, hi, refit in (
-            ('渐变起点 %', self.start, 0, 80, True),
+            ('渐变起点  %', self.start, 0, 80, True),
             ('衰减曲线', self.falloff, .5, 3, True),
-            ('去除强度 %', self.strength, 0, 150, False),
+            ('去除强度  %', self.strength, 0, 150, False),
         ):
-            ttk.Label(inspector, text=label).pack(fill='x')
-            scale = ttk.Scale(inspector, variable=variable, from_=lo, to=hi,
-                              command=(lambda v: self.invalidate()) if refit else (lambda v: self.schedule_render()))
-            scale.pack(fill='x', pady=5)
-            value_label = ttk.Label(inspector, text=f'{variable.get():.1f}')
-            value_label.pack(anchor='e')
-            variable.trace_add('write', lambda *_, v=variable, label=value_label:
-                               label.configure(text=f'{v.get():.1f}'))
+            scale = parameter_slider(background, label, variable, lo, hi,
+                (lambda v: self.invalidate()) if refit else (lambda v: self.schedule_render()))
             self.editor_widgets.append(scale)
             self.sliders.append(scale)
-        self.protect_button = ttk.Checkbutton(inspector, text='保护地景／星云（拖框）', variable=self.protect_mode)
-        self.protect_button.pack(fill='x', pady=8)
-        self.clear_button = ttk.Button(inspector, text='清除保护区域', command=self.clear_protection)
-        self.clear_button.pack(fill='x')
-        self.analyze_button = ttk.Button(inspector, text='估计光污染背景', style='Accent.TButton', command=self.analyze)
-        self.analyze_button.pack(fill='x', pady=8)
-        self.reset_button = ttk.Button(inspector, text='重置校正', command=self.reset)
-        self.reset_button.pack(fill='x')
+        ttk.Separator(inspector).pack(fill='x', pady=4)
+        protection = section('02   保护真实结构')
+        self.protect_button = ttk.Checkbutton(protection, text='在画面拖框保护地景／星云', variable=self.protect_mode)
+        self.protect_button.pack(anchor='w')
+        ttk.Label(protection, text='保护框内保留原始像素，不参与背景估计。', wraplength=255, style='Muted.TLabel').pack(fill='x', pady=6)
+        actions = ttk.Frame(protection)
+        actions.pack(fill='x')
+        self.clear_button = ttk.Button(actions, text='清除保护', style='Quiet.TButton', command=self.clear_protection)
+        self.clear_button.pack(side='left')
+        self.reset_button = ttk.Button(actions, text='重置参数', style='Quiet.TButton', command=self.reset)
+        self.reset_button.pack(side='right')
+        self.analyze_button = ttk.Button(protection, text='估计光污染背景', style='Primary.TButton', command=self.analyze)
+        self.analyze_button.pack(fill='x', pady=(10, 4))
+        ttk.Button(protection, text='适用范围与操作说明', style='Quiet.TButton', command=self.show_help).pack(anchor='w')
         self.editor_widgets += [self.protect_button, self.clear_button, self.analyze_button, self.reset_button]
-        ttk.Label(inspector, text='保护框内不参与估计，也不修改像素；边缘平滑过渡。\n均匀星云、银河和地景可能被误当背景，请先框选保护。\n只处理平滑渐变，不能修复过曝或灯光眩光。', wraplength=265, style='Muted.TLabel').pack(fill='x', pady=12)
-        ttk.Label(inspector, text='输出文件夹').pack(fill='x')
-        self.output_entry = ttk.Entry(inspector, textvariable=self.destination)
-        self.output_entry.pack(fill='x')
-        self.output_button = ttk.Button(inspector, text='选择输出目录…', command=self.choose_output)
-        self.output_button.pack(fill='x', pady=5)
-        self.export_button = ttk.Button(inspector, text='导出 16 位 TIFF', command=self.export)
-        self.export_button.pack(fill='x', pady=5)
-        self.cancel_button = ttk.Button(inspector, text='取消任务', command=self.cancel)
-        self.cancel_button.pack(fill='x')
-        self.folder_button = ttk.Button(inspector, text='打开结果', command=self.open_result, state='disabled')
-        self.folder_button.pack(fill='x', pady=5)
-        ttk.Button(inspector, text='运行日志', command=lambda: show_runtime_log(self)).pack(fill='x')
-        scroll_controls(inspector, 275, reflow=False)
+        canvas = scroll_controls(inspector, 275, reflow=False)
+        # Export remains visible while the adjustment groups scroll independently.
+        output = ttk.Frame(inspector, padding=(12, 10))
+        output.pack(side='bottom', fill='x', before=canvas)
+        ttk.Separator(output).pack(fill='x', pady=(0, 10))
+        ttk.Label(output, text='03   输出', style='Section.TLabel').pack(anchor='w', pady=(0, 8))
+        path_row = ttk.Frame(output)
+        path_row.pack(fill='x')
+        self.output_entry = ttk.Entry(path_row, textvariable=self.destination, width=12)
+        self.output_entry.pack(side='left', fill='x', expand=True)
+        self.output_button = ttk.Button(path_row, text='浏览…', style='Quiet.TButton', command=self.choose_output)
+        self.output_button.pack(side='right', padx=(5, 0))
+        self.export_button = ttk.Button(output, text='导出 16 位 TIFF', style='Primary.TButton', command=self.export)
+        self.export_button.pack(fill='x', pady=(8, 5))
+        utility = ttk.Frame(output)
+        utility.pack(fill='x')
+        self.cancel_button = ttk.Button(utility, text='取消任务', style='Quiet.TButton', command=self.cancel)
+        self.cancel_button.pack(side='left')
+        self.folder_button = ttk.Button(utility, text='打开结果', style='Quiet.TButton', command=self.open_result, state='disabled')
+        self.folder_button.pack(side='left')
+        ttk.Button(utility, text='日志', style='Quiet.TButton', command=lambda: show_runtime_log(self)).pack(side='right')
         viewer = ttk.Frame(root)
         viewer.pack(fill='both', expand=True)
         bar = ttk.Frame(viewer)
@@ -125,6 +139,10 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.protocol('WM_DELETE_WINDOW', self._request_close)
         self.controls()
         self.after(60, self.poll)
+
+    def show_help(self):
+        messagebox.showinfo('光污染校正说明',
+            '先框选保护地景、银河和星云，再估计背景。\n调整方向、起点、曲线或保护区后，请重新估计。\n\n本工具处理单方向平滑渐变，不会自动识别天空。\n均匀星云可能被误当背景；请与原图对比。\n过曝、灯光眩光和复杂局部色块不适用。', parent=self)
 
     def pollution_settings(self):
         return dict(direction=DIRECTIONS[self.direction.get()], start=self.start.get()/100,
