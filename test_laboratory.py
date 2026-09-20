@@ -10,6 +10,31 @@ from laboratory import run_experiment, quality_metrics
 
 
 class LaboratoryTests(unittest.TestCase):
+    def test_missing_input_creates_no_output(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            with self.assertRaisesRegex(ValueError, "不存在"):
+                run_experiment([root / "missing.tif"], root / "out", "quality", CancellationToken("test", 1))
+            self.assertFalse((root / "out").exists())
+
+    def test_cancel_restart_pointer_regression(self):
+        import gc
+        import tkinter as tk
+        from laboratory_workspace import LaboratoryWindow
+        from laboratory_smoke import exercise_laboratory
+        from toolbox_smoke import pump
+        root = tk.Tk()
+        root.withdraw()
+        window = LaboratoryWindow(root, "mean")
+        try:
+            exercise_laboratory(root, window)
+        finally:
+            window._request_close()
+            pump(root, 1.4)
+            root.destroy()
+            del window, root
+            gc.collect()
+
     def test_png_preserves_16_bit_channels(self):
         import cv2
         from laboratory import read_pixels

@@ -46,10 +46,11 @@ def quality_metrics(image):
     scale = min(1, 1600 / max(h, w))
     small = cv2.resize(image, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(small.astype(np.float32) / 65535, cv2.COLOR_RGB2GRAY)
+    clipped = sum(np.count_nonzero(np.max(image[y:y + 128], axis=2) >= 65500) for y in range(0, h, 128))
     return dict(width=w, height=h, analysis_scale=scale,
                 sharpness=float(cv2.Laplacian(gray, cv2.CV_32F).var()),
                 background=float(np.median(gray)),
-                clipped_fraction=float(np.count_nonzero(np.max(image, axis=2) >= 65500) / (w * h)))
+                clipped_fraction=float(clipped / (w * h)))
 
 
 def run_experiment(paths, destination, mode, token, progress=lambda *_: None):
@@ -58,6 +59,14 @@ def run_experiment(paths, destination, mode, token, progress=lambda *_: None):
     paths = [Path(p).resolve() for p in paths]
     if len(set(paths)) != len(paths) or len(paths) < (1 if mode == "quality" else 2):
         raise ValueError("体检至少需要一张，叠加至少需要两张不重复照片")
+    if not str(destination).strip():
+        raise ValueError("请选择输出目录")
+    for path in paths:
+        token.raise_if_cancelled()
+        if not path.is_file():
+            raise ValueError(f"素材不存在：{path}")
+        if path.suffix.lower() not in SUFFIXES:
+            raise ValueError(f"暂不支持此格式：{path.name}")
     destination = Path(destination).expanduser().resolve()
     if any(destination == p.parent or p.parent in destination.parents for p in paths):
         raise ValueError("请选择素材文件夹之外的输出目录")
@@ -67,7 +76,9 @@ def run_experiment(paths, destination, mode, token, progress=lambda *_: None):
     output.mkdir()
     manifest = {"mode": mode, "sources": [str(p) for p in paths], "status": "running", "algorithm_version": 1}
     def save_manifest():
-        (output / "experiment.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary = output / "experiment.json.tmp"
+        temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(output / "experiment.json")
     save_manifest()
     accumulator = None
     records = []
@@ -95,11 +106,13 @@ def run_experiment(paths, destination, mode, token, progress=lambda *_: None):
             del pixels
         token.raise_if_cancelled()
         if mode == "quality":
-            with (output / "quality.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+            with (output / "quality.partial.csv").open("w", newline="", encoding="utf-8-sig") as stream:
                 writer = csv.DictWriter(stream, fieldnames=list(records[0]))
                 writer.writeheader()
                 # Prevent spreadsheet formula execution through imported filenames.
                 writer.writerows({**r, "file": "'" + r["file"] if r["file"].startswith(("=", "+", "-", "@")) else r["file"]} for r in records)
+            token.raise_if_cancelled()
+            (output / "quality.partial.csv").rename(output / "quality.csv")
         else:
             progress(len(paths), "写入完整分辨率 16 位 TIFF")
             if mode == "mean":

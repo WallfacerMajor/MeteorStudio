@@ -2652,6 +2652,13 @@ class MeteorComposer(tk.Tk):
 
     def _open_laboratory(self, mode):
         from laboratory_workspace import LaboratoryWindow
+        previous = getattr(self, "laboratory_window", None)
+        if previous is not None and previous.winfo_exists():
+            if previous.mode == mode:
+                previous.lift()
+                previous.focus_force()
+                return
+            previous._request_close()
         self.laboratory_window = LaboratoryWindow(self, mode)
         self._activate_child_workspace(self.laboratory_window, "laboratory_window")
 

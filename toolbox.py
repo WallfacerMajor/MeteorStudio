@@ -174,6 +174,12 @@ def build_home(app, menu_path=()) -> ttk.Frame:
         cards.columnconfigure(col, weight=1, uniform="tool")
     for row in range((len(nodes) + 1) // 2):
         cards.rowconfigure(row, weight=1)
+    if menu_path:
+        footer = ttk.Frame(home)
+        footer.pack(fill="x", pady=(14, 0))
+        ttk.Label(footer, text="源素材只读   /   本地处理   /   独立输出", style="Muted.TLabel").pack(side="left")
+        ttk.Button(footer, text="软件连接设置 →", command=app.show_toolbox).pack(side="right")
+        return home
     software = ttk.LabelFrame(home, text="外部软件 · 连接与路径", padding=12)
     software.pack(fill="x", pady=(20, 8))
     registry = SoftwareRegistry()
