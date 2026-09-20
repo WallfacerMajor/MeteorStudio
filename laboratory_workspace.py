@@ -28,8 +28,6 @@ class LaboratoryWindow(tk.Toplevel):
         body.pack(fill="both", expand=True)
         ttk.Label(body, text="N I G H T S C A P E   /   L A B", style="Muted.TLabel").pack(anchor="w")
         ttk.Label(body, text=MODES[mode][0], style="Hero.TLabel").pack(anchor="w", pady=8)
-        description = ttk.Label(body, text=MODES[mode][1], wraplength=690, style="Muted.TLabel")
-        description.pack(anchor="w", pady=(0, 14))
         inspector = ttk.Frame(body, width=260)
         self.edit_inspector = inspector
         inspector.pack(side="right", fill="y", padx=(12, 0))
@@ -42,7 +40,7 @@ class LaboratoryWindow(tk.Toplevel):
         self.remove_button.pack(side="left", padx=(8, 0))
         self.clear_button = ttk.Button(actions, text="清空列表", command=self.clear)
         self.clear_button.pack(side="left", padx=8)
-        self.status = tk.StringVar(value="添加照片开始")
+        self.status = tk.StringVar(value="")
         self.summary = tk.StringVar()
         ttk.Label(body, textvariable=self.summary, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         footer = ttk.Frame(inspector)
@@ -55,7 +53,7 @@ class LaboratoryWindow(tk.Toplevel):
         self.open_button.pack(side="right")
         status_label = ttk.Label(body, textvariable=self.status, wraplength=690)
         status_label.pack(side="bottom", fill="x", pady=8)
-        body.bind("<Configure>", lambda event: (description.configure(wraplength=max(300, event.width - 40)), status_label.configure(wraplength=max(300, event.width - 40))))
+        body.bind("<Configure>", lambda event: status_label.configure(wraplength=max(300, event.width - 40)))
         self.progress = ttk.Progressbar(body)
         self.progress.pack(side="bottom", fill="x")
         output = ttk.Frame(inspector)
@@ -112,7 +110,7 @@ class LaboratoryWindow(tk.Toplevel):
         rows = self.files.get_children()
         self.paths = [p for row, p in zip(rows, self.paths) if row not in selected]
         self.files.delete(*selected)
-        self.status.set(f"已从列表移除 {len(selected)} 张；原片未修改")
+        self.status.set(f"已从列表移除 {len(selected)} 张")
         self.refresh_controls()
         return "break"
 

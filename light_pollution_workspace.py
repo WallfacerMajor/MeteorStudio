@@ -37,7 +37,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.original = tk.BooleanVar(value=False)
         self.protect_mode = tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
-        self.status = tk.StringVar(value='打开照片 → 框选需保护的地景／星云 → 估计背景 → 调整强度')
+        self.status = tk.StringVar(value='')
         self.info = tk.StringVar(value='')
         root = ttk.Frame(self, padding=14)
         root.pack(fill='both', expand=True)
@@ -81,7 +81,6 @@ class LightPollutionWindow(WhiteBalanceWindow):
         protection = section('保护区域')
         self.protect_button = ttk.Checkbutton(protection, text='在画面拖框保护地景／星云', variable=self.protect_mode)
         self.protect_button.pack(anchor='w')
-        ttk.Label(protection, text='保护框内保留原始像素，不参与背景估计。', wraplength=255, style='Muted.TLabel').pack(fill='x', pady=6)
         actions = ttk.Frame(protection)
         actions.pack(fill='x')
         self.clear_button = ttk.Button(actions, text='清除保护', style='Quiet.TButton', command=self.clear_protection)
@@ -125,7 +124,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.canvas = tk.Canvas(viewer, background='#181818', highlightthickness=0)
         self.canvas.pack(fill='both', expand=True)
         self.image_item = self.canvas.create_image(0, 0, anchor='nw')
-        self.empty_item = self.canvas.create_text(0, 0, text='打开照片开始\n\n先保护地景，再估计天空渐变', fill='#9aafc5', justify='center')
+        self._build_empty_action()
         self.canvas.bind('<Configure>', self.resize)
         self.canvas.bind('<ButtonPress-1>', self.press)
         self.canvas.bind('<B1-Motion>', self.motion)
@@ -150,12 +149,14 @@ class LightPollutionWindow(WhiteBalanceWindow):
         enabled = self.levels is not None and not self.busy
         for widget in self.editor_widgets:
             widget.configure(state=('readonly' if isinstance(widget, ttk.Combobox) else 'normal') if enabled else 'disabled')
-        for widget in (self.open_button, self.output_entry, self.output_button):
+        for widget in (self.open_button, self.empty_button, self.output_entry, self.output_button):
             widget.configure(state='disabled' if self.busy else 'normal')
         self.export_button.configure(state='normal' if enabled and self.model is not None and self.destination.get().strip() else 'disabled')
         self.cancel_button.configure(state='normal' if self.busy else 'disabled')
 
     def open_image(self):
+        if self.busy:
+            return
         path = filedialog.askopenfilename(parent=self, title='选择光污染校正素材', filetypes=[('照片', '*.tif *.tiff *.png *.jpg *.jpeg *.arw *.nef *.nrw *.cr2 *.cr3 *.crw *.dng *.raf *.orf *.rw2')])
         if path and not self.busy:
             self.submit('loaded', lambda token: (Path(path), make_pyramid(read_source(path), token)))

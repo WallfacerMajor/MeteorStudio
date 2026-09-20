@@ -75,12 +75,35 @@ def widgets(parent):
         yield from widgets(child)
 
 
+def exercise_empty_open(root, window, dialog_target, path):
+    """The empty-canvas action uses the same picker, cancel and busy rules."""
+    assert window.status.get() == ''
+    with patch(dialog_target, return_value='') as picker:
+        click(root, window.empty_button)
+        pump(root, 1.45)
+        picker.assert_called_once()
+        assert window.source is None and window.empty_button.winfo_ismapped()
+        assert all('*' != pattern.strip() for _, pattern in picker.call_args.kwargs['filetypes'])
+    from background_tasks import CancellationToken
+    with patch.object(window, 'task_token', CancellationToken('operation', 0), create=True):
+        window.busy = True
+        window.controls()
+        with patch(dialog_target) as picker:
+            click(root, window.empty_button)
+            picker.assert_not_called()
+    window.busy = False
+    window.controls()
+    with patch(dialog_target, return_value=str(path)) as picker:
+        click(root, window.empty_button)
+        picker.assert_called_once()
+
+
 def capture(window, name):
     # Check the visible UI's persistent copy even when screenshots are disabled.
     for widget in widgets(window):
         if isinstance(widget, (ttk.Label, ttk.LabelFrame, ttk.Button)):
             text = str(widget.cget('text'))
-            assert not any(phrase in text for phrase in ('源素材只读', '原图只读', '本地处理', '独立输出', '共用同一本地模型', '16 位合成链路')), text
+            assert not any(phrase in text for phrase in ('源素材只读', '原图只读', '本地处理', '独立输出', '共用同一本地模型', '16 位合成链路', '滚轮缩放', '打开照片开始', '选择任意版本即可', 'Alt临时切换', '所有输出写入新文件', '绿色虚线=候选')), text
             assert not (isinstance(widget, ttk.Button) and text == '运行日志'), text
     target = os.environ.get("NIGHTSCAPE_SCREENSHOTS")
     if target:

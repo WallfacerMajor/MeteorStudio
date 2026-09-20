@@ -57,7 +57,7 @@ class AlignmentWorkspace(tk.Toplevel):
         self.laboratory_mode = tk.BooleanVar(value=False)
         self.lab_projection = tk.StringVar(value="墨卡托（宽幅弧线）")
         self.lab_canvas = tk.StringVar(value="扩展公共天空 135%")
-        self.status = tk.StringVar(value="选择对齐参考图和流星原图文件夹；输出文件夹会自动创建，也可以手动更改。")
+        self.status = tk.StringVar(value="")
         self.items = []
         self.confirmed_tracks_by_file: dict[str, list[dict]] = {}
         self.worker_queue: queue.Queue = queue.Queue()
@@ -233,7 +233,7 @@ class AlignmentWorkspace(tk.Toplevel):
             else:
                 self.reference_focal_length.set("")
                 self.reference_focal_input.configure(state="normal")
-                self.reference_focal_status.set("参考图没有EXIF，请在左侧填写真实焦距")
+                self.reference_focal_status.set("参考图缺少 EXIF，请填写焦距")
         except (OSError, ValueError, TypeError):
             self.reference_focal_length.set("")
             self.reference_focal_input.configure(state="normal")

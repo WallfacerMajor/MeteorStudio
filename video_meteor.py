@@ -832,7 +832,7 @@ class VideoMeteorWindow(tk.Toplevel):
         self.eraser_width = tk.IntVar(value=42)
         self.brush_feather = tk.IntVar(value=14)
         self.source_offset = tk.IntVar(value=0)
-        self.status = tk.StringVar(value="选择视频后开始分析")
+        self.status = tk.StringVar(value="")
 
         self.effect_mode = tk.StringVar(value="慢放并淡出")
         self.local_speed = tk.DoubleVar(value=20.0)
@@ -895,10 +895,6 @@ class VideoMeteorWindow(tk.Toplevel):
         header = ttk.Frame(root)
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text="视频流星动态", style="Title.TLabel").pack(side="left")
-        ttk.Label(
-            header,
-            text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
-        ).pack(side="left", padx=14)
         ttk.Button(header, text="返回流星合成工作区", command=self._return_to_composer).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
@@ -977,7 +973,6 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Label(preview_bar, text="查看：").pack(side="left")
         for text, value in (("原视频帧", "original"), ("提取的流星层", "residual"), ("融合后效果", "effect")):
             ttk.Radiobutton(preview_bar, text=text, variable=self.preview_mode, value=value, command=self._render_current).pack(side="left", padx=(0, 7))
-        ttk.Label(preview_bar, text="B画笔 / E橡皮擦 / Alt临时切换 / Shift连线 / H临时隐藏蒙版").pack(side="right")
         self.canvas = tk.Canvas(center, background="#171717", cursor="crosshair", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _e: self._render_current())
@@ -1013,7 +1008,6 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Button(frame_bar, text="◀", width=3, command=lambda: self._change_source_offset(-1)).pack(side="left")
         ttk.Label(frame_bar, textvariable=self.source_offset, width=5, anchor="center").pack(side="left")
         ttk.Button(frame_bar, text="▶", width=3, command=lambda: self._change_source_offset(1)).pack(side="left")
-        ttk.Label(frame_bar, text="（合并连续候选后，可逐帧编辑并用曲线慢放）").pack(side="left", padx=8)
 
         right = ttk.LabelFrame(inspector, text="全局流星动态参数", padding=8, width=330)
         right.pack(fill="x")

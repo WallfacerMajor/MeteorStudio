@@ -33,9 +33,10 @@ def exercise_white_balance(root, window):
         pixels[540:660, 840:960] = [24000, 18000, 12000]
         tifffile.imwrite(path, pixels, photometric="rgb")
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        with patch("white_balance_workspace.filedialog.askopenfilename", return_value=str(path)):
-            click(root, window.open_button)
+        from toolbox_smoke import exercise_empty_open
+        exercise_empty_open(root, window, "white_balance_workspace.filedialog.askopenfilename", path)
         wait_for(lambda: window.levels is not None and window.photo is not None and not window.busy)
+        assert not window.empty_button.winfo_ismapped()
         assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         assert window.export_button.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         assert window.output_entry.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()

@@ -43,7 +43,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.equipment = {key: tk.StringVar() for key in ("camera", "modification", "filter", "reference")}
         self.original, self.picker = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
-        self.status = tk.StringVar(value="打开照片开始 · 支持 sRGB TIFF / PNG / JPG 和 RAW")
+        self.status = tk.StringVar(value="")
         self.info = tk.StringVar(value="")
         self.gain_info = tk.StringVar(value="中性点：未取样")
         body = ttk.Frame(self, padding=(16, 12))
@@ -186,7 +186,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.canvas = tk.Canvas(viewer, background="#181818", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.image_item = self.canvas.create_image(0, 0, anchor="nw")
-        self.empty_item = self.canvas.create_text(0, 0, text="打开一张照片\n\n滚轮缩放 · 拖动平移 · 中性点取样", fill="#9aafc5", justify="center")
+        self._build_empty_action()
         self.canvas.bind("<Configure>", self.resize)
         self.canvas.bind("<ButtonPress-1>", self.press)
         self.canvas.bind("<B1-Motion>", self.pan)
@@ -199,6 +199,11 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.controls()
         self.after(60, self.poll)
 
+    def _build_empty_action(self):
+        self.empty_button = ttk.Button(self.canvas, text="打开一张照片", command=self.open_image,
+                                       style="Quiet.TButton", cursor="hand2")
+        self.empty_item = self.canvas.create_window(0, 0, window=self.empty_button, anchor="center")
+
     def settings(self):
         return validate_settings(dict(warmth=self.warmth.get(), tint=self.tint.get(), neutral=self.neutral,
             neutral_strength=self.strength.get(), raw_baseline="daylight" if self.raw_baseline.get().startswith("固定") else "camera",
@@ -209,7 +214,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         pending = self.candidate_preview is not None
         for widget in (*self.sliders, self.pick_button, self.reset_button, self.save_button, self.load_button):
             widget.configure(state="normal" if editable else "disabled")
-        for widget in (self.open_button, self.output_entry, self.output_button):
+        for widget in (self.open_button, self.empty_button, self.output_entry, self.output_button):
             widget.configure(state="disabled" if self.busy else "normal")
         self.export_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
         self.batch_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
@@ -227,6 +232,8 @@ class WhiteBalanceWindow(tk.Toplevel):
             self.baseline_combo.configure(state="disabled")
 
     def open_image(self):
+        if self.busy:
+            return
         path = filedialog.askopenfilename(parent=self, title="选择白平衡素材", filetypes=[("照片", "*.tif *.tiff *.png *.jpg *.jpeg *.arw *.nef *.nrw *.cr2 *.cr3 *.crw *.dng *.raf *.orf *.rw2")])
         if not path or self.busy:
             return
@@ -357,7 +364,7 @@ class WhiteBalanceWindow(tk.Toplevel):
     def pick_mode(self):
         self.canvas.configure(cursor="crosshair" if self.picker.get() else "")
         if self.picker.get():
-            self.status.set("点击应呈灰／白色的区域；避开星云、星点和光污染。")
+            self.status.set("中性点取样")
 
     def fit(self):
         if self.levels:
@@ -520,7 +527,7 @@ class WhiteBalanceWindow(tk.Toplevel):
                 self.candidates = data
                 self.draw_candidates()
                 self.controls()
-                self.status.set(f"找到 {len(data)} 个平滑参考候选；点击编号预览，确认后应用" if data else "未找到适合推荐的区域；请使用灰卡参考或手动取样")
+                self.status.set(f"找到 {len(data)} 个参考候选" if data else "未找到适合推荐的区域；请使用灰卡参考或手动取样")
             elif kind == "loaded":
                 self.source, self.levels, parameters, preserve_view = data
                 self.loaded_baseline = parameters["raw_baseline"]

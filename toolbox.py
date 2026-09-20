@@ -254,7 +254,6 @@ def build_home(app, menu_path=()) -> ttk.Frame:
             ttk.Button(navigation, text=group.title, command=lambda path=menu_path[:index + 1]: app.show_toolbox(path)).pack(side="left")
     ttk.Label(home, text="N I G H T S C A P E   /   T O O L B O X", style="Muted.TLabel").pack(anchor="w")
     ttk.Label(home, text=ancestors[-1].title if ancestors else PRODUCT_NAME, style="Hero.TLabel").pack(anchor="w", pady=(8, 4))
-    ttk.Label(home, text=ancestors[-1].description if ancestors else "选择工具分类，开始处理你的星野作品。", style="Muted.TLabel").pack(anchor="w", pady=(0, 22))
     cards = ttk.Frame(home)
     cards.pack(fill="x")
     home.tool_buttons = {}

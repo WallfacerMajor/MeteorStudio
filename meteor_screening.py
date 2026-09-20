@@ -890,7 +890,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.filter_summary = tk.StringVar(value="显示 0/0")
         self.filter_after_id: str | None = None
         self.filtered_result_indices: list[int] = []
-        self.status = tk.StringVar(value="选择照片文件夹开始筛选")
+        self.status = tk.StringVar(value="")
         self.summary = tk.StringVar(value="尚未分析")
         self.files: list[Path] = []
         self.results: list[ScreeningResult] = []
@@ -930,7 +930,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.manual_mark_mode = False
         self.manual_mark_start: tuple[int, int] | None = None
         self.manual_mark_label = tk.StringVar(value="手动标记漏检流星")
-        self.candidate_status = tk.StringVar(value="点击候选标记，确认是否为流星")
+        self.candidate_status = tk.StringVar(value="")
         self.autosave_status = tk.StringVar(value="自动保存：等待修改")
         self.autosave_after_id: str | None = None
         self._restoring_autosave = False
@@ -1119,13 +1119,10 @@ class MeteorScreeningWindow(tk.Toplevel):
             preview_tools, text="原图精细预览", variable=self.use_original_preview,
             command=self._original_preview_changed,
         ).pack(side="left", padx=(10, 0))
-        ttk.Label(preview_tools, text="滚轮缩放 · 拖动平移 · H 原图", style="Muted.TLabel").pack(side="left", padx=10)
         for widget in preview_tools.winfo_children():
             widget.pack_forget()
         for index, widget in enumerate(preview_tools.winfo_children()):
             widget.grid(row=index//2, column=index%2, sticky="w", padx=(0, 5), pady=2)
-        preview_tools.winfo_children()[-1].configure(wraplength=220)
-        preview_tools.winfo_children()[-1].grid(columnspan=2)
 
         self.canvas = tk.Canvas(right, background="#151515", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
@@ -3274,7 +3271,7 @@ class MeteorScreeningWindow(tk.Toplevel):
                         self._rebuild_preview_overlay()
                         self.status.set(
                             f"原图精细预览：{Path(path).name} · "
-                            f"{image.shape[1]}×{image.shape[0]} · 滚轮放大或点击 1:1"
+                            f"{image.shape[1]}×{image.shape[0]}"
                         )
                 elif item[0] == "full_preview_error":
                     _, generation, source_signature, path, message = item

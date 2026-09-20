@@ -28,9 +28,10 @@ def exercise_light_pollution(root, window):
         pixels = np.rint(encode_srgb(linear)*65535).astype(np.uint16)
         tifffile.imwrite(source, pixels, photometric='rgb')
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        with patch('light_pollution_workspace.filedialog.askopenfilename', return_value=str(source)):
-            click(root, window.open_button)
+        from toolbox_smoke import exercise_empty_open
+        exercise_empty_open(root, window, 'light_pollution_workspace.filedialog.askopenfilename', source)
         wait_for(lambda: window.levels is not None and window.photo is not None and not window.busy)
+        assert not window.empty_button.winfo_ismapped()
         assert window.edit_inspector.winfo_rootx() >= window.canvas.winfo_rootx()+window.canvas.winfo_width()
         click(root, window.protect_button)
         a,b = window.point(0,.81)

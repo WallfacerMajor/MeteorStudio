@@ -2043,7 +2043,7 @@ class MeteorComposer(tk.Tk):
         self.source_preview_label = tk.StringVar(value="4 来源标注")
         self.show_mask = tk.BooleanVar(value=True)
         self.h_mask_held = False
-        self.status = tk.StringVar(value="请选择输入素材；输出位置可留空自动创建。")
+        self.status = tk.StringVar(value="")
 
         self.files: list[Path] = []
         self.selected_base_files: list[Path] = []
@@ -2278,7 +2278,7 @@ class MeteorComposer(tk.Tk):
 
         left = ttk.Frame(body, width=310)
         body.add(left, weight=0)
-        ttk.Label(left, text="TIFF 素材（单击或上下键立即加载）").pack(anchor="w")
+        ttk.Label(left, text="TIFF 素材").pack(anchor="w")
         self.tree = ttk.Treeview(left, columns=("status",), show="tree headings", selectmode="browse")
         self.tree.heading("#0", text="文件")
         self.tree.heading("status", text="蒙版")
@@ -2388,10 +2388,6 @@ class MeteorComposer(tk.Tk):
 
         history_header = ttk.Frame(history_tools)
         history_header.pack(fill="x", pady=(0, 5))
-        ttk.Label(
-            history_header,
-            text="选择任意版本即可回到该状态；回退后再修改会丢弃后续记录（最多100次）",
-        ).pack(side="left")
         self.history_position_label = ttk.Label(history_header, text="0 / 0")
         self.history_position_label.pack(side="right")
         history_body = ttk.Frame(history_tools)
@@ -2441,7 +2437,6 @@ class MeteorComposer(tk.Tk):
         ttk.Button(mask_tools, text="保存项目", command=self.save_project).grid(row=2, column=3, pady=(7, 0), padx=3, sticky="ew")
         self.load_project_button = ttk.Button(mask_tools, text="载入项目", command=self.load_project)
         self.load_project_button.grid(row=2, column=4, pady=(7, 0), padx=3, sticky="ew")
-        ttk.Label(mask_tools, text="绿色虚线=候选；移到线上点击绿色按钮选中。Alt 临时切换画笔/橡皮擦。", foreground="#9aafc5").grid(row=2, column=5, columnspan=7, sticky="e", pady=(7, 0))
         for column in (4, 7, 10):
             mask_tools.columnconfigure(column, weight=1)
 
@@ -2587,7 +2582,6 @@ class MeteorComposer(tk.Tk):
             scroll_controls(tab, 330)
         # History is already a vertically scrolling list.
         self.history_tree.column("action", width=220)
-        history_header.winfo_children()[0].configure(wraplength=280)
         bottom.pack_forget()
         bottom.pack(side="bottom", fill="x", before=inspector)
         self._refresh_history_ui()
@@ -3218,7 +3212,7 @@ F1：显示本快捷键表""")
         if source.is_dir():
             self.scan_inputs(reload_current=True)
         else:
-            self.status.set("已选择新底图；选择原图文件夹后会自动建立配对和输出目录")
+            self.status.set("已选择底图")
 
     def scan_inputs(self, reload_current: bool = True) -> bool:
         previous_current = self.current_path
@@ -5961,7 +5955,7 @@ F1：显示本快捷键表""")
         reference = self.selected_object if handle else self._find_object_near(event.x, event.y)
         if reference is None:
             self._clear_object_selection()
-            self.status.set("单击一颗流星即可选中；选中后可拖动或使用变换手柄")
+            self.status.set("未选中流星")
             return "break"
         self.selected_object = reference
         if hasattr(self, "control_notebook"):
@@ -5975,7 +5969,7 @@ F1：显示本快捷键表""")
         self.object_drag_original = replace(stroke, points=stroke.points.copy())
         self._cancel_deferred_full_preview_work()
         self._prepare_live_object_drag(reference, self.object_drag_original)
-        self.status.set("拖动中：流星内容与蒙版同步移动；松开后只精确更新旧位置和新位置")
+        self.status.set("正在移动流星…")
         return "break"
 
     def _preview_clone(self, stroke: Stroke, full_width: int) -> Stroke:
@@ -7295,7 +7289,7 @@ F1：显示本快捷键表""")
         self.control_notebook.select(self.history_tools_tab)
         self._refresh_history_ui()
         self.history_tree.focus_set()
-        self.status.set("操作历史已展开：单击任意版本即可回到该状态")
+        self.status.set("操作历史已展开")
 
     def _history_selection_changed(self, _event=None) -> None:
         if self.history_ui_updating or self.history_batch_navigation:
@@ -8833,7 +8827,7 @@ F1：显示本快捷键表""")
                     self.setting_candidate_threshold = False
                     self._update_candidate_summary(key)
                     self._refresh_history_ui()
-                    self.status.set(f"已加载 {path.name}；可拖动画笔，或单击起点后 Shift+单击终点画直线。")
+                    self.status.set(f"已加载 {path.name}")
                     self._render_preview()
                     self._schedule_neighbor_prefetch(path)
                 elif kind == "global_preview_partial":

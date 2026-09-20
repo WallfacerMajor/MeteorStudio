@@ -17,7 +17,7 @@ class ExactPreviewViewer(tk.Toplevel):
         initial_mode: str = "blend",
     ) -> None:
         super().__init__(parent)
-        self.title("导出级精确预览 — 滚轮缩放，左键拖动")
+        self.title("精准预览")
         self.geometry("1280x820")
         self.minsize(760, 520)
         self.images = {"blend": final_image, "labeled": labeled_image}
@@ -46,9 +46,6 @@ class ExactPreviewViewer(tk.Toplevel):
         ttk.Button(toolbar, text="−", width=3, command=lambda: self._zoom_by(1 / 1.25)).pack(side="left")
         ttk.Button(toolbar, text="+", width=3, command=lambda: self._zoom_by(1.25)).pack(side="left", padx=(4, 0))
         ttk.Label(toolbar, textvariable=self.zoom_label).pack(side="left", padx=12)
-        ttk.Label(
-            toolbar, text="鼠标滚轮缩放 · 左键拖动平移 · 双击切换 100%/适合窗口"
-        ).pack(side="right")
 
         self.canvas = tk.Canvas(self, background="#111111", highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
