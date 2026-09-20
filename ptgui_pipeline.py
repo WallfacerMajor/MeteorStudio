@@ -336,7 +336,10 @@ def siril_find_stars(
             [
                 "requires 1.2.0",
                 f'load "{_script_path_text(proxy)}"',
-                "setfindstar reset -sigma=1.0 -roundness=0.20 -relax=on -radius=5",
+                # Wide-field PNG proxies are already stretched. Their broad
+                # Milky Way/background variation must not set the detection
+                # threshold above nearly every small stellar PSF.
+                "setfindstar reset -sigma=0.1 -roundness=0.20 -relax=on -radius=3",
                 f"findstar -out={list_name} -maxstars={max_stars}",
                 "close",
                 "",
@@ -374,12 +377,14 @@ def siril_find_stars(
         # reporting a comparatively large PSF fit RMSE.  Keep those candidates
         # for geometric verification; RANSAC and the final reprojection error
         # remain the actual acceptance gate.
-        if saturated or not (0.5 <= fwhm_x <= 18 and 0.5 <= fwhm_y <= 18) or rmse > 40.0:
+        if not (0.5 <= fwhm_x <= 18 and 0.5 <= fwhm_y <= 18) or rmse > 40.0:
             continue
-        # Siril/FITS uses a lower-left Y origin while OpenCV and PTGui image
-        # coordinates use an upper-left origin. Normalize at the boundary so
-        # masks, SIFT support checks, and PTGui control points agree.
-        rows.append((x, proxy_height - 1.0 - y))
+        # Siril exports Dynamic PSF positions relative to the TOP LEFT, even
+        # though its FITS pixel buffer uses the other orientation internally.
+        # Saturated stars with a valid fitted PSF remain useful for registration.
+        # https://siril.readthedocs.io/en/stable/Dynamic-PSF.html
+        if np.isfinite([x, y, rmse]).all() and 0 <= x < proxy_image.shape[1] and 0 <= y < proxy_height:
+            rows.append((x, y))
     # Three PSF-confirmed stars are sufficient to prove that the sky region is
     # usable.  The actual transform still requires at least six independent
     # RANSAC-filtered SIFT correspondences below, so this does not weaken the
@@ -429,8 +434,10 @@ def match_star_pairs(
 
     meteor_features, base_features = prepare(meteor), prepare(base)
     sift = cv2.SIFT_create(nfeatures=16000, contrastThreshold=0.006, edgeThreshold=15, sigma=1.2)
-    meteor_feature_mask = make_star_sky_mask(meteor.shape, meteor_stars, radius=max(12, round(min(meteor.shape) / 70)))
-    base_feature_mask = make_star_sky_mask(base.shape, base_stars, radius=max(12, round(min(base.shape) / 70)))
+    # Include local star patterns, not just tiny isolated PSF islands. SIFT
+    # needs their surrounding structure to distinguish near-identical stars.
+    meteor_feature_mask = make_star_sky_mask(meteor.shape, meteor_stars, radius=max(20, round(min(meteor.shape) / 40)))
+    base_feature_mask = make_star_sky_mask(base.shape, base_stars, radius=max(20, round(min(base.shape) / 40)))
     # User-confirmed meteors are not stars and must never contribute SIFT
     # control points. Coordinates are normalized, so the sidecar remains valid
     # for RAW/JPEG/TIFF proxies of different sizes.
@@ -455,7 +462,7 @@ def match_star_pairs(
     if md is None or bd is None:
         raise RuntimeError("Siril星区内没有足够的可匹配特征")
     candidates = cv2.BFMatcher(cv2.NORM_L2).knnMatch(md, bd, k=2)
-    good = [first for first, second in candidates if first.distance < 0.78 * second.distance]
+    good = [pair[0] for pair in candidates if len(pair) == 2 and pair[0].distance < 0.78 * pair[1].distance]
     if len(good) < 4:
         raise RuntimeError(f"仅找到{len(good)}组候选星点")
     source = np.float32([mk[m.queryIdx].pt for m in good])
@@ -487,13 +494,40 @@ def match_star_pairs(
     # Siril is a sky/PSF validator, not the sole correspondence detector. Two
     # differently processed frames may expose different subsets of faint stars;
     # in that case retain the already mask-limited, MAGSAC-consistent matches.
-    if int(supported.sum()) >= 4:
-        source, target = source[supported], target[supported]
+    # PSF support is a preference, never a destructive second acceptance gate:
+    # independent edits can make the catalogues detect different faint stars.
+    # Keep geometrically verified points, ordering supported ones first.
+    order = np.argsort(~supported, kind="stable")
+    source, target = source[order], target[order]
+    # SIFT emits several orientations for the same point. These are one
+    # correspondence, not independent evidence for a reliable homography.
+    source, target = _unique_star_pairs(source, target)
     projected = cv2.perspectiveTransform(source[:, None, :], transform)[:, 0, :]
     errors = np.linalg.norm(projected - target, axis=1)
     median_error = float(np.median(errors) / full_scale)
     distributed = _distributed_pairs(source, target, base.shape[1], base.shape[0])
     return [(src / full_scale, dst / full_scale) for src, dst in distributed], median_error
+
+
+def _unique_star_pairs(source: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep independent correspondences in linear expected time, not O(n²)."""
+    source_cells, target_cells, indices = {}, {}, []
+
+    def occupied(point, cells):
+        x, y = map(math.floor, point)
+        return any(
+            (point[0]-other[0])**2 + (point[1]-other[1])**2 <= 1.0
+            for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+            for other in cells.get((x+dx, y+dy), ())
+        )
+
+    for index, (src, dst) in enumerate(zip(source, target)):
+        if occupied(src, source_cells) or occupied(dst, target_cells):
+            continue
+        indices.append(index)
+        source_cells.setdefault(tuple(map(math.floor, src)), []).append(src)
+        target_cells.setdefault(tuple(map(math.floor, dst)), []).append(dst)
+    return source[indices], target[indices]
 
 
 def alignment_solution_quality(control_points: int, median_error: float) -> tuple[bool, bool, str]:

@@ -9148,7 +9148,20 @@ if __name__ == "__main__":
     smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
     editable_smoke_report = os.environ.get("METEOR_EDITABLE_SMOKE_REPORT")
     real_pointer_smoke_report = os.environ.get("METEOR_REAL_POINTER_SMOKE_REPORT")
-    if os.environ.get("NIGHTSCAPE_SMOKE_REPORT"):
+    if os.environ.get("METEOR_ALIGNMENT_SMOKE_REPORT"):
+        from alignment_regression_smoke import run_case
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, "_restore_autosave"), patch.object(MeteorComposer, "_setup_autosave"):
+            application = MeteorComposer()
+        try:
+            result = run_case(application)
+            Path(os.environ["METEOR_ALIGNMENT_SMOKE_REPORT"]).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            Path(os.environ["METEOR_ALIGNMENT_SMOKE_REPORT"]).write_text(json.dumps({"failure": traceback.format_exc()}), encoding="utf-8")
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("NIGHTSCAPE_SMOKE_REPORT"):
         from toolbox_smoke import run_smoke
         from unittest.mock import patch
         with patch.object(MeteorComposer, "_restore_autosave"):

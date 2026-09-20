@@ -7,6 +7,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
+import cv2
 from PIL import Image, TiffImagePlugin
 
 from ptgui_pipeline import (
@@ -22,6 +23,8 @@ from ptgui_pipeline import (
     ptgui_solution_sanity,
     read_lens_info,
     siril_find_stars,
+    match_star_pairs,
+    _unique_star_pairs,
 )
 from background_tasks import TaskCancelledError
 
@@ -36,11 +39,13 @@ class ExternalProcessCancellationTests(unittest.TestCase):
             for x, y in ((10, 20), (30, 40), (50, 60)):
                 columns = ['0'] * 16
                 columns[5:9] = [str(x), str(y), '2', '2']
+                # Siril can fit clipped bright stars; those remain usable.
+                columns[14] = '1' if x == 30 else '0'
                 rows.append(' '.join(columns))
             (root / 'case_stars.lst').write_text('\n'.join(rows), encoding='utf-8')
             with patch('ptgui_pipeline._run_cancellable_process', return_value=(0, 'Siril success log')):
                 stars, log = siril_find_stars(Path('siril'), proxy, root, 'case')
-            np.testing.assert_array_equal(stars, [[10, 59], [30, 39], [50, 19]])
+            np.testing.assert_array_equal(stars, [[10, 20], [30, 40], [50, 60]])
             self.assertEqual(stars.dtype, np.float32)
             self.assertEqual(log, 'Siril success log')
 
@@ -95,6 +100,32 @@ class ExternalProcessCancellationTests(unittest.TestCase):
 
 
 class AlignmentSolutionQualityTests(unittest.TestCase):
+    def test_sparse_psf_catalogue_does_not_discard_verified_correspondences(self):
+        points = np.float32([(x, y) for y in (40, 160, 280) for x in (40, 160, 280, 400)])
+        target = points + [7, 11]
+        descriptors = np.eye(len(points), 128, dtype=np.float32)
+        source_keypoints = [cv2.KeyPoint(float(x), float(y), 3) for x, y in points]
+        target_keypoints = [cv2.KeyPoint(float(x), float(y), 3) for x, y in target]
+        with tempfile.TemporaryDirectory() as folder:
+            image = Path(folder) / 'stars.png'
+            Image.new('L', (500, 400)).save(image)
+            with patch('ptgui_pipeline.cv2.SIFT_create') as detector:
+                detector.return_value.detectAndCompute.side_effect = [
+                    (source_keypoints, descriptors), (target_keypoints, descriptors),
+                ]
+                pairs, error = match_star_pairs(image, image, points[:4], target[:4], .25)
+        self.assertEqual(len(pairs), 12)
+        self.assertLess(error, .01)
+        for source, dest in pairs:
+            np.testing.assert_allclose(dest-source, [28, 44], atol=.001)
+
+    def test_multiple_sift_orientations_are_not_independent_control_points(self):
+        source = np.float32([[.9, 2], [1.1, 2], [9, 8], [15, 20]])
+        target = np.float32([[5, 6], [5.2, 6], [5.1, 6], [25, 30]])
+        unique_source, unique_target = _unique_star_pairs(source, target)
+        np.testing.assert_array_equal(unique_source, source[[0, 3]])
+        np.testing.assert_array_equal(unique_target, target[[0, 3]])
+
     def test_five_control_points_are_rejected_as_unverified(self):
         accepted, review, message = alignment_solution_quality(5, 1.2)
         self.assertFalse(accepted)
