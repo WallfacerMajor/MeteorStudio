@@ -99,16 +99,14 @@ class AlignmentWorkspace(tk.Toplevel):
         configuration.pack(fill="x", pady=(0, 6))
         inputs_tab = ttk.Frame(configuration, padding=6)
         lens_tab = ttk.Frame(configuration, padding=6)
-        configuration.add(inputs_tab, text="输入与软件")
+        configuration.add(inputs_tab, text="输入与输出")
         configuration.add(lens_tab, text="镜头与投影")
-        paths = ttk.LabelFrame(inputs_tab, text="输入、工具与输出（源素材只读）", padding=8)
+        paths = ttk.LabelFrame(inputs_tab, text="素材与输出（源素材只读）", padding=8)
         self.input_panel = paths
         paths.pack(fill="x")
         self._path_row(paths, 0, "对齐参考图", self.base_path, self._choose_base, "选择文件…")
         self._path_row(paths, 1, "完整流星原图文件夹", self.meteor_dir, self._choose_meteors, "选择文件夹…")
         self._path_row(paths, 2, "输出文件夹（可选）", self.output_dir, self._choose_output, "另选文件夹…")
-        self._path_row(paths, 3, "PTGui程序", self.ptgui_path, self._choose_ptgui, "选择程序…")
-        self._path_row(paths, 4, "Siril CLI程序", self.siril_path, self._choose_siril, "选择程序…")
         paths.columnconfigure(1, weight=1)
 
         settings = ttk.LabelFrame(lens_tab, text="镜头与星空区域", padding=8)
@@ -321,8 +319,6 @@ class AlignmentWorkspace(tk.Toplevel):
             output.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise ValueError(f"无法创建输出文件夹：{exc}") from exc
-        if not ptgui.is_file() or not siril.is_file():
-            raise ValueError("找不到PTGui或Siril CLI程序")
         return base, meteor_dir, output, ptgui, siril
 
     def scan(self) -> None:
@@ -386,6 +382,14 @@ class AlignmentWorkspace(tk.Toplevel):
         except Exception as exc:
             show_copyable_error("星空对齐", str(exc), parent=self)
             return
+        from toolbox import require_software
+        software = require_software(self, ("ptgui", "siril"))
+        if software is None:
+            self.status.set("已取消，配置软件后可重新开始。")
+            return
+        ptgui, siril = software["ptgui"], software["siril"]
+        self.ptgui_path.set(str(ptgui))
+        self.siril_path.set(str(siril))
         self.running = True
         self._set_inputs_running(True)
         self.last_result = None

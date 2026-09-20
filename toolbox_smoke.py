@@ -17,18 +17,23 @@ def pump(app, seconds):
 
 
 def click(app, widget):
+    widget.winfo_toplevel().attributes('-topmost', True)
+    widget.winfo_toplevel().lift()
     app.update()
     reveal_control(app, widget)
     x = widget.winfo_rootx() + widget.winfo_width() // 2
     y = widget.winfo_rooty() + widget.winfo_height() // 2
     if 0 <= x < app.winfo_screenwidth() and 0 <= y < app.winfo_screenheight():
-        assert app.winfo_containing(x, y) == widget, f'Control obscured: {widget}'
+        assert app.winfo_containing(x, y) == widget, f'Control obscured: {widget}; hit {app.winfo_containing(x, y)}'
     widget.event_generate("<ButtonPress-1>", x=widget.winfo_width() // 2, y=widget.winfo_height() // 2)
     widget.event_generate("<ButtonRelease-1>", x=widget.winfo_width() // 2, y=widget.winfo_height() // 2)
     pump(app, 0.15)
 
 
 def reveal_control(app, widget):
+    widget.winfo_toplevel().attributes('-topmost', True)
+    widget.winfo_toplevel().lift()
+    app.update()
     owners = []
     branch = widget
     ancestor = widget.master
@@ -83,13 +88,22 @@ def capture(window, name):
 
 
 def run_smoke(app):
+    app.attributes("-topmost", True)
+    app.state("normal")
     app.geometry("1280x820+20+20")
+    app.lift()
+    app.focus_force()
     assert app.edit_inspector.winfo_exists()
     app.show_toolbox()
     pump(app, 0.4)
+    app.lift()
+    app.focus_force()
+    pump(app, 0.3)
     assert app.toolbox_home.winfo_ismapped()
     capture(app, "toolbox.png")
     assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points", "color", "laboratory"}
+    from software_settings_smoke import exercise_settings
+    settings_checks = exercise_settings(app)
     click(app, app.toolbox_home.tool_buttons["color"])
     click(app, app.toolbox_home.tool_buttons["white_balance"])
     from white_balance_smoke import exercise_white_balance
@@ -153,8 +167,8 @@ def run_smoke(app):
         window.base_path.set(str(base))
         window.meteor_dir.set(str(inputs))
         window.reference_focal_length.set("35")
-        window.ptgui_path.set(str(base))
-        window.siril_path.set(str(base))
+        window.ptgui_path.set("")
+        window.siril_path.set("")
         window.after(350, lambda: heartbeat.append(time.monotonic()))
         with patch("alignment_workspace.read_lens_info", side_effect=slow_read), patch("alignment_workspace.show_copyable_error", side_effect=lambda *a, **k: errors.append(a)):
             click(app, window.scan_button)
@@ -162,6 +176,10 @@ def run_smoke(app):
             pump(app, 0.5)
             assert heartbeat and not window.running and len(window.items) == 1, errors
             assert window.run_button.instate(["!disabled"])
+            with patch('toolbox.require_software', return_value=None) as setup, patch('alignment_workspace.run_alignment_pipeline') as pipeline:
+                click(app, window.run_button)
+                setup.assert_called_once_with(window, ('ptgui', 'siril'))
+                assert not pipeline.called and not window.running
             # A changed folder cannot launch the old scan's images.
             other = root / "other"
             other.mkdir()
@@ -226,7 +244,7 @@ def run_smoke(app):
             assert not (owned_timers & remaining), (attr, owned_timers & remaining)
             pump(app, 1.4)
             assert getattr(app, attr) is None and app.composite_panel.winfo_ismapped()
-    return {**white_balance_checks, **light_pollution_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
+    return {**settings_checks, **white_balance_checks, **light_pollution_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
 
 
 if __name__ == "__main__":

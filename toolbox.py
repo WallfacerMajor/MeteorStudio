@@ -85,6 +85,98 @@ def tool_menu_button(parent, app):
     return button
 
 
+def settings_menu_button(parent):
+    button = ttk.Menubutton(parent, text="设置 ▾")
+    menu = tk.Menu(button, tearoff=False)
+    owner = parent.winfo_toplevel()
+    menu.add_command(label="外部软件与路径…", command=lambda: show_software_settings(owner))
+    submenu = tk.Menu(menu, tearoff=False)
+    for spec in SOFTWARE:
+        submenu.add_command(label=spec.title, command=lambda key=spec.key: show_software_settings(owner, (key,)))
+    menu.add_cascade(label="软件连接", menu=submenu)
+    menu.add_separator()
+    from error_dialog import show_runtime_log
+    menu.add_command(label="运行日志…", command=lambda: show_runtime_log(owner))
+    button.configure(menu=menu)
+    return button
+
+
+def show_software_settings(parent, keys=None, required=False):
+    """One modal preferences dialog; closing it never starts a pending operation."""
+    registry = SoftwareRegistry()
+    keys = tuple(keys or registry.specs)
+    dialog = tk.Toplevel(parent)
+    dialog.title("设置 · 外部软件")
+    dialog.transient(parent)
+    dialog.geometry("640x410")
+    dialog.minsize(500, 350)
+    body = ttk.Frame(dialog, padding=20)
+    body.pack(fill="both", expand=True)
+    ttk.Label(body, text="外部软件", style="Title.TLabel").pack(anchor="w")
+    ttk.Label(body, text="当前操作需要配置以下软件。选择程序后点击继续。" if required else "软件会自动查找；仅在未找到或需要更换版本时指定路径。",
+              style="Muted.TLabel", wraplength=550).pack(fill="x", pady=(6, 16))
+    dialog.path_values, dialog.choose_buttons = {}, {}
+    for key in keys:
+        spec = registry.specs[key]
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=6)
+        ttk.Label(row, text=spec.title, width=10).pack(side="left")
+        value = tk.StringVar(value=str(registry.resolve(key) or "未找到程序"))
+        dialog.path_values[key] = value
+        ttk.Entry(row, textvariable=value, state="readonly").pack(side="left", fill="x", expand=True, padx=8)
+        def choose(key=key, value=value):
+            path = filedialog.askopenfilename(parent=dialog, title="选择程序文件（macOS 请进入 .app/Contents/MacOS）")
+            if path:
+                try:
+                    registry.save(key, path)
+                    value.set(path)
+                    message.set("已保存，后续操作自动使用此路径。")
+                except (OSError, ValueError) as exc:
+                    from error_dialog import show_copyable_error
+                    show_copyable_error("软件设置", str(exc), parent=dialog)
+        choose_button = ttk.Button(row, text="选择…", command=choose)
+        choose_button.pack(side="right")
+        dialog.choose_buttons[key] = choose_button
+    message = tk.StringVar()
+    ttk.Label(body, textvariable=message, style="Muted.TLabel", wraplength=550).pack(fill="x", pady=10)
+    footer = ttk.Frame(body)
+    footer.pack(side="bottom", fill="x")
+    accepted = False
+    def finish():
+        nonlocal accepted
+        if required and any(registry.resolve(key) is None for key in keys):
+            message.set("请先为以上软件选择有效的程序文件，或取消当前操作。")
+            return
+        accepted = True
+        dialog.destroy()
+    dialog.close_button = ttk.Button(footer, text="取消" if required else "关闭", command=dialog.destroy)
+    dialog.close_button.pack(side="left")
+    dialog.done_button = ttk.Button(footer, text="继续" if required else "完成", style="Primary.TButton", command=finish)
+    dialog.done_button.pack(side="right")
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.bind("<Escape>", lambda e: dialog.destroy())
+    parent._software_settings_dialog = dialog
+    dialog.wait_visibility()
+    dialog.grab_set()
+    parent.wait_window(dialog)
+    parent._software_settings_dialog = None
+    # Release widget/variable references on Tk's thread before a background
+    # worker can collect the closed dialog's Python reference cycles.
+    dialog.choose_buttons.clear()
+    dialog.path_values.clear()
+    return accepted
+
+
+def require_software(parent, keys):
+    registry = SoftwareRegistry()
+    missing = tuple(key for key in keys if registry.resolve(key) is None)
+    if missing and not show_software_settings(parent, missing, required=True):
+        return None
+    registry = SoftwareRegistry()
+    paths = {key: registry.resolve(key) for key in keys}
+    return paths if all(paths.values()) else None
+
+
 @dataclass(frozen=True)
 class SoftwareSpec:
     key: str
@@ -153,6 +245,7 @@ def build_home(app, menu_path=()) -> ttk.Frame:
     navigation = ttk.Frame(home)
     navigation.pack(fill="x", pady=(0, 12))
     tool_menu_button(navigation, app).pack(side="right")
+    settings_menu_button(navigation).pack(side="right", padx=8)
     if menu_path:
         ttk.Button(navigation, text="← 返回上级", command=lambda: app.show_toolbox(menu_path[:-1])).pack(side="left", padx=(0, 12))
         ttk.Button(navigation, text=PRODUCT_NAME, command=app.show_toolbox).pack(side="left")
@@ -182,25 +275,6 @@ def build_home(app, menu_path=()) -> ttk.Frame:
         footer = ttk.Frame(home)
         footer.pack(fill="x", pady=(14, 0))
         ttk.Label(footer, text="源素材只读   /   本地处理   /   独立输出", style="Muted.TLabel").pack(side="left")
-        ttk.Button(footer, text="软件连接设置 →", command=app.show_toolbox).pack(side="right")
         return home
-    software = ttk.LabelFrame(home, text="外部软件 · 连接与路径", padding=12)
-    software.pack(fill="x", pady=(20, 8))
-    registry = SoftwareRegistry()
-    for row, spec in enumerate(SOFTWARE):
-        value = tk.StringVar(value=str(registry.resolve(spec.key) or "未找到程序，请选择路径"))
-        ttk.Label(software, text=spec.title, width=12).grid(row=row, column=0, sticky="w", pady=3)
-        ttk.Entry(software, textvariable=value, state="readonly").grid(row=row, column=1, sticky="ew", padx=12)
-        def choose(key=spec.key, variable=value):
-            path = filedialog.askopenfilename(parent=app, title="选择程序文件（macOS 请进入 .app/Contents/MacOS）")
-            if path:
-                try:
-                    registry.save(key, path)
-                    variable.set(path)
-                except (OSError, ValueError) as exc:
-                    from error_dialog import show_copyable_error
-                    show_copyable_error("软件路径", str(exc), parent=app)
-        ttk.Button(software, text="选择程序…", command=choose).grid(row=row, column=2)
-    software.columnconfigure(1, weight=1)
     ttk.Label(home, text="源素材只读   /   本地处理   /   独立输出", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
     return home

@@ -37,7 +37,7 @@ from meteor_detection import (
 )
 from preview_viewer import ExactPreviewViewer
 from ui_navigation import keep_tree_row_in_navigation_runway
-from toolbox import PRODUCT_NAME, build_home, tool_menu_button
+from toolbox import PRODUCT_NAME, build_home, tool_menu_button, settings_menu_button
 from ui_theme import apply_theme
 
 
@@ -2243,6 +2243,7 @@ class MeteorComposer(tk.Tk):
         header.pack(fill="x", pady=(0, 8))
         ttk.Button(header, text="← 流星工具", command=lambda: self.show_toolbox(("meteor",))).pack(side="left")
         tool_menu_button(header, self).pack(side="left", padx=(6, 0))
+        settings_menu_button(header).pack(side="left", padx=6)
         self.workspace_title_label = ttk.Label(header, text="流星合成工作区")
         self.workspace_title_label.pack(side="left", padx=12)
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
@@ -2766,6 +2767,7 @@ class MeteorComposer(tk.Tk):
                 self.show_toolbox(category)
         ttk.Button(navigation, text=f"← 返回{category_title}", command=return_home).pack(side="left")
         tool_menu_button(navigation, self).pack(side="left", padx=8)
+        settings_menu_button(navigation).pack(side="left")
         ttk.Label(navigation, text=PRODUCT_NAME, style="Muted.TLabel").pack(side="right")
         def restore_main(event=None) -> None:
             if event is not None and event.widget is not window:

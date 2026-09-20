@@ -1915,6 +1915,11 @@ class VideoMeteorWindow(tk.Toplevel):
         except Exception as exc:
             show_copyable_error(self.title(), str(exc), parent=self)
             return
+        if ffmpeg_executable() is None:
+            from toolbox import require_software
+            if require_software(self, ("ffmpeg",)) is None:
+                self.status.set("已取消，配置 FFmpeg 后可重新导出。")
+                return
         output_path = output_dir / f"{video.stem}_meteor_dynamic_{datetime.now():%Y%m%d_%H%M%S}.mp4"
 
         def worker(token: CancellationToken) -> tuple:
