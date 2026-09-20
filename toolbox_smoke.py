@@ -94,6 +94,15 @@ def capture(window, name):
 
 
 def run_smoke(app):
+    if os.environ.get('NATIVE_MENU_SMOKE_ONLY'):
+        import tkinter as tk
+        from native_menu_smoke import run_native_menu_smoke
+        window = tk.Toplevel(app)
+        window.geometry('600x320+40+40')
+        try:
+            return run_native_menu_smoke(window)
+        finally:
+            window.destroy()
     app.attributes("-topmost", True)
     app.state("normal")
     app.geometry("1280x820+20+20")

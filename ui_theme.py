@@ -2,6 +2,7 @@
 from tkinter import ttk
 from tkinter import font as tkfont
 import tkinter as tk
+import sys
 
 
 def apply_theme(root):
@@ -24,6 +25,18 @@ def apply_theme(root):
     root.option_add("*Text.insertBackground", text)
     root.option_add("*Listbox.background", field)
     root.option_add("*TCombobox*Listbox.background", field)
+    # Windows draws native popup menus outside ttk's theme. A global light
+    # foreground on its system light background makes their entries invisible.
+    if sys.platform == 'win32':
+        menu_colors = dict(background='SystemMenu', foreground='SystemMenuText',
+                           activeBackground='SystemHighlight', activeForeground='SystemHighlightText',
+                           disabledForeground='SystemGrayText', selectColor='SystemMenuText')
+    else:
+        menu_colors = dict(background=panel, foreground=text,
+                           activeBackground='#405b7a', activeForeground='#ffffff',
+                           disabledForeground=muted, selectColor=text)
+    for option, value in menu_colors.items():
+        root.option_add(f'*Menu.{option}', value)
     style.configure(".", background=bg, foreground=text, bordercolor="#454545", lightcolor=panel, darkcolor=bg, troughcolor=field, selectbackground="#405b7a", selectforeground="#ffffff")
     style.configure("TButton", background=panel, borderwidth=0, padding=(8, 4), focusthickness=1, focuscolor=accent)
     style.map("TButton", background=[("disabled", bg), ("pressed", "#345977"), ("active", "#263c53")], foreground=[("disabled", "#64778c")])
