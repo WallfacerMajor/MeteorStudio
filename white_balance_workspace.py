@@ -75,7 +75,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         panel = ttk.Frame(body)
         panel.pack(fill="both", expand=True)
         sidebar = ttk.Frame(panel, width=245)
-        sidebar.pack(side="left", fill="y", padx=(0, 12))
+        sidebar.pack(side="right", fill="y", padx=(12, 0))
         sidebar.pack_propagate(False)
         self.control_canvas = tk.Canvas(sidebar, width=225, background="#101824", highlightthickness=0)
         scrollbar = ttk.Scrollbar(sidebar, orient="vertical", command=self.control_canvas.yview)

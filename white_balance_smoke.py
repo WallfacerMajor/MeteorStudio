@@ -43,6 +43,7 @@ def exercise_white_balance(root, window):
         with patch("white_balance_workspace.filedialog.askopenfilename", return_value=str(path)):
             click(root, window.open_button)
         wait_for(lambda: window.levels is not None and window.photo is not None and not window.busy)
+        assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         assert np.array_equal(window.levels[0], pixels)
         click(root, window.actual_button)
         pump(root, .4)
@@ -131,5 +132,6 @@ def exercise_white_balance(root, window):
         bottom = top + window.control_canvas.winfo_height()
         assert top <= window.load_button.winfo_rooty() < bottom
         assert window.export_button.winfo_ismapped() and window.canvas.winfo_height() > 100
+        assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         capture(window, "white-balance-small.png")
     return {"modified_camera_preset": "passed", "modified_batch_consistency": "passed", "wb_viewport_stable": "passed", "wb_original_compare": "passed", "wb_neutral_sample": "passed", "wb_settings_roundtrip": "passed", "wb_16bit_export_readonly": "passed", "wb_small_window_controls": "passed"}
