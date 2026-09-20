@@ -904,7 +904,11 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
 
-        paths = ttk.LabelFrame(root, text="输入方案与输出", padding=8)
+        inspector = ttk.Frame(root, width=360)
+        self.edit_inspector = inspector
+        inspector.pack(side="right", fill="y", padx=(10, 0))
+        inspector.pack_propagate(False)
+        paths = ttk.LabelFrame(inspector, text="输入方案与输出", padding=8)
         paths.pack(fill="x")
         ttk.Label(paths, text="素材方案").grid(row=0, column=0, sticky="w")
         mode = ttk.Combobox(paths, textvariable=self.input_mode_label, values=tuple(INPUT_MODES), state="readonly", width=30)
@@ -932,7 +936,7 @@ class VideoMeteorWindow(tk.Toplevel):
 
         left = ttk.Frame(body, width=350)
         body.add(left, weight=0)
-        review = ttk.LabelFrame(left, text="候选审核", padding=7)
+        review = ttk.LabelFrame(inspector, text="候选审核", padding=7)
         review.pack(fill="x")
         ttk.Label(review, text="自动接受分数").grid(row=0, column=0, sticky="w")
         ttk.Scale(review, from_=1, to=100, variable=self.threshold, orient="horizontal", command=self._threshold_changed).grid(row=0, column=1, sticky="ew", padx=5)
@@ -955,17 +959,17 @@ class VideoMeteorWindow(tk.Toplevel):
         self.tree.column("lock", width=42, anchor="center")
         self.tree.pack(fill="both", expand=True, pady=6)
         self.tree.bind("<<TreeviewSelect>>", self._tree_selected)
-        decision = ttk.Frame(left)
+        decision = ttk.Frame(inspector)
         decision.pack(fill="x")
         ttk.Button(decision, text="✓ 保留", command=self.accept_current).pack(side="left", fill="x", expand=True)
         ttk.Button(decision, text="✕ 排除", command=self.reject_current).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Button(decision, text="锁定/解锁", command=self.toggle_lock).pack(side="left", fill="x", expand=True)
-        ttk.Button(left, text="＋ 手工添加当前帧", command=self.add_manual_event).pack(fill="x", pady=(5, 0))
-        groups = ttk.Frame(left)
+        ttk.Button(inspector, text="＋ 手工添加当前帧", command=self.add_manual_event).pack(fill="x", pady=(5, 0))
+        groups = ttk.Frame(inspector)
         groups.pack(fill="x", pady=(5, 0))
         ttk.Button(groups, text="合并所选连续帧", command=self.merge_selected_events).pack(side="left", fill="x", expand=True)
         ttk.Button(groups, text="拆分多帧事件", command=self.split_current_event).pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Button(left, text="当前流星单独参数…", command=self.edit_current_settings).pack(fill="x", pady=(5, 0))
+        ttk.Button(inspector, text="当前流星单独参数…", command=self.edit_current_settings).pack(fill="x", pady=(5, 0))
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
@@ -988,7 +992,7 @@ class VideoMeteorWindow(tk.Toplevel):
         self.canvas.bind("<Command-Button-1>", self._delete_stroke_at)
         self.canvas.bind("<Shift-Button-3>", self._delete_stroke_at)
 
-        tools_bar = ttk.Frame(center)
+        tools_bar = ttk.Frame(inspector)
         tools_bar.pack(fill="x", pady=(5, 0))
         ttk.Radiobutton(tools_bar, text="画笔 (B)", variable=self.edit_mode, value="brush", command=self._tool_changed).pack(side="left")
         ttk.Radiobutton(tools_bar, text="橡皮擦 (E)", variable=self.edit_mode, value="eraser", command=self._tool_changed).pack(side="left", padx=(5, 12))
@@ -1004,7 +1008,7 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Button(tools_bar, text="撤销", command=self.undo_mask).pack(side="right")
         ttk.Button(tools_bar, text="重做", command=self.redo_mask).pack(side="right", padx=4)
 
-        frame_bar = ttk.Frame(center)
+        frame_bar = ttk.Frame(inspector)
         frame_bar.pack(fill="x", pady=(4, 0))
         ttk.Label(frame_bar, text="事件内流星帧：").pack(side="left")
         ttk.Button(frame_bar, text="◀", width=3, command=lambda: self._change_source_offset(-1)).pack(side="left")
@@ -1012,8 +1016,8 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Button(frame_bar, text="▶", width=3, command=lambda: self._change_source_offset(1)).pack(side="left")
         ttk.Label(frame_bar, text="（合并连续候选后，可逐帧编辑并用曲线慢放）").pack(side="left", padx=8)
 
-        right = ttk.LabelFrame(body, text="全局流星动态参数", padding=8, width=330)
-        body.add(right, weight=0)
+        right = ttk.LabelFrame(inspector, text="全局流星动态参数", padding=8, width=330)
+        right.pack(fill="x")
         row = 0
         ttk.Label(right, text="效果模式").grid(row=row, column=0, sticky="w")
         ttk.Combobox(right, textvariable=self.effect_mode, values=EFFECT_MODES, state="readonly", width=18).grid(row=row, column=1, sticky="ew")
@@ -1063,7 +1067,12 @@ class VideoMeteorWindow(tk.Toplevel):
         ttk.Label(bottom, textvariable=self.status).pack(side="left", fill="x", expand=True)
         self.progress = ttk.Progressbar(bottom, mode="determinate", length=260)
         self.progress.pack(side="left", padx=8)
-        ttk.Button(bottom, text="导出动态流星视频", command=self.export).pack(side="right")
+        ttk.Button(inspector, text="导出动态流星视频", command=self.export).pack(side="right")
+
+        from workspace_layout import scroll_controls
+        scroll_controls(inspector, 330)
+        bottom.pack_forget()
+        bottom.pack(side="bottom", fill="x", before=inspector)
 
         watched = (
             self.video_path, self.clean_video_path, self.output_dir, self.input_mode_label,

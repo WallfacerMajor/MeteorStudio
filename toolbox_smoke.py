@@ -18,9 +18,48 @@ def pump(app, seconds):
 
 def click(app, widget):
     app.update()
+    reveal_control(app, widget)
+    x = widget.winfo_rootx() + widget.winfo_width() // 2
+    y = widget.winfo_rooty() + widget.winfo_height() // 2
+    if 0 <= x < app.winfo_screenwidth() and 0 <= y < app.winfo_screenheight():
+        assert app.winfo_containing(x, y) == widget, f'Control obscured: {widget}'
     widget.event_generate("<ButtonPress-1>", x=widget.winfo_width() // 2, y=widget.winfo_height() // 2)
     widget.event_generate("<ButtonRelease-1>", x=widget.winfo_width() // 2, y=widget.winfo_height() // 2)
     pump(app, 0.15)
+
+
+def reveal_control(app, widget):
+    owners = []
+    ancestor = widget.master
+    while ancestor is not None:
+        if isinstance(getattr(ancestor, 'master', None), ttk.Notebook):
+            notebook = ancestor.master
+            wanted = notebook.index(ancestor)
+            if notebook.select() != str(ancestor):
+                for x in range(2, notebook.winfo_width(), 4):
+                    try:
+                        hit = notebook.index(f'@{x},10')
+                    except Exception:
+                        continue
+                    if hit == wanted:
+                        notebook.event_generate('<ButtonPress-1>', x=x, y=10)
+                        notebook.event_generate('<ButtonRelease-1>', x=x, y=10)
+                        app.update()
+                        break
+        if hasattr(ancestor, '_inspector_canvas'):
+            owners.append(ancestor._inspector_canvas)
+        ancestor = getattr(ancestor, 'master', None)
+    for canvas in reversed(owners):
+        for _ in range(160):
+            app.update()
+            top = canvas.winfo_rooty()
+            bottom = top + canvas.winfo_height()
+            y = widget.winfo_rooty()
+            if top <= y and y + widget.winfo_height() <= bottom:
+                break
+            canvas.event_generate('<Button-4>' if y < top else '<Button-5>')
+        else:
+            raise AssertionError(f'Cannot scroll to control: {widget}')
 
 
 def widgets(parent):
@@ -43,6 +82,7 @@ def capture(window, name):
 
 def run_smoke(app):
     app.geometry("1280x820+20+20")
+    assert app.edit_inspector.winfo_exists()
     app.show_toolbox()
     pump(app, 0.4)
     assert app.toolbox_home.winfo_ismapped()
@@ -147,12 +187,22 @@ def run_smoke(app):
         with patch.object(cls, restore), patch.object(cls, save):
             click(app, app.toolbox_home.tool_buttons[key])
             child = getattr(app, attr)
+            assert child.edit_inspector.winfo_rootx() >= child.canvas.winfo_rootx() + child.canvas.winfo_width()
+            assert child.canvas.winfo_width() >= 150 and child.canvas.winfo_height() >= 200
             if key == "screening":
                 status, label = child.filter_status_combo, child.filter_label_combo
                 assert status.winfo_rootx() + status.winfo_width() <= label.winfo_rootx()
                 child.last_export_dir.set("")
                 child.return_callback = lambda path: (_ for _ in ()).throw(AssertionError("Empty export became current directory"))
             capture(child, f"{attr}.png")
+            child.geometry('980x650' if key == 'screening' else '1120x720')
+            pump(app, 1.4)
+            assert child.edit_inspector.winfo_rootx() >= child.canvas.winfo_rootx() + child.canvas.winfo_width()
+            assert child.canvas.winfo_width() >= 150 and child.canvas.winfo_height() >= 200
+            target = child.export_button if key == 'screening' else next(w for w in widgets(child) if isinstance(w, ttk.Button) and w.cget('text') == '导出动态流星视频')
+            reveal_control(app, target)
+            assert child.winfo_containing(target.winfo_rootx()+target.winfo_width()//2, target.winfo_rooty()+target.winfo_height()//2) == target
+            capture(child, f"{attr}-small.png")
             commands = set(child._tclCommands or ())
             owned_timers = set()
             for timer in app.tk.splitlist(app.tk.call("after", "info")):

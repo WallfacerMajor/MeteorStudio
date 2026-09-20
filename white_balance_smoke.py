@@ -44,6 +44,8 @@ def exercise_white_balance(root, window):
             click(root, window.open_button)
         wait_for(lambda: window.levels is not None and window.photo is not None and not window.busy)
         assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
+        assert window.export_button.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
+        assert window.output_entry.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         assert np.array_equal(window.levels[0], pixels)
         before = window.settings()
         reveal(window.suggest_button)

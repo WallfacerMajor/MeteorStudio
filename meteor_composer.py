@@ -2281,6 +2281,10 @@ class MeteorComposer(tk.Tk):
         paths.columnconfigure(1, weight=1)
         self._update_output_mode_ui()
 
+        inspector = ttk.Frame(root, width=360)
+        self.edit_inspector = inspector
+        inspector.pack(side="right", fill="y", padx=(10, 0))
+        inspector.pack_propagate(False)
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(10, 6))
 
@@ -2296,7 +2300,7 @@ class MeteorComposer(tk.Tk):
         self.tree.bind("<ButtonPress-1>", self._tree_pointer_press)
         self.tree.bind("<ButtonRelease-1>", self._tree_pointer_release)
         self.tree.bind("<<TreeviewSelect>>", self._tree_selection_changed)
-        source_state = ttk.Frame(left)
+        source_state = ttk.Frame(inspector)
         source_state.pack(fill="x", pady=(4, 0))
         self.aligned_source_button = ttk.Button(
             source_state, text="自动对齐图", command=lambda: self._set_current_source_state("aligned")
@@ -2306,32 +2310,35 @@ class MeteorComposer(tk.Tk):
             source_state, text="原始状态图", command=lambda: self._set_current_source_state("original")
         )
         self.original_source_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Label(left, textvariable=self.source_state_label).pack(anchor="w", pady=(2, 0))
+        ttk.Label(inspector, textvariable=self.source_state_label).pack(anchor="w", pady=(2, 0))
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
         view_bar = ttk.Frame(center)
         view_bar.pack(fill="x", pady=(0, 2))
-        ttk.Label(view_bar, text="查看：").pack(side="left")
-        ttk.Radiobutton(view_bar, text="1 当前素材图", variable=self.view_mode, value="source", command=self._view_mode_changed).pack(side="left")
-        ttk.Radiobutton(view_bar, text="2 干净底图", variable=self.view_mode, value="base", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(view_bar, textvariable=self.blend_preview_label, variable=self.view_mode, value="blend", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
-        ttk.Radiobutton(view_bar, textvariable=self.source_preview_label, variable=self.view_mode, value="labeled", command=self._view_mode_changed).pack(side="left", padx=(8, 0))
-        ttk.Label(view_bar, text="编辑视图：拖动画蒙版；按住 H 临时隐藏红色").pack(side="right")
+        for index, (label, value) in enumerate((("素材", "source"), ("干净底图", "base"), (None, "blend"), (None, "labeled"))):
+            options = dict(text=label) if label else dict(textvariable=self.blend_preview_label if value == "blend" else self.source_preview_label)
+            ttk.Radiobutton(view_bar, **options, variable=self.view_mode, value=value, command=self._view_mode_changed).grid(row=0, column=index, sticky="w", padx=(0, 4))
+        view_bar.columnconfigure(0, weight=1)
+        view_bar.columnconfigure(1, weight=1)
+        quality_bar = ttk.Frame(inspector)
+        quality_bar.pack(fill="x")
         exact_bar = ttk.Frame(center)
         exact_bar.pack(fill="x", pady=(0, 4))
-        ttk.Label(exact_bar, textvariable=self.preview_quality_status).pack(side="left")
-        ttk.Label(exact_bar, textvariable=self.exact_preview_status).pack(side="left", padx=(8, 0))
-        self.undo_button = ttk.Button(exact_bar, text="↶ 撤销", command=self.undo_stroke)
+        ttk.Label(quality_bar, textvariable=self.preview_quality_status, wraplength=200).pack(side="left")
+        ttk.Label(quality_bar, textvariable=self.exact_preview_status, wraplength=120).pack(side="left", padx=(8, 0))
+        edit_history = ttk.Frame(inspector)
+        edit_history.pack(fill="x", pady=4)
+        self.undo_button = ttk.Button(edit_history, text="↶ 撤销", command=self.undo_stroke)
         self.undo_button.pack(side="left", padx=(14, 0))
-        self.redo_button = ttk.Button(exact_bar, text="↷ 重做", command=self.redo_stroke)
+        self.redo_button = ttk.Button(edit_history, text="↷ 重做", command=self.redo_stroke)
         self.redo_button.pack(side="left", padx=(4, 0))
         self.history_button = ttk.Button(
-            exact_bar, text="历史记录", command=self._show_history_panel,
+            edit_history, text="历史记录", command=self._show_history_panel,
         )
         self.history_button.pack(side="left", padx=(4, 0))
-        ttk.Button(exact_bar, text="适合窗口", command=self._canvas_fit).pack(side="right", padx=(4, 0))
-        ttk.Button(exact_bar, text="100%", command=self._canvas_actual_size).pack(side="right", padx=(4, 0))
+        ttk.Button(exact_bar, text="适合", width=5, command=self._canvas_fit).pack(side="right", padx=(4, 0))
+        ttk.Button(exact_bar, text="1:1", width=4, command=self._canvas_actual_size).pack(side="right", padx=(4, 0))
         ttk.Button(exact_bar, text="+", width=3, command=lambda: self._canvas_zoom_by(1.25)).pack(side="right", padx=(4, 0))
         ttk.Button(exact_bar, text="−", width=3, command=lambda: self._canvas_zoom_by(1 / 1.25)).pack(side="right")
         ttk.Label(exact_bar, textvariable=self.canvas_zoom_label).pack(side="right", padx=(8, 4))
@@ -2374,8 +2381,8 @@ class MeteorComposer(tk.Tk):
         self.object_menu.add_command(label="使用自动对齐素材", command=lambda: self._set_selected_source_mode("aligned"))
         self.object_menu.add_command(label="使用原始素材", command=lambda: self._set_selected_source_mode("original"))
 
-        self.control_notebook = ttk.Notebook(root)
-        self.control_notebook.pack(fill="x", pady=(0, 5))
+        self.control_notebook = ttk.Notebook(inspector)
+        self.control_notebook.pack(fill="both", expand=True, pady=(0, 5))
 
         mask_tools = ttk.Frame(self.control_notebook, padding=8)
         blend_tools = ttk.Frame(self.control_notebook, padding=8)
@@ -2385,10 +2392,10 @@ class MeteorComposer(tk.Tk):
         self.blend_tools_tab = blend_tools
         self.selected_tools_tab = selected_tools
         self.history_tools_tab = history_tools
-        self.control_notebook.add(mask_tools, text="3  蒙版与候选")
-        self.control_notebook.add(blend_tools, text="4  融合与底图")
-        self.control_notebook.add(selected_tools, text="5  所选流星")
-        self.control_notebook.add(history_tools, text="6  操作历史")
+        self.control_notebook.add(mask_tools, text="蒙版")
+        self.control_notebook.add(blend_tools, text="融合")
+        self.control_notebook.add(selected_tools, text="所选流星")
+        self.control_notebook.add(history_tools, text="历史")
         self.control_notebook.bind("<<NotebookTabChanged>>", self._control_tab_changed)
 
         history_header = ttk.Frame(history_tools)
@@ -2580,20 +2587,21 @@ class MeteorComposer(tk.Tk):
         ttk.Label(bottom, textvariable=self.autosave_status).pack(side="left", padx=8)
         self.progress = ttk.Progressbar(bottom, mode="determinate", length=220)
         self.progress.pack(side="left", padx=8)
-        self.export_button = ttk.Button(bottom, text="导出合成结果", command=self.export)
-        self.export_button.pack(side="right")
-        ttk.Button(bottom, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
-        ttk.Button(bottom, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
+        export_actions = ttk.Frame(inspector)
+        export_actions.pack(fill="x", before=self.control_notebook, pady=5)
+        self.export_button = ttk.Button(export_actions, text="导出合成结果", command=self.export)
+        self.export_button.pack(fill="x")
+        ttk.Button(export_actions, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
+        ttk.Button(export_actions, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
 
-        # Reserve the bottom controls before allowing the canvas to consume the
-        # remaining height. Packing the expanding body first can push later
-        # controls completely outside an 820px window on Windows display scales.
-        body.pack_forget()
-        self.control_notebook.pack_forget()
+        from workspace_layout import scroll_controls
+        for tab in (mask_tools, blend_tools, selected_tools):
+            scroll_controls(tab, 330)
+        # History is already a vertically scrolling list.
+        self.history_tree.column("action", width=220)
+        history_header.winfo_children()[0].configure(wraplength=280)
         bottom.pack_forget()
-        bottom.pack(side="bottom", fill="x")
-        self.control_notebook.pack(side="bottom", fill="x", pady=(0, 5))
-        body.pack(fill="both", expand=True, pady=(10, 6))
+        bottom.pack(side="bottom", fill="x", before=inspector)
         self._refresh_history_ui()
 
     def _toggle_paths_panel(self) -> None:
@@ -3136,8 +3144,8 @@ F1：显示本快捷键表""")
 
     def _update_blend_preview_label(self) -> None:
         shared = self._uses_shared_base()
-        self.blend_preview_label.set("3 总融合预览" if shared else "3 当前图融合预览")
-        self.source_preview_label.set("4 总图来源标注" if shared else "4 当前图来源标注")
+        self.blend_preview_label.set("总融合" if shared else "当前融合")
+        self.source_preview_label.set("总来源" if shared else "当前来源")
 
     def _base_selection_signature(self) -> str:
         """Identify the clean-base selection represented by the active pair table."""

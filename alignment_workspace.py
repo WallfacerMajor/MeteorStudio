@@ -91,7 +91,11 @@ class AlignmentWorkspace(tk.Toplevel):
             root,
             text="Siril只辅助寻找星点；PTGui以对齐参考图建立星空控制点并原生导出图层。流星在返回主工作区后再抠。",
         ).pack(anchor="w", pady=(2, 10))
-        configuration = ttk.Notebook(root)
+        inspector = ttk.Frame(root, width=360)
+        self.edit_inspector = inspector
+        inspector.pack(side="right", fill="y", padx=(12, 0))
+        inspector.pack_propagate(False)
+        configuration = ttk.Notebook(inspector, height=300)
         configuration.pack(fill="x", pady=(0, 6))
         inputs_tab = ttk.Frame(configuration, padding=6)
         lens_tab = ttk.Frame(configuration, padding=6)
@@ -150,12 +154,12 @@ class AlignmentWorkspace(tk.Toplevel):
             values=list(LAB_CANVASES), state="disabled", width=22,
         )
         self.lab_canvas_box.pack(side="left")
-        mode_row = ttk.Frame(root)
+        mode_row = ttk.Frame(inspector)
         mode_row.pack(fill="x", pady=(8, 0))
         self.mode_button = ttk.Checkbutton(mode_row, text="仅生成控制点工程（跳过 16 位图层导出）", variable=self.control_points_only, command=self._laboratory_changed)
         self.mode_button.pack(side="left")
 
-        actions = ttk.Frame(root)
+        actions = ttk.Frame(inspector)
         actions.pack(fill="x", pady=8)
         self.scan_button = ttk.Button(actions, text="1. 扫描素材", command=self.scan)
         self.scan_button.pack(side="left")
@@ -170,7 +174,7 @@ class AlignmentWorkspace(tk.Toplevel):
             actions, text="打开导出文件夹", command=self._open_output_folder, state="disabled",
         )
         self.open_output_button.pack(side="left", padx=(8, 0))
-        result_actions = ttk.Frame(root)
+        result_actions = ttk.Frame(inspector)
         result_actions.pack(fill="x", pady=(0, 8))
         self.creative_button = ttk.Button(result_actions, text="选中待处理项 → 创意放置", command=self.mark_creative, state="disabled")
         self.creative_button.pack(side="right")
@@ -204,10 +208,17 @@ class AlignmentWorkspace(tk.Toplevel):
         results.rowconfigure(0, weight=1)
 
         footer = ttk.Frame(root)
-        footer.pack(side="bottom", fill="x", pady=(8, 0), before=results)
+        footer.pack(side="bottom", fill="x", pady=(8, 0), before=inspector)
         ttk.Label(footer, textvariable=self.status, wraplength=650).pack(side="left", fill="x", expand=True)
         self.progress = ttk.Progressbar(footer, mode="determinate", maximum=100, length=160)
         self.progress.pack(side="right")
+
+        from workspace_layout import scroll_controls, stack_controls
+        scroll_controls(inputs_tab, 310)
+        scroll_controls(lens_tab, 310)
+        for section in (mode_row, actions, result_actions):
+            stack_controls(section, 330)
+        scroll_controls(inspector, 335, reflow=False)
 
     def _path_row(self, parent, row, label, variable, callback, button_text) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)

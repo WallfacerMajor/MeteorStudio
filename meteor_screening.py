@@ -970,7 +970,11 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Button(header, text="返回流星合成功能", command=self._return_to_composer).pack(side="right")
         ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(0, 6))
 
-        settings = ttk.LabelFrame(root, text="筛选设置", padding=8)
+        inspector = ttk.Frame(root, width=320)
+        self.edit_inspector = inspector
+        inspector.pack(side="right", fill="y", padx=(10, 0))
+        inspector.pack_propagate(False)
+        settings = ttk.LabelFrame(inspector, text="筛选设置", padding=8)
         settings.pack(fill="x")
         self._path_row(settings, 0, "连续照片文件夹", self.source_dir, self._browse_source)
         self._path_row(settings, 1, "筛选结果保存位置", self.output_dir, self._browse_output)
@@ -1110,7 +1114,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Button(preview_tools, text="适应窗口", command=self._fit_preview).pack(side="left")
         ttk.Button(preview_tools, text="1:1", command=self._actual_size_preview).pack(side="left", padx=(5, 0))
         ttk.Checkbutton(
-            preview_tools, text="显示候选标记", variable=self.show_candidate_marks,
+            preview_tools, text="候选标记", variable=self.show_candidate_marks,
             command=self._candidate_marks_changed,
         ).pack(side="left", padx=(10, 0))
         ttk.Checkbutton(
@@ -1118,6 +1122,12 @@ class MeteorScreeningWindow(tk.Toplevel):
             command=self._original_preview_changed,
         ).pack(side="left", padx=(10, 0))
         ttk.Label(preview_tools, text="滚轮缩放 · 拖动平移 · H 原图", style="Muted.TLabel").pack(side="left", padx=10)
+        for widget in preview_tools.winfo_children():
+            widget.pack_forget()
+        for index, widget in enumerate(preview_tools.winfo_children()):
+            widget.grid(row=index//2, column=index%2, sticky="w", padx=(0, 5), pady=2)
+        preview_tools.winfo_children()[-1].configure(wraplength=220)
+        preview_tools.winfo_children()[-1].grid(columnspan=2)
 
         self.canvas = tk.Canvas(right, background="#151515", highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill="both", expand=True)
@@ -1130,7 +1140,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.canvas.bind("<ButtonRelease-1>", self._canvas_release)
         self.canvas.bind("<Delete>", self._remove_selected_candidates)
 
-        candidate_actions = ttk.Frame(right)
+        candidate_actions = ttk.Frame(inspector)
         candidate_actions.pack(fill="x", pady=(6, 0))
         candidate_labels = ttk.Frame(candidate_actions)
         candidate_labels.pack(fill="x")
@@ -1180,9 +1190,9 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Label(
             candidate_selection, text="Delete 清除选中",
         ).pack(side="left", padx=(10, 0))
-        ttk.Label(right, textvariable=self.candidate_status).pack(fill="x", pady=(3, 0))
+        ttk.Label(inspector, textvariable=self.candidate_status).pack(fill="x", pady=(3, 0))
 
-        image_actions = ttk.Frame(right)
+        image_actions = ttk.Frame(inspector)
         image_actions.pack(fill="x", pady=(5, 0))
         ttk.Label(image_actions, text="当前照片：").pack(side="left")
         ttk.Button(image_actions, text="✓ 保留这张照片", command=self.accept_selected).pack(side="left")
@@ -1191,11 +1201,13 @@ class MeteorScreeningWindow(tk.Toplevel):
         ttk.Label(image_actions, textvariable=self.summary).pack(side="right")
 
         bottom = ttk.Frame(root)
-        bottom.pack(side="bottom", fill="x", before=body)
+        bottom.pack(side="bottom", fill="x", before=inspector)
         ttk.Label(bottom, textvariable=self.status).pack(side="left", fill="x", expand=True)
         ttk.Label(bottom, textvariable=self.autosave_status).pack(side="right", padx=(8, 10))
         self.progress = ttk.Progressbar(bottom, length=260, mode="determinate")
         self.progress.pack(side="right")
+        from workspace_layout import scroll_controls
+        scroll_controls(inspector, 295)
         self.bind("<KeyPress-h>", self._hide_candidate_marks)
         self.bind("<KeyRelease-h>", self._show_candidate_marks)
         self.bind("<KeyPress-H>", self._hide_candidate_marks)

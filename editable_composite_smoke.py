@@ -29,7 +29,7 @@ def run_smoke(app) -> dict:
         app.control_notebook.tab(index, "text")
         for index in range(app.control_notebook.index("end"))
     ]
-    if tab_names != ["3  蒙版与候选", "4  融合与底图", "5  所选流星", "6  操作历史"]:
+    if tab_names != ["蒙版", "融合", "所选流星", "历史"]:
         raise AssertionError(f"Unexpected workspace tabs: {tab_names}")
     required_controls = {
         "B ✎ 画笔", "E ▱ 橡皮擦", "本地模型分析当前单张", "自动检测全部",
@@ -1063,6 +1063,20 @@ def run_smoke(app) -> dict:
     )
 
     # Exact user-reported point 2: blank padding directly below 载入项目.
+    from toolbox_smoke import reveal_control
+    def inspector_viewport():
+        return (app.canvas_zoom, app.canvas_center_x, app.canvas_center_y,
+                tuple(app.display_box), app.canvas.winfo_width(), app.canvas.winfo_height())
+    before_scroll = inspector_viewport()
+    reveal_control(app, app.load_project_button)
+    deadline = time.monotonic() + 1.45
+    while time.monotonic() < deadline:
+        app.update()
+        time.sleep(.01)
+    if inspector_viewport() != before_scroll:
+        raise AssertionError('Scrolling the right inspector changed the image viewport')
+    if app.edit_inspector.winfo_rootx() < app.canvas.winfo_rootx() + app.canvas.winfo_width():
+        raise AssertionError('Editing controls are not on the right of the canvas')
     load_center_x = app.load_project_button.winfo_rootx() + app.load_project_button.winfo_width() // 2
     load_bottom = app.load_project_button.winfo_rooty() + app.load_project_button.winfo_height()
     tools_bottom = app.mask_tools_tab.winfo_rooty() + app.mask_tools_tab.winfo_height()
