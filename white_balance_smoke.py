@@ -1,5 +1,6 @@
 """Real pointer regressions also executed inside the packaged application."""
 import hashlib
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +18,16 @@ def exercise_white_balance(root, window):
             pump(root, .05)
         assert predicate(), window.status.get()
         pump(root, 1.4)
+    def reveal(widget):
+        for _ in range(100):
+            top = window.control_canvas.winfo_rooty()
+            bottom = top + window.control_canvas.winfo_height()
+            y = widget.winfo_rooty()
+            if top <= y and y + widget.winfo_height() <= bottom:
+                return
+            window.control_canvas.event_generate("<Button-4>" if y < top else "<Button-5>")
+            pump(root, .015)
+        raise AssertionError("Control is not reachable")
     with tempfile.TemporaryDirectory() as folder:
         source = Path(folder) / "source"
         source.mkdir()
@@ -61,12 +72,19 @@ def exercise_white_balance(root, window):
         assert window.neutral != [1, 1, 1] and not window.picker.get()
         balanced = apply_lut(pixels[600:601,900:901], make_lut(window.settings()))[0,0].astype(int)
         assert balanced.max() - balanced.min() <= 2
+        window.equipment["camera"].set("Test camera")
+        window.equipment["modification"].set("Hα 增强")
+        window.equipment["filter"].set("UV/IR cut")
+        window.equipment["reference"].set("灰卡 / 同一光学组合")
         settings = window.settings()
         config = Path(folder) / "settings.json"
+        reveal(window.save_button)
         with patch("white_balance_workspace.filedialog.asksaveasfilename", return_value=str(config)):
             click(root, window.save_button)
+        reveal(window.reset_button)
         click(root, window.reset_button)
         assert window.neutral == [1, 1, 1] and window.warmth.get() == 0
+        reveal(window.load_button)
         with patch("white_balance_workspace.filedialog.askopenfilename", return_value=str(config)):
             click(root, window.load_button)
         assert window.settings() == settings
@@ -76,6 +94,31 @@ def exercise_white_balance(root, window):
         result = tifffile.imread(window.result / "result.tif")
         assert result.dtype == np.uint16 and result.shape == pixels.shape
         np.testing.assert_array_equal(result, apply_lut(pixels, make_lut(settings)))
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        # Preset loading enables reuse, and opening another photo must not
+        # discard equipment identifiers or the sampled calibration.
+        second = source / "second.tif"
+        tifffile.imwrite(second, pixels, photometric="rgb")
+        with patch("white_balance_workspace.filedialog.askopenfilename", return_value=str(second)):
+            click(root, window.open_button)
+        wait_for(lambda: window.source == second and not window.busy)
+        assert window.settings() == settings and window.keep_settings.get()
+        previous = window.result
+        broken = source / "broken.tif"
+        broken.write_bytes(b"invalid")
+        logged = []
+        with patch("white_balance_workspace.append_runtime_log", side_effect=lambda *args: logged.append(args)):
+            with patch("white_balance_workspace.filedialog.askopenfilenames", return_value=(str(path), str(second), str(broken))):
+                click(root, window.batch_button)
+            wait_for(lambda: not window.busy and window.result != previous)
+        batch = json.loads((window.result / "batch.json").read_text(encoding="utf-8"))
+        assert batch["status"] == "complete_with_errors" and len(batch["items"]) == 3
+        assert logged and "broken.tif" in logged[0][0] and "成功 2 / 3" in window.status.get()
+        assert float(window.progress["value"]) == 100
+        assert batch["settings"] == settings
+        for item in batch["items"]:
+            if item["status"] == "complete":
+                np.testing.assert_array_equal(tifffile.imread(Path(item["output"]) / "result.tif"), result)
         assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
         capture(window, "white-balance.png")
         window.state("normal")
@@ -89,4 +132,4 @@ def exercise_white_balance(root, window):
         assert top <= window.load_button.winfo_rooty() < bottom
         assert window.export_button.winfo_ismapped() and window.canvas.winfo_height() > 100
         capture(window, "white-balance-small.png")
-    return {"wb_viewport_stable": "passed", "wb_original_compare": "passed", "wb_neutral_sample": "passed", "wb_settings_roundtrip": "passed", "wb_16bit_export_readonly": "passed", "wb_small_window_controls": "passed"}
+    return {"modified_camera_preset": "passed", "modified_batch_consistency": "passed", "wb_viewport_stable": "passed", "wb_original_compare": "passed", "wb_neutral_sample": "passed", "wb_settings_roundtrip": "passed", "wb_16bit_export_readonly": "passed", "wb_small_window_controls": "passed"}

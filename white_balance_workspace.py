@@ -6,10 +6,10 @@ from pathlib import Path
 from tkinter import ttk, filedialog
 from PIL import Image, ImageTk
 from background_tasks import BackgroundTaskScheduler
-from error_dialog import show_copyable_error, show_runtime_log
+from error_dialog import show_copyable_error, show_runtime_log, append_runtime_log
 from platform_utils import open_folder
 from ui_navigation import cancel_widget_timers
-from white_balance import read_source, make_pyramid, render_view, sample_neutral, export_image, validate_settings
+from white_balance import read_source, make_pyramid, render_view, sample_neutral, export_image, export_batch, validate_settings, RAW_SUFFIXES
 
 
 class WhiteBalanceWindow(tk.Toplevel):
@@ -31,6 +31,11 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.drag = None
         self.photo = None
         self.warmth, self.tint = tk.DoubleVar(value=0), tk.DoubleVar(value=0)
+        self.strength = tk.DoubleVar(value=100)
+        self.raw_baseline = tk.StringVar(value="相机白平衡")
+        self.loaded_baseline = "camera"
+        self.keep_settings = tk.BooleanVar(value=False)
+        self.equipment = {key: tk.StringVar() for key in ("camera", "modification", "filter", "reference")}
         self.original, self.picker = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
         self.status = tk.StringVar(value="打开照片开始 · 支持 sRGB TIFF / PNG / JPG 和 RAW")
@@ -50,6 +55,8 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.export_button.pack(side="left")
         self.cancel_button = ttk.Button(footer, text="取消导出", state="disabled", command=self.cancel_export)
         self.cancel_button.pack(side="left", padx=6)
+        self.batch_button = ttk.Button(footer, text="批量应用当前设置…", command=self.batch_export)
+        self.batch_button.pack(side="left")
         self.folder_button = ttk.Button(footer, text="打开结果", state="disabled", command=self.open_result)
         self.folder_button.pack(side="right")
         ttk.Button(footer, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=6)
@@ -84,11 +91,11 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.control_canvas.bind("<Button-5>", lambda e: self.control_canvas.yview_scroll(1, "units"))
         ttk.Label(controls, text="相对调整", style="Title.TLabel").pack(anchor="w", pady=(0, 8))
         self.sliders = []
-        for title, var in (("色温偏移  ·  冷 ← → 暖", self.warmth), ("色调  ·  绿 ← → 洋红", self.tint)):
+        for title, var, lower in (("色温偏移  ·  冷 ← → 暖", self.warmth, -100), ("色调  ·  绿 ← → 洋红", self.tint, -100), ("中性校准强度  ·  0–100%", self.strength, 0)):
             ttk.Label(controls, text=title).pack(anchor="w", pady=(8, 0))
-            value = ttk.Label(controls, text="0", style="Muted.TLabel")
+            value = ttk.Label(controls, text=f"{var.get():+.1f}", style="Muted.TLabel")
             value.pack(anchor="e")
-            scale = ttk.Scale(controls, from_=-100, to=100, variable=var)
+            scale = ttk.Scale(controls, from_=lower, to=100, variable=var)
             scale.pack(fill="x", pady=(0, 8))
             self.sliders.append(scale)
             var.trace_add("write", lambda *_, v=var, label=value: (label.configure(text=f"{v.get():+.1f}"), self.schedule_render()))
@@ -98,6 +105,26 @@ class WhiteBalanceWindow(tk.Toplevel):
         ttk.Label(controls, textvariable=self.gain_info, style="Muted.TLabel", wraplength=220).pack(anchor="w", pady=10)
         self.reset_button = ttk.Button(controls, text="重置白平衡", command=self.reset)
         self.reset_button.pack(fill="x", pady=5)
+        ttk.Separator(controls).pack(fill="x", pady=12)
+        ttk.Label(controls, text="改机与滤镜校准", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(controls, text="打开灰卡参考 → 取中性点 →\n保存设备预设，再用于同组照片。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
+        self.equipment_widgets = []
+        for key, title in (("camera", "机身"), ("modification", "改机方式"), ("filter", "滤镜 / 光学组合"), ("reference", "参考光源 / 拍摄条件")):
+            ttk.Label(controls, text=title).pack(anchor="w", pady=(5, 0))
+            if key == "modification":
+                entry = ttk.Combobox(controls, textvariable=self.equipment[key], values=("未记录", "Hα 增强", "全光谱", "未改机"), state="readonly")
+            else:
+                entry = ttk.Entry(controls, textvariable=self.equipment[key], validate="key",
+                                  validatecommand=(self.register(lambda value: len(value) <= 300), "%P"))
+            entry.pack(fill="x")
+            self.equipment_widgets.append(entry)
+        ttk.Label(controls, text="RAW 解码基准", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        self.baseline_combo = ttk.Combobox(controls, textvariable=self.raw_baseline, values=("相机白平衡", "固定日光（同组）"), state="readonly")
+        self.baseline_combo.pack(fill="x")
+        self.baseline_combo.bind("<<ComboboxSelected>>", self.baseline_changed)
+        self.keep_button = ttk.Checkbutton(controls, text="下一张沿用当前校准", variable=self.keep_settings)
+        self.keep_button.pack(anchor="w", pady=8)
+        ttk.Label(controls, text="改机方式仅作记录，不套固定减红。\n同组 RAW 建议统一解码基准。\n校准强度只影响中性点校正，\n不自动识别或中和星云红色。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
         self.save_button = ttk.Button(controls, text="保存设置…", command=self.save_settings)
         self.save_button.pack(fill="x", pady=5)
         self.load_button = ttk.Button(controls, text="载入设置…", command=self.load_settings)
@@ -131,7 +158,9 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.after(60, self.poll)
 
     def settings(self):
-        return validate_settings(dict(warmth=self.warmth.get(), tint=self.tint.get(), neutral=self.neutral))
+        return validate_settings(dict(warmth=self.warmth.get(), tint=self.tint.get(), neutral=self.neutral,
+            neutral_strength=self.strength.get(), raw_baseline="daylight" if self.raw_baseline.get().startswith("固定") else "camera",
+            equipment={key: value.get() for key, value in self.equipment.items()}))
 
     def controls(self):
         editable = self.levels is not None and not self.busy
@@ -140,11 +169,23 @@ class WhiteBalanceWindow(tk.Toplevel):
         for widget in (self.open_button, self.output_entry, self.output_button):
             widget.configure(state="disabled" if self.busy else "normal")
         self.export_button.configure(state="normal" if editable and self.destination.get().strip() else "disabled")
+        self.batch_button.configure(state="normal" if editable and self.destination.get().strip() else "disabled")
+        self.keep_button.configure(state="disabled" if self.busy else "normal")
+        self.baseline_combo.configure(state="disabled" if self.busy else "readonly")
+        for widget in self.equipment_widgets:
+            widget.configure(state="disabled" if self.busy else "readonly" if isinstance(widget, ttk.Combobox) else "normal")
 
     def open_image(self):
         path = filedialog.askopenfilename(parent=self, title="选择白平衡素材", filetypes=[("照片", "*.tif *.tiff *.png *.jpg *.jpeg *.arw *.nef *.nrw *.cr2 *.cr3 *.crw *.dng *.raf *.orf *.rw2")])
         if not path or self.busy:
             return
+        data = self.settings()
+        if not self.keep_settings.get():
+            data.update(warmth=0, tint=0, neutral=[1, 1, 1], neutral_strength=100)
+        self.load_photo(Path(path), data)
+
+    def load_photo(self, path, data, preserve_view=False):
+        data = validate_settings(data)
         self.busy = True
         self.controls()
         self.status.set("读取原始像素并准备预览…")
@@ -152,23 +193,40 @@ class WhiteBalanceWindow(tk.Toplevel):
         identity, events = self.load_id, self.events
         path = Path(path)
         def work(token):
-            pixels = read_source(path)
+            pixels = read_source(path, data["raw_baseline"])
             token.raise_if_cancelled()
-            return path, make_pyramid(pixels, token)
+            return path, make_pyramid(pixels, token), data, preserve_view
         self.scheduler.submit("load", work,
             on_result=lambda result: events.put(("loaded", identity, result)),
             on_error=lambda exc, detail: events.put(("load_error", identity, (str(exc), detail))))
+
+    def baseline_changed(self, event=None):
+        if self.busy:
+            return
+        data = self.settings()
+        # An old gray-card gain is not valid on a different decode baseline.
+        data.update(neutral=[1, 1, 1], neutral_strength=100, warmth=0, tint=0)
+        if self.source and self.source.suffix.lower() in RAW_SUFFIXES:
+            self.load_photo(self.source, data, preserve_view=True)
+        else:
+            self.apply_settings(data)
+            self.loaded_baseline = data["raw_baseline"]
+        self.status.set("RAW 基准已更改；请在相同基准下重新取灰卡或载入匹配预设")
 
     def apply_settings(self, settings):
         data = validate_settings(settings)
         self.neutral = data["neutral"]
         self.warmth.set(data["warmth"])
         self.tint.set(data["tint"])
+        self.strength.set(data["neutral_strength"])
+        self.raw_baseline.set("固定日光（同组）" if data["raw_baseline"] == "daylight" else "相机白平衡")
+        for key, variable in self.equipment.items():
+            variable.set(data["equipment"][key])
         self.gain_info.set("中性点 RGB：" + " / ".join(f"{v:.3f}" for v in self.neutral))
         self.schedule_render()
 
     def reset(self):
-        self.apply_settings({})
+        self.apply_settings(dict(self.settings(), warmth=0, tint=0, neutral=[1, 1, 1], neutral_strength=100))
         self.picker.set(False)
         self.pick_mode()
 
@@ -187,7 +245,12 @@ class WhiteBalanceWindow(tk.Toplevel):
         if path:
             try:
                 data = json.loads(Path(path).read_text(encoding="utf-8"))
-                self.apply_settings(data.get("settings", data) if isinstance(data, dict) else data)
+                data = validate_settings(data.get("settings", data) if isinstance(data, dict) else data)
+                if self.source and self.source.suffix.lower() in RAW_SUFFIXES and data["raw_baseline"] != self.loaded_baseline:
+                    self.load_photo(self.source, data, preserve_view=True)
+                else:
+                    self.apply_settings(data)
+                self.keep_settings.set(True)
             except (OSError, ValueError) as exc:
                 show_copyable_error("载入设置", str(exc), parent=self)
 
@@ -233,7 +296,7 @@ class WhiteBalanceWindow(tk.Toplevel):
             try:
                 if x < 0 or y < 0:
                     raise ValueError("请在照片内取样")
-                self.apply_settings({"neutral": sample_neutral(self.levels[0], int(x), int(y))})
+                self.apply_settings(dict(self.settings(), neutral=sample_neutral(self.levels[0], int(x), int(y)), warmth=0, tint=0, neutral_strength=100))
                 self.original.set(False)
                 self.picker.set(False)
                 self.pick_mode()
@@ -284,7 +347,15 @@ class WhiteBalanceWindow(tk.Toplevel):
         if path:
             self.destination.set(path)
 
-    def export(self):
+    def batch_export(self):
+        if self.busy:
+            return
+        paths = filedialog.askopenfilenames(parent=self, title="选择整组素材 · 使用当前校准，不逐张自动白平衡",
+            filetypes=[("照片", "*.tif *.tiff *.png *.jpg *.jpeg *.arw *.nef *.nrw *.cr2 *.cr3 *.crw *.dng *.raf *.orf *.rw2")])
+        if paths:
+            self.export(paths)
+
+    def export(self, batch_paths=None):
         if self.busy or self.source is None or not self.destination.get().strip():
             return
         source, destination, settings = self.source, self.destination.get().strip(), self.settings()
@@ -298,9 +369,18 @@ class WhiteBalanceWindow(tk.Toplevel):
         def work(token):
             completed = False
             try:
-                folder = export_image(source, destination, settings, token, lambda v, text: events.put(("progress", identity, (v, text))))
+                operation, inputs = (export_batch, tuple(batch_paths)) if batch_paths else (export_image, source)
+                folder = operation(inputs, destination, settings, token, lambda v, text: events.put(("progress", identity, (v, text))))
                 completed = True
-                events.put(("exported", identity, folder))
+                summary = "导出完成"
+                if batch_paths:
+                    report = json.loads((folder / "batch.json").read_text(encoding="utf-8"))
+                    passed = sum(item["status"] == "complete" for item in report["items"])
+                    for item in report["items"]:
+                        if item["status"] != "complete":
+                            append_runtime_log(f"批量改机校准失败：{item['source']}", item.get("error", "未知错误"))
+                    summary = f"批量结束 · 成功 {passed} / {len(report['sources'])} · 详情见 batch.json"
+                events.put(("exported", identity, (folder, summary)))
             finally:
                 if token.cancelled and not completed:
                     events.put(("cancelled", identity, None))
@@ -322,11 +402,18 @@ class WhiteBalanceWindow(tk.Toplevel):
             if identity != current:
                 continue
             if kind == "loaded":
-                self.source, self.levels = data
+                self.source, self.levels, parameters, preserve_view = data
+                self.loaded_baseline = parameters["raw_baseline"]
                 self.busy = False
                 self.original.set(False)
-                self.reset()
-                self.fit()
+                self.apply_settings(parameters)
+                self.picker.set(False)
+                self.pick_mode()
+                if preserve_view:
+                    self.clamp()
+                    self.schedule_render()
+                else:
+                    self.fit()
                 self.controls()
                 self.canvas.itemconfigure(self.empty_item, state="hidden")
                 h, w = self.levels[0].shape[:2]
@@ -346,12 +433,14 @@ class WhiteBalanceWindow(tk.Toplevel):
                 self.cancel_button.configure(state="disabled")
                 self.controls()
                 if kind == "exported":
-                    self.result = data
+                    self.result, summary = data
                     self.folder_button.configure(state="normal")
-                    self.status.set(f"导出完成 · {data}")
+                    self.status.set(f"{summary} · {self.result}")
                 else:
                     self.status.set("已取消，原片未修改")
             elif kind.endswith("error"):
+                if kind == "load_error" and self.source:
+                    self.raw_baseline.set("固定日光（同组）" if self.loaded_baseline == "daylight" else "相机白平衡")
                 if kind != "preview_error":
                     self.busy = False
                     self.controls()

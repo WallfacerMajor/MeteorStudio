@@ -29,20 +29,30 @@ def validate_settings(settings):
     try:
         warmth, tint = float(settings.get("warmth", 0)), float(settings.get("tint", 0))
         neutral = np.asarray(settings.get("neutral", [1, 1, 1]), dtype=float)
+        strength = float(settings.get("neutral_strength", 100))
     except (TypeError, ValueError) as exc:
         raise ValueError("白平衡参数无效") from exc
     if not np.isfinite([warmth, tint]).all() or max(abs(warmth), abs(tint)) > 100:
         raise ValueError("冷暖和色调须在 -100 到 100 之间")
     if neutral.shape != (3,) or not np.isfinite(neutral).all() or np.any(neutral < .125) or np.any(neutral > 8):
         raise ValueError("中性点增益无效，请重新取样")
-    return dict(version=1, warmth=warmth, tint=tint, neutral=neutral.tolist())
+    if not np.isfinite(strength) or not 0 <= strength <= 100:
+        raise ValueError("校准强度须在 0 到 100 之间")
+    baseline = settings.get("raw_baseline", "camera")
+    if baseline not in ("camera", "daylight"):
+        raise ValueError("未知 RAW 解码基准")
+    equipment = settings.get("equipment", {})
+    if not isinstance(equipment, dict) or any(not isinstance(v, str) or len(v) > 300 for v in equipment.values()):
+        raise ValueError("设备预设内容无效")
+    return dict(version=1, warmth=warmth, tint=tint, neutral=neutral.tolist(), neutral_strength=strength,
+                raw_baseline=baseline, equipment={k: equipment.get(k, "") for k in ("camera", "modification", "filter", "reference")})
 
 
 def gains_for(settings):
     settings = validate_settings(settings)
     w, t = settings["warmth"] / 100, settings["tint"] / 100
     # Relative controls, intentionally not labelled as absolute kelvin.
-    gain = np.asarray(settings["neutral"]) * np.exp2([w + t * .25, -t * .5, -w + t * .25])
+    gain = np.asarray(settings["neutral"]) ** (settings["neutral_strength"] / 100) * np.exp2([w + t * .25, -t * .5, -w + t * .25])
     return gain / np.dot(gain, LUMA)
 
 
@@ -73,13 +83,15 @@ def sample_neutral(image, x, y, radius=7):
     return gains.tolist()
 
 
-def read_source(path):
+def read_source(path, raw_baseline="camera"):
+    if raw_baseline not in ("camera", "daylight"):
+        raise ValueError("未知 RAW 解码基准")
     path = Path(path)
     if path.suffix.lower() in RAW_SUFFIXES:
         import rawpy
         with rawpy.imread(str(path)) as raw:
             # Camera WB is the baseline; controls remain a relative RGB edit.
-            linear = raw.postprocess(use_camera_wb=True, use_auto_wb=False, output_color=rawpy.ColorSpace.sRGB,
+            linear = raw.postprocess(use_camera_wb=raw_baseline == "camera", use_auto_wb=False, output_color=rawpy.ColorSpace.sRGB,
                                      gamma=(1, 1), output_bps=16, no_auto_bright=True)
         lut = np.rint(encode_srgb(np.arange(65536) / 65535) * 65535).astype(np.uint16)
         for y in range(0, linear.shape[0], 128):
@@ -151,7 +163,7 @@ def export_image(source, destination, settings, token, progress=lambda *_: None)
         raise ValueError("请选择原片文件夹之外的输出目录")
     token.raise_if_cancelled()
     progress(0, "重新读取原片…")
-    pixels = read_source(source)
+    pixels = read_source(source, settings["raw_baseline"])
     token.raise_if_cancelled()
     destination.mkdir(parents=True, exist_ok=True)
     folder = destination / datetime.now().strftime("白平衡_%Y%m%d_%H%M%S_%f")
@@ -186,4 +198,54 @@ def export_image(source, destination, settings, token, progress=lambda *_: None)
     finally:
         if output is not None:
             output._mmap.close()
+        record()
+
+
+def export_batch(sources, destination, settings, token, progress=lambda *_: None):
+    """Apply one frozen calibration to every source; report partial failures."""
+    settings = validate_settings(settings)
+    sources = list(dict.fromkeys(Path(p).resolve() for p in sources))
+    if not sources or not str(destination).strip():
+        raise ValueError("请选择批量素材和输出目录")
+    destination = Path(destination).expanduser().resolve()
+    for source in sources:
+        if destination == source.parent or source.parent in destination.parents:
+            raise ValueError("批量输出目录必须位于所有素材目录之外")
+        if not source.is_file():
+            raise ValueError(f"素材不存在：{source}")
+    token.raise_if_cancelled()
+    destination.mkdir(parents=True, exist_ok=True)
+    folder = destination / datetime.now().strftime("改机批量_%Y%m%d_%H%M%S_%f")
+    folder.mkdir()
+    report = dict(settings=settings, sources=[str(p) for p in sources], status="running", items=[])
+    def record():
+        temporary = folder / "batch.json.tmp"
+        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(folder / "batch.json")
+    record()
+    try:
+        for index, source in enumerate(sources):
+            token.raise_if_cancelled()
+            try:
+                output = export_image(source, folder, settings, token,
+                    lambda percent, message: progress((index + percent/100) * 100/len(sources), f"{index+1}/{len(sources)} · {source.name} · {message}"))
+                named_output = folder / f"{index+1:04d}_{source.stem[:80]}"
+                # Only rename our newly-created output directory, never input.
+                if output.resolve().parent != folder.resolve() or named_output.resolve().parent != folder.resolve():
+                    raise ValueError("输出目录越界")
+                output.rename(named_output)
+                output = named_output
+                report["items"].append(dict(source=str(source), output=str(output), status="complete"))
+            except Exception as exc:
+                report["items"].append(dict(source=str(source), status="cancelled" if token.cancelled else "failed", error=str(exc)))
+                if token.cancelled:
+                    raise
+            record()
+            progress((index + 1) * 100 / len(sources), f"已处理 {index+1}/{len(sources)} 张；失败项已记录")
+        report["status"] = "complete_with_errors" if any(item["status"] != "complete" for item in report["items"]) else "complete"
+        return folder
+    except Exception:
+        report["status"] = "cancelled" if token.cancelled else "failed"
+        raise
+    finally:
         record()
