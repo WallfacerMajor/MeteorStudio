@@ -2202,6 +2202,8 @@ class MeteorComposer(tk.Tk):
         self.last_export_path: Path | None = None
 
         self._build_ui()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self._bind_shortcuts()
         self._setup_autosave()
         self.after(150, self._poll_queue)
@@ -2234,9 +2236,6 @@ class MeteorComposer(tk.Tk):
         settings_menu_button(header).pack(side="left", padx=6)
         self.workspace_title_label = ttk.Label(header, text="流星合成工作区")
         self.workspace_title_label.pack(side="left", padx=12)
-        ttk.Button(header, text="视频动态", command=self.open_video_workspace).pack(side="right")
-        ttk.Button(header, text="星空对齐", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
-        ttk.Button(header, text="流星批量筛选…", command=self.open_screening_workspace).pack(side="right", padx=(0, 6))
         self.paths_toggle_button = ttk.Button(header, text="收起 1 流星合成功能", command=self._toggle_paths_panel)
         self.paths_toggle_button.pack(side="right", padx=(0, 6))
 
@@ -2423,7 +2422,6 @@ class MeteorComposer(tk.Tk):
         ttk.Label(mask_tools, textvariable=self.candidate_threshold, width=4).grid(row=1, column=5, pady=(7, 0))
         ttk.Label(mask_tools, textvariable=self.candidate_summary).grid(row=1, column=6, columnspan=3, sticky="w", padx=(12, 0), pady=(7, 0))
 
-        ttk.Button(mask_tools, text="撤销 Ctrl+Z", command=self.undo_stroke).grid(row=2, column=0, pady=(7, 0), sticky="ew")
         ttk.Button(mask_tools, text="清除此图蒙版", command=self.clear_strokes).grid(row=2, column=1, pady=(7, 0), padx=3, sticky="ew")
         self.auto_detect_button = ttk.Button(
             mask_tools, text="自动检测全部", command=self.auto_detect_all
@@ -2568,7 +2566,7 @@ class MeteorComposer(tk.Tk):
         export_actions = ttk.Frame(inspector)
         export_actions.pack(fill="x", before=self.control_notebook, pady=5)
         self.export_button = ttk.Button(export_actions, text="导出合成结果", command=self.export)
-        self.export_button.pack(fill="x")
+        self.export_button.pack(side="left")
         ttk.Button(export_actions, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
         ttk.Button(export_actions, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
 
@@ -2751,6 +2749,8 @@ class MeteorComposer(tk.Tk):
             except tk.TclError:
                 pass
 
+        from action_icons import iconize_actions
+        iconize_actions(navigation)
         window.bind("<Destroy>", restore_main, add=True)
         try:
             if self.state() == "zoomed":
@@ -3020,7 +3020,7 @@ Delete/Backspace：删除所选流星；方向键微移，Shift+方向键移动 
 
 单张候选
 点击“检测当前照片”，再拖动候选评分阈值；阈值越低，加入的候选越多
-鼠标靠近候选轨迹：弹出“＋选中”按钮，点击后直接加入并锁定
+鼠标靠近候选轨迹：点击“＋”加入并锁定
 红色蒙版及候选分数默认显示；按住 H 可临时隐藏
 
 查看与文件
@@ -5435,12 +5435,12 @@ F1：显示本快捷键表""")
         candidate = self.candidates[str(self.current_path)][index]
         canvas_w = max(1, self.canvas.winfo_width())
         canvas_h = max(1, self.canvas.winfo_height())
-        label = f"＋ 选中 {candidate.auto_score or 0}分"
-        icon_x = min(canvas_w - 56, max(56, canvas_x + 58))
+        label = "＋"
+        icon_x = min(canvas_w - 20, max(20, canvas_x + 28))
         icon_y = min(canvas_h - 17, max(17, canvas_y - 20))
         tag = "candidate_pick"
         rectangle = self.canvas.create_rectangle(
-            icon_x - 52, icon_y - 14, icon_x + 52, icon_y + 14,
+            icon_x - 15, icon_y - 14, icon_x + 15, icon_y + 14,
             fill="#176b3a", outline="#8dffb8", width=2, tags=(tag,)
         )
         text_item = self.canvas.create_text(
@@ -5487,6 +5487,7 @@ F1：显示本快捷键表""")
                 (key, insert_at), candidate, include_selected=True
             )
         score = candidate.auto_score or 0
+        button_box = self.canvas.bbox("candidate_pick")
         self._clear_candidate_hover()
         self.show_mask.set(True)
         self._update_candidate_summary(key)
@@ -5495,11 +5496,14 @@ F1：显示本快捷键表""")
             self._commit_incremental_global_preview(
                 incremental, validate=False, dirty_box=self.last_incremental_box
             )
-            self.status.set(f"已选中并锁定 {score} 分候选；对应局部已即时融合")
+            self.status.set(f"已加入并锁定 · {score} 分")
         else:
             self._render_preview()
-            self.status.set(f"已选中并锁定 {score} 分候选；调阈值或清除蒙版时都会保留")
+            self.status.set(f"已加入并锁定 · {score} 分")
         self._schedule_autosave()
+        if button_box:
+            from action_icons import show_canvas_hint
+            show_canvas_hint(self.canvas, "加入并锁定候选", (button_box[0], button_box[1]))
         return "break"
 
     def _update_brush_cursor(self) -> None:
@@ -7481,6 +7485,8 @@ F1：显示本快捷键表""")
         ttk.Button(buttons, text="恢复真实位置", command=lambda: apply_values(True)).pack(side="left")
         ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="left", padx=6)
         ttk.Button(buttons, text="应用", command=apply_values).pack(side="left")
+        from action_icons import iconize_actions
+        iconize_actions(dialog)
 
     def _stroke_start(self, event) -> None:
         if not self.current_path:

@@ -67,6 +67,8 @@ class AlignmentWorkspace(tk.Toplevel):
         self.running = False
         self.last_result: AlignmentResult | None = None
         self._build_ui()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self._poll_id = self.after(120, self._poll_queue)
 

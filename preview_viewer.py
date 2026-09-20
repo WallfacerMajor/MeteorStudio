@@ -61,6 +61,8 @@ class ExactPreviewViewer(tk.Toplevel):
         self.bind("<KeyPress-1>", lambda _event: self.actual_size())
         self.bind("<KeyPress-plus>", lambda _event: self._zoom_by(1.25))
         self.bind("<KeyPress-minus>", lambda _event: self._zoom_by(1 / 1.25))
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self.after_idle(self.actual_size)
 
     def _image(self) -> np.ndarray:

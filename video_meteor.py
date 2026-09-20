@@ -874,6 +874,8 @@ class VideoMeteorWindow(tk.Toplevel):
         self.autosave_after_id: str | None = None
 
         self._build_ui()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.after(150, self._poll_queue)
@@ -1748,6 +1750,8 @@ class VideoMeteorWindow(tk.Toplevel):
         buttons.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
         ttk.Button(buttons, text="取消", command=dialog.destroy).pack(side="right")
         ttk.Button(buttons, text="保存", command=save).pack(side="right", padx=6)
+        from action_icons import iconize_actions
+        iconize_actions(dialog)
 
     def _global_parameter_changed(self) -> None:
         self._render_current()

@@ -80,10 +80,6 @@ def show_runtime_log(parent: tk.Misc, title: str = "运行日志／错误详情"
     window.minsize(520, 300)
     frame = ttk.Frame(window, padding=10)
     frame.pack(fill="both", expand=True)
-    ttk.Label(
-        frame,
-        text="打包版没有单独的命令行终端；后台错误和诊断信息会保留在这里。",
-    ).pack(anchor="w", pady=(0, 8))
     body = ttk.Frame(frame)
     body.pack(fill="both", expand=True)
     text = tk.Text(body, wrap="none", font=("TkFixedFont", 10), padx=8, pady=8)
@@ -136,6 +132,8 @@ def show_runtime_log(parent: tk.Misc, title: str = "运行日志／错误详情"
     window.bind("<Control-a>", lambda _event: (text.tag_add("sel", "1.0", "end-1c"), "break")[-1])
     window.bind("<Control-c>", lambda _event: (copy_all(), "break")[-1])
     window.bind("<Escape>", lambda _event: window.destroy())
+    from action_icons import iconize_actions
+    iconize_actions(window)
     refresh()
     window.lift()
 
@@ -225,6 +223,8 @@ def show_copyable_error(
     dialog.bind("<Escape>", lambda _event: dialog.destroy())
     dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
 
+    from action_icons import iconize_actions
+    iconize_actions(dialog)
     dialog.update_idletasks()
     try:
         if owner is not None:

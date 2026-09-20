@@ -83,6 +83,8 @@ class LaboratoryWindow(tk.Toplevel):
         scroll_controls(inspector, 235)
         self.destination.trace_add("write", lambda *_: self.refresh_controls())
         self.refresh_controls()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self.after(80, self.poll)
 
     def add_files(self):

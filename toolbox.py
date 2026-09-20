@@ -87,6 +87,8 @@ def tool_menu_button(parent, app):
         for spec, path in iter_tools(group.children, (group.key,)):
             menu.add_command(label=spec.title, command=lambda item=spec, category=path: app.navigate_tool(item, category))
     button.configure(menu=menu)
+    from action_icons import iconize_actions
+    iconize_actions(button)
     return button
 
 
@@ -104,6 +106,8 @@ def settings_menu_button(parent):
     from error_dialog import show_runtime_log
     menu.add_command(label="运行日志…", command=lambda: show_runtime_log(owner))
     button.configure(menu=menu)
+    from action_icons import iconize_actions
+    iconize_actions(button)
     return button
 
 
@@ -162,6 +166,8 @@ def show_software_settings(parent, keys=None, required=False):
     dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
     dialog.bind("<Escape>", lambda e: dialog.destroy())
     parent._software_settings_dialog = dialog
+    from action_icons import iconize_actions
+    iconize_actions(dialog)
     dialog.wait_visibility()
     dialog.grab_set()
     parent.wait_window(dialog)
@@ -258,10 +264,12 @@ def build_home(app, menu_path=()) -> ttk.Frame:
     for index, group in enumerate(TOOL_MENU):
         card = ttk.LabelFrame(cards, text=group.title, padding=14)
         card.grid(row=index // 2, column=index % 2, sticky="nsew", padx=5, pady=7)
-        for spec, path in iter_tools(group.children, (group.key,)):
+        for tool_index, (spec, path) in enumerate(iter_tools(group.children, (group.key,))):
             button = ttk.Button(card, text=spec.title, command=lambda item=spec, category=path: app.navigate_tool(item, category))
-            button.pack(fill="x", pady=4)
+            button.grid(row=0, column=tool_index, padx=6, pady=6)
             home.tool_buttons[spec.key] = button
     for col in range(2):
         cards.columnconfigure(col, weight=1, uniform="tool")
+    from action_icons import iconize_actions
+    iconize_actions(home)
     return home

@@ -135,6 +135,8 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.destination.trace_add('write', lambda *_: self.controls())
         self.protocol('WM_DELETE_WINDOW', self._request_close)
         self.controls()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self.after(60, self.poll)
 
     def show_help(self):

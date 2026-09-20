@@ -939,6 +939,8 @@ class MeteorScreeningWindow(tk.Toplevel):
             max_workers=3, thread_name_prefix="meteor-screening"
         )
         self._build_ui()
+        from action_icons import iconize_actions
+        iconize_actions(self)
         for variable in (
             self.filter_name, self.filter_status, self.filter_label,
             self.filter_score_min, self.filter_score_max,
@@ -1182,9 +1184,6 @@ class MeteorScreeningWindow(tk.Toplevel):
             command=self._remove_all_candidates,
         )
         self.remove_all_candidates_button.pack(side="left")
-        ttk.Label(
-            candidate_selection, text="Delete 清除选中",
-        ).pack(side="left", padx=(10, 0))
         ttk.Label(inspector, textvariable=self.candidate_status).pack(fill="x", pady=(3, 0))
 
         image_actions = ttk.Frame(inspector)

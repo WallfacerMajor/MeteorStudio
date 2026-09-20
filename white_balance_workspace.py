@@ -4,7 +4,7 @@ import queue
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk
 from background_tasks import BackgroundTaskScheduler
 from error_dialog import show_copyable_error, show_runtime_log, append_runtime_log
 from platform_utils import open_folder
@@ -121,12 +121,6 @@ class WhiteBalanceWindow(tk.Toplevel):
         reference_tools.pack(fill="x")
         self.pick_button = ttk.Checkbutton(reference_tools, text="取样", style="Toolbutton",
                                            variable=self.picker, command=self.pick_mode)
-        icon = Image.new('RGBA', (60, 60))
-        pen = ImageDraw.Draw(icon)
-        pen.line([(12, 48), (13, 35), (37, 11), (49, 23), (25, 47), (12, 48)], fill='#eeeeee', width=5)
-        pen.line([(28, 13), (47, 32)], fill='#eeeeee', width=5)
-        self.picker_icon = ImageTk.PhotoImage(icon.resize((20, 20), Image.Resampling.LANCZOS), master=self)
-        self.pick_button.configure(image=self.picker_icon, compound="left")
         self.pick_button.pack(side="left", fill="x", expand=True)
         self.suggest_button = ttk.Button(reference_tools, text="✦ 推荐", command=self.suggest_points)
         self.suggest_button.pack(side="left", fill="x", expand=True, padx=(6, 0))
@@ -173,11 +167,9 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.export_button.configure(text="导出 TIFF")
         for child, row, column, span in (
             (self.export_button, 0, 0, 1), (self.cancel_button, 0, 1, 1),
-            (self.batch_button, 1, 0, 2), (self.folder_button, 2, 0, 1),
+            (self.batch_button, 0, 2, 1), (self.folder_button, 0, 3, 1),
         ):
             child.grid(row=row, column=column, columnspan=span, sticky="ew", pady=2)
-        footer.columnconfigure(0, weight=1)
-        footer.columnconfigure(1, weight=1)
         ttk.Separator(sidebar).pack(side="bottom", fill="x", before=self.inspector_tabs)
         output.pack_configure(pady=8)
         self.output_entry.pack_configure(padx=5)
@@ -215,6 +207,8 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.protocol("WM_DELETE_WINDOW", self._request_close)
         self.controls()
         self.bind('<Escape>', self.cancel_reference)
+        from action_icons import iconize_actions
+        iconize_actions(self)
         self.after(60, self.poll)
 
     def _build_empty_action(self):

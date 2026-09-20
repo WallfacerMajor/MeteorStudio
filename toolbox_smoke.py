@@ -101,6 +101,8 @@ def exercise_empty_open(root, window, dialog_target, path):
 def capture(window, name):
     # Check the visible UI's persistent copy even when screenshots are disabled.
     for widget in widgets(window):
+        if isinstance(widget, (ttk.Button, ttk.Menubutton)):
+            assert widget.cget('image') and str(widget.cget('compound')) == 'none', (name, widget, 'Action must be icon-only')
         if isinstance(widget, (ttk.Label, ttk.LabelFrame, ttk.Button)):
             text = str(widget.cget('text'))
             assert not any(phrase in text for phrase in ('源素材只读', '原图只读', '本地处理', '独立输出', '共用同一本地模型', '16 位合成链路', '滚轮缩放', '打开照片开始', '选择任意版本即可', 'Alt临时切换', '所有输出写入新文件', '绿色虚线=候选')), text
@@ -109,11 +111,58 @@ def capture(window, name):
     if target:
         folder = Path(target)
         folder.mkdir(parents=True, exist_ok=True)
+        window.attributes('-topmost', True)
+        window.lift()
+        hint = getattr(window._root(), '_active_action_hint', None)
+        if hint and hint.popup:
+            hint.popup.lift()
         window.update()
         x, y = window.winfo_rootx(), window.winfo_rooty()
         desktop = ImageGrab.grab()
         scale = desktop.width / window.winfo_screenwidth()
         desktop.crop(tuple(round(value * scale) for value in (x, y, x + window.winfo_width(), y + window.winfo_height()))).save(folder / name)
+
+
+def exercise_action_hints(app):
+    import tkinter as tk
+    from action_icons import iconize_actions
+    window = tk.Toplevel(app)
+    window.geometry('380x200+80+80')
+    calls = []
+    caption = tk.StringVar(window, '保存项目')
+    button = ttk.Button(window, textvariable=caption, command=lambda: calls.append('run'))
+    button.pack(padx=30, pady=45)
+    iconize_actions(window)
+    try:
+        pump(app, .2)
+        button.event_generate('<Enter>')
+        pump(app, .6)
+        hint = button._action_hint
+        assert hint.popup and hint.popup.winfo_ismapped()
+        assert hint.popup.winfo_children()[0].cget('text') == '保存项目'
+        assert not calls and window.grab_current() is None
+        button.event_generate('<Leave>')
+        assert hint.popup is None
+        click(app, button)
+        assert calls == ['run'] and hint.popup and window.grab_current() is None, (calls, hint.popup, window.grab_current())
+        capture(window, 'action-hint.png')
+        pump(app, 1.9)
+        assert hint.popup is None
+        caption.set('载入项目')
+        assert button._action_key == 'load'
+        button.configure(state='disabled')
+        click(app, button)
+        assert calls == ['run'] and hint.popup
+        assert hint.popup.winfo_children()[0].cget('text') == '载入项目（当前不可用）'
+        owned_timer = hint.timer
+        window.destroy()
+        pump(app, 2)
+        assert owned_timer not in app.tk.splitlist(app.tk.call('after', 'info'))
+        assert getattr(app, '_active_action_hint', None) is not hint
+    finally:
+        if window.winfo_exists():
+            window.destroy()
+    return {'icon_only_actions': 'passed', 'click_hover_hints': 'passed', 'disabled_dynamic_hint_cleanup': 'passed'}
 
 
 def run_smoke(app):
@@ -137,6 +186,7 @@ def run_smoke(app):
     app.geometry("1280x820+20+20")
     app.lift()
     app.focus_force()
+    icon_checks = exercise_action_hints(app)
     assert app.edit_inspector.winfo_exists()
     app.show_toolbox()
     pump(app, 0.4)
@@ -299,7 +349,7 @@ def run_smoke(app):
             assert child.canvas.winfo_width() >= 150 and child.canvas.winfo_height() >= 200
             target = child.export_button if key == 'screening' else next(w for w in widgets(child) if isinstance(w, ttk.Button) and w.cget('text') == '导出动态流星视频')
             reveal_control(app, target)
-            assert child.winfo_containing(target.winfo_rootx()+target.winfo_width()//2, target.winfo_rooty()+target.winfo_height()//2) == target
+            assert child.winfo_containing(target.winfo_rootx()+target.winfo_width()//2, target.winfo_rooty()+target.winfo_height()//2) == target, (attr, target, target.winfo_rooty(), child.winfo_height())
             capture(child, f"{attr}-small.png")
             commands = set(child._tclCommands or ())
             owned_timers = set()
@@ -316,7 +366,7 @@ def run_smoke(app):
             assert not (owned_timers & remaining), (attr, owned_timers & remaining)
             pump(app, 1.4)
             assert getattr(app, attr) is None and app.composite_panel.winfo_ismapped()
-    return {**settings_checks, **white_balance_checks, **light_pollution_checks, **laboratory_checks, "direct_tool_entries": "passed", "return_to_toolbox": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
+    return {**icon_checks, **settings_checks, **white_balance_checks, **light_pollution_checks, **laboratory_checks, "direct_tool_entries": "passed", "return_to_toolbox": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
 
 
 if __name__ == "__main__":

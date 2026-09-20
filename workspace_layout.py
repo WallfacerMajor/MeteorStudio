@@ -47,6 +47,7 @@ def parameter_slider(parent, title, variable, lower, upper, command=None, colors
 
 def stack_controls(frame, width=320):
     """Reflow existing controls without replacing widgets or their event bindings."""
+    from action_icons import is_icon_action
     children = list(frame.winfo_children())
     for child in children:
         if child.winfo_manager() == 'grid':
@@ -58,6 +59,16 @@ def stack_controls(frame, width=320):
     index = 0
     while index < len(children):
         child = children[index]
+        if is_icon_action(child):
+            row = ttk.Frame(frame)
+            row.pack(fill='x', pady=3)
+            for _ in range(max(1, width // 48)):
+                if index >= len(children) or not is_icon_action(children[index]):
+                    break
+                children[index].pack(in_=row, side='left', padx=(0, 5))
+                children[index].lift()
+                index += 1
+            continue
         if isinstance(child, ttk.Label) and index+1 < len(children) and isinstance(children[index+1], ttk.Scale):
             row = ttk.Frame(frame)
             row.pack(fill='x', pady=5)
@@ -97,7 +108,8 @@ def scroll_controls(frame, width=340, reflow=True):
     canvas.bind('<Configure>', lambda e: canvas.itemconfigure(item, width=e.width))
     content.bind('<Configure>', lambda e: canvas.configure(scrollregion=(0, 0, e.width, max(e.height, canvas.winfo_height()))))
     frame._inspector_canvas = canvas
-    frame._inspector_scrolled_widgets = tuple(children)
+    # Action rows retain their original Tk parent through pack(in_=...).
+    frame._inspector_scrolled_widgets = tuple(child for child in frame.winfo_children() if child not in (canvas, bar))
     for child in children:
         child.pack(in_=content, fill='x', pady=3)
         child.lift()

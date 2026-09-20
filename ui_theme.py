@@ -45,6 +45,11 @@ def apply_theme(root):
     style.configure("Primary.TButton", background="#496c96", foreground="#ffffff", borderwidth=0, padding=(10, 5))
     style.map("Primary.TButton", background=[("disabled", panel), ("pressed", "#3e5c80"), ("active", "#587ead")], foreground=[("disabled", "#858585"), ("!disabled", "#ffffff")])
     style.configure("Quiet.TButton", background=bg, borderwidth=0, padding=(8, 4))
+    style.configure("Icon.TButton", padding=(7, 5))
+    style.configure("Primary.Icon.TButton", background="#496c96", padding=(7, 5))
+    style.map("Primary.Icon.TButton", background=[("disabled", bg), ("pressed", "#3e5c80"), ("active", "#587ead")])
+    style.configure("Icon.TMenubutton", padding=(7, 5))
+    style.configure("Icon.Toolbutton", padding=(7, 5))
     style.configure("Toolbutton", background=panel, foreground=text, padding=(8, 4), borderwidth=0)
     style.map("Toolbutton", background=[("disabled", bg), ("selected", "#315574"), ("active", "#414141")],
               foreground=[("disabled", "#858585"), ("!disabled", text)])
