@@ -54,6 +54,20 @@ def run_native_menu_smoke(root):
     output = Path(os.environ.get('NATIVE_MENU_SCREENSHOTS', 'review-artifacts/native-menus'))
     output.mkdir(parents=True, exist_ok=True)
     reports = {}
+    for label, button in (('tools', tools), ('settings', settings)):
+        button.event_generate('<Motion>', warp=True, x=button.winfo_width()//2, y=button.winfo_height()//2)
+        deadline = time.monotonic()+1.4
+        while time.monotonic() < deadline:
+            root.update()
+            time.sleep(.01)
+        assert button.instate(['active']), 'Pointer did not activate menu button'
+        rect = wintypes.RECT(button.winfo_rootx(), button.winfo_rooty(),
+                             button.winfo_rootx()+button.winfo_width(), button.winfo_rooty()+button.winfo_height())
+        picture = capture(rect).convert('RGB')
+        picture.save(output/f'{label}-hover.png')
+        assert sum(max(rgb)<140 for rgb in picture.getdata()) > picture.width*picture.height*.6, 'Hover background became light'
+        assert sum(min(rgb)>160 for rgb in picture.getdata()) > 15, 'Hover text disappeared'
+        reports[label+'_hover'] = 'passed'
     for label, button, down in (('tools', tools, 1), ('settings', settings, 2), ('context', probe, 0)):
         failures = []
         def observer():

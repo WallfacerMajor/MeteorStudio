@@ -70,7 +70,7 @@ def menu_level(path=(), nodes=TOOL_MENU):
 
 
 def tool_menu_button(parent, app):
-    button = ttk.Menubutton(parent, text="工具")
+    button = ttk.Menubutton(parent, text="切换工具")
     menu = tk.Menu(button, tearoff=False)
     def populate(parent_menu, nodes, path=()):
         for node in nodes:
@@ -245,7 +245,6 @@ def build_home(app, menu_path=()) -> ttk.Frame:
     home = ttk.Frame(app, padding=28)
     navigation = ttk.Frame(home)
     navigation.pack(fill="x", pady=(0, 12))
-    tool_menu_button(navigation, app).pack(side="right")
     settings_menu_button(navigation).pack(side="right", padx=8)
     if menu_path:
         ttk.Button(navigation, text="← 返回上级", command=lambda: app.show_toolbox(menu_path[:-1])).pack(side="left", padx=(0, 12))

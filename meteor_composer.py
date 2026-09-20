@@ -1986,8 +1986,10 @@ class MeteorComposer(tk.Tk):
         super().__init__()
         apply_theme(self)
         self.title(f"{APP_NAME} — {APP_VERSION}")
-        self.geometry("1280x820")
-        self.minsize(1000, 680)
+        width = min(1280, int(self.winfo_screenwidth() * .9))
+        height = min(820, int(self.winfo_screenheight() * .85))
+        self.geometry(f"{width}x{height}+{(self.winfo_screenwidth()-width)//2}+{max(20, (self.winfo_screenheight()-height)//2-20)}")
+        self.minsize(min(1000, width), min(680, height))
 
         self.source_dir = tk.StringVar()
         self.base_dir = tk.StringVar()
@@ -2208,20 +2210,6 @@ class MeteorComposer(tk.Tk):
         # reload the current image twice, which looked exactly like click-to-zoom.
         if not os.environ.get("METEOR_REAL_POINTER_SMOKE_REPORT"):
             self._restore_autosave()
-
-    def maximize_for_normal_launch(self) -> None:
-        """Use the native maximized state, with a cross-platform fallback."""
-        try:
-            self.state("zoomed")
-            return
-        except tk.TclError:
-            pass
-        try:
-            self.attributes("-zoomed", True)
-            return
-        except tk.TclError:
-            pass
-        self.geometry(f"{self.winfo_screenwidth()}x{self.winfo_screenheight()}+0+0")
 
     def destroy(self) -> None:
         from ui_navigation import cancel_widget_timers
@@ -9230,5 +9218,4 @@ if __name__ == "__main__":
     else:
         application = MeteorComposer()
         application.show_toolbox()
-        application.after_idle(application.maximize_for_normal_launch)
         application.mainloop()

@@ -94,6 +94,12 @@ def capture(window, name):
 
 
 def run_smoke(app):
+    app.show_toolbox()
+    pump(app, 1.4)
+    assert app.state() == 'normal', 'Startup must not maximize the window'
+    assert app.winfo_width() < app.winfo_screenwidth()
+    assert app.winfo_height() < app.winfo_screenheight()
+    assert not any(isinstance(w, ttk.Menubutton) and w.cget('text') in ('工具', '切换工具') for w in widgets(app.toolbox_home))
     if os.environ.get('NATIVE_MENU_SMOKE_ONLY'):
         import tkinter as tk
         from native_menu_smoke import run_native_menu_smoke

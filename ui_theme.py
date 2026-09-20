@@ -50,6 +50,9 @@ def apply_theme(root):
     style.configure("Editor.Horizontal.TScale", borderwidth=0, troughcolor="#555555", background=bg, sliderlength=14, sliderthickness=12)
     style.configure("Thin.Horizontal.TProgressbar", thickness=3, borderwidth=0)
     style.configure("TMenubutton", background=bg, borderwidth=0, padding=(7, 3), arrowcolor=muted)
+    style.map("TMenubutton", background=[("disabled", bg), ("pressed", "#3e4b59"), ("active", "#414141")],
+              foreground=[("disabled", "#858585"), ("!disabled", text)],
+              arrowcolor=[("disabled", "#858585"), ("!disabled", muted)])
     style.configure("Horizontal.TSeparator", background="#444444", borderwidth=0)
     style.configure("Vertical.TSeparator", background="#181818", borderwidth=0)
     style.configure("TEntry", fieldbackground=field, insertcolor=text, padding=4)

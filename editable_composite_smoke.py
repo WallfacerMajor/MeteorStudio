@@ -12,6 +12,17 @@ import cv2
 import numpy as np
 
 
+
+def _maximize_test_window(app):
+    """Keep the large-canvas stress case independent of default launch policy."""
+    try:
+        app.state("zoomed")
+    except Exception:
+        try:
+            app.attributes("-zoomed", True)
+        except Exception:
+            app.geometry(f"{app.winfo_screenwidth()}x{app.winfo_screenheight()}+0+0")
+
 def run_smoke(app) -> dict:
     from meteor_composer import (
         ExactPreviewViewer, Stroke, adjust_composite_base_exposure,
@@ -112,12 +123,10 @@ def run_smoke(app) -> dict:
     app.view_mode.set("source")
     app._render_preview()
     app.update()
-    # Match the ordinary application entry point instead of testing only an
-    # off-screen fixed geometry. Windows performs another layout settlement
-    # when the real workspace enters its native maximized state.
+    # Exercise editing after the user maximizes the normal startup window.
     app.geometry("1280x820+0+0")
     app.update_idletasks()
-    app.maximize_for_normal_launch()
+    _maximize_test_window(app)
     app.update_idletasks()
     app.update()
     app._canvas_fit()
@@ -1598,7 +1607,7 @@ def run_real_pointer_smoke(app) -> dict:
     app.deiconify()
     app.update_idletasks()
     app.update()
-    app.maximize_for_normal_launch()
+    _maximize_test_window(app)
     app.update_idletasks()
     app.update()
 
