@@ -38,7 +38,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.protect_mode = tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
         self.status = tk.StringVar(value='打开照片 → 框选需保护的地景／星云 → 估计背景 → 调整强度')
-        self.info = tk.StringVar(value='原片只读 · 默认校正底部渐变')
+        self.info = tk.StringVar(value='')
         root = ttk.Frame(self, padding=14)
         root.pack(fill='both', expand=True)
         header = ttk.Frame(root)
@@ -90,7 +90,6 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.reset_button.pack(side='right')
         self.analyze_button = ttk.Button(protection, text='估计光污染背景', style='Primary.TButton', command=self.analyze)
         self.analyze_button.pack(fill='x', pady=(10, 4))
-        ttk.Button(protection, text='适用范围与操作说明', style='Quiet.TButton', command=self.show_help).pack(anchor='w')
         self.editor_widgets += [self.protect_button, self.clear_button, self.analyze_button, self.reset_button]
         canvas = scroll_controls(inspector, 275, reflow=False)
         # Export remains visible while the adjustment groups scroll independently.
@@ -112,7 +111,6 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.cancel_button.pack(side='left')
         self.folder_button = ttk.Button(utility, text='打开结果', style='Quiet.TButton', command=self.open_result, state='disabled')
         self.folder_button.pack(side='left')
-        ttk.Button(utility, text='日志', style='Quiet.TButton', command=lambda: show_runtime_log(self)).pack(side='right')
         viewer = ttk.Frame(root)
         viewer.pack(fill='both', expand=True)
         bar = ttk.Frame(viewer)

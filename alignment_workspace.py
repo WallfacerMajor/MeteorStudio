@@ -86,11 +86,6 @@ class AlignmentWorkspace(tk.Toplevel):
         header = ttk.Frame(root)
         header.pack(fill="x")
         ttk.Label(header, text="Siril 星点 + PTGui 控制点", style="Title.TLabel").pack(side="left")
-        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right")
-        ttk.Label(
-            root,
-            text="Siril只辅助寻找星点；PTGui以对齐参考图建立星空控制点并原生导出图层。流星在返回主工作区后再抠。",
-        ).pack(anchor="w", pady=(2, 10))
         inspector = ttk.Frame(root, width=360)
         self.edit_inspector = inspector
         inspector.pack(side="right", fill="y", padx=(12, 0))
@@ -101,7 +96,7 @@ class AlignmentWorkspace(tk.Toplevel):
         lens_tab = ttk.Frame(configuration, padding=6)
         configuration.add(inputs_tab, text="输入与输出")
         configuration.add(lens_tab, text="镜头与投影")
-        paths = ttk.LabelFrame(inputs_tab, text="素材与输出（源素材只读）", padding=8)
+        paths = ttk.LabelFrame(inputs_tab, text="素材与输出", padding=8)
         self.input_panel = paths
         paths.pack(fill="x")
         self._path_row(paths, 0, "对齐参考图", self.base_path, self._choose_base, "选择文件…")
@@ -128,12 +123,8 @@ class AlignmentWorkspace(tk.Toplevel):
         ttk.Label(settings, text="星空区域").grid(row=1, column=4, sticky="w", pady=(5, 0))
         ttk.Label(settings, text="逐张自动识别并生成星点蒙版").grid(row=1, column=5, columnspan=3, sticky="w", padx=5, pady=(5, 0))
         settings.columnconfigure(5, weight=1)
-        ttk.Label(
-            settings,
-            text="参考图与素材使用独立焦距。参考图有EXIF时自动读取；没有EXIF时必须由用户填写，程序不会猜测。",
-        ).grid(row=2, column=0, columnspan=8, sticky="w", pady=(5, 0))
 
-        laboratory = ttk.LabelFrame(lens_tab, text="对齐实验室（每次独立输出，不覆盖正式结果）", padding=8)
+        laboratory = ttk.LabelFrame(lens_tab, text="对齐实验室", padding=8)
         self.laboratory_panel = laboratory
         laboratory.pack(fill="x", pady=(8, 0))
         ttk.Checkbutton(
@@ -338,7 +329,7 @@ class AlignmentWorkspace(tk.Toplevel):
         self._set_inputs_running(True)
         for button in (self.run_button, self.load_button, self.open_output_button, self.creative_button, self.discard_button):
             button.configure(state="disabled")
-        self.status.set("正在只读扫描素材与 EXIF…")
+        self.status.set("正在扫描素材与 EXIF…")
 
         def worker(token):
             sources = list_images(folder)
@@ -457,7 +448,7 @@ class AlignmentWorkspace(tk.Toplevel):
                     for index, (path, values) in enumerate(zip(self.items, rows)):
                         self.tree.insert("", "end", iid=str(index), text=path.name, values=values)
                     self.run_button.configure(state="normal")
-                    self.status.set(f"只读扫描完成：{len(self.items)} 张；参考图 {focal:.1f}mm（{source}）")
+                    self.status.set(f"扫描完成：{len(self.items)} 张；参考图 {focal:.1f}mm（{source}）")
                 elif item[0] == "progress":
                     _, value, text = item
                     self.progress["value"] = value

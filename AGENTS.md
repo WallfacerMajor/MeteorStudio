@@ -101,7 +101,8 @@
 - “空白点击不缩放”需同时检查可见显示边界、归一化中心、画布分配和延迟后的状态，不能只比较数值缩放倍率。
 - 单颗编辑测试必须监控全局失效、总融合 worker、精准预览 worker及遗留 `after` 任务，断言全部未启动。
 - 缓存淘汰回归需验证仍能只读取相交图层并更新局部。当前真实项目是 7952×5304，已有验证示例只更新约 169×167 的区域。
-- 每次本地交付至少执行：`python -m unittest discover -p "test_*.py"`、`python editable_composite_smoke.py`、重新打包，以及对打包 EXE 运行 `METEOR_EDITABLE_SMOKE_REPORT` 交互测试。
+- 用户要求不要每轮都跑全量单元测试。按修改影响范围选择专项测试；只有跨模块处理逻辑变化、专项失败暴露广泛风险或用户要求时，再执行 `python -m unittest discover -p "test_*.py"`。
+- 本地交付仍需执行相关真实交互回归、`python editable_composite_smoke.py`、重新打包，以及对打包 EXE 运行 `METEOR_EDITABLE_SMOKE_REPORT` 交互测试。
 
 ## 视频功能
 

@@ -44,14 +44,13 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.original, self.picker = tk.BooleanVar(value=False), tk.BooleanVar(value=False)
         self.destination = tk.StringVar()
         self.status = tk.StringVar(value="打开照片开始 · 支持 sRGB TIFF / PNG / JPG 和 RAW")
-        self.info = tk.StringVar(value="原片只读 · 调整可重置")
+        self.info = tk.StringVar(value="")
         self.gain_info = tk.StringVar(value="中性点：未取样")
         body = ttk.Frame(self, padding=(16, 12))
         body.pack(fill="both", expand=True)
         header = ttk.Frame(body)
         header.pack(fill="x", pady=(0, 10))
         ttk.Label(header, text="白平衡", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="  调整冷暖，保留星野细节", style="Muted.TLabel").pack(side="left")
         self.open_button = ttk.Button(header, text="打开照片…", command=self.open_image)
         self.open_button.pack(side="right")
         panel = ttk.Frame(body)
@@ -81,7 +80,6 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.batch_button.pack(side="left")
         self.folder_button = ttk.Button(footer, text="打开结果", state="disabled", command=self.open_result)
         self.folder_button.pack(side="right")
-        ttk.Button(footer, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=6)
         self.progress = ttk.Progressbar(body, maximum=100)
         self.progress.pack(side="bottom", fill="x", pady=(6, 0), before=panel)
         self.status_label = ttk.Label(body, textvariable=self.status, wraplength=850)
@@ -103,20 +101,17 @@ class WhiteBalanceWindow(tk.Toplevel):
             var.trace_add("write", lambda *_: self.schedule_render())
         self.pick_button = ttk.Checkbutton(controls, text="取中性点（点击照片）", variable=self.picker, command=self.pick_mode)
         self.pick_button.pack(anchor="w", pady=(12, 6))
-        ttk.Label(controls, text="选择本来应呈灰／白色的区域。\n不要将彩色星云、光污染或\n有色星点当作中性点。", style="Muted.TLabel", wraplength=220).pack(anchor="w")
         ttk.Label(controls, textvariable=self.gain_info, style="Muted.TLabel", wraplength=220).pack(anchor="w", pady=10)
         self.reset_button = ttk.Button(controls, text="重置白平衡", command=self.reset)
         self.reset_button.pack(fill="x", pady=5)
         self.suggest_button = ttk.Button(controls, text="自动推荐参考点", command=self.suggest_points)
         self.suggest_button.pack(fill="x", pady=5)
-        ttk.Label(controls, text="点击画面编号预览，再确认应用。\n仅筛选平滑区域，不能证明中性灰；\n请排除地景、尘埃、星云和光污染。", style="Muted.TLabel", wraplength=215).pack(anchor="w")
         self.confirm_point_button = ttk.Button(controls, text="应用此参考点", command=self.confirm_point)
         self.confirm_point_button.pack(fill="x", pady=5)
         self.cancel_point_button = ttk.Button(controls, text="取消参考点预览", command=self.cancel_point)
         self.cancel_point_button.pack(fill="x")
         ttk.Separator(controls).pack(fill="x", pady=12)
         ttk.Label(controls, text="改机与滤镜校准", style="Section.TLabel").pack(anchor="w")
-        ttk.Label(controls, text="打开灰卡参考 → 取中性点 →\n保存设备预设，再用于同组照片。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
         self.equipment_widgets = []
         for key, title in (("camera", "机身"), ("modification", "改机方式"), ("filter", "滤镜 / 光学组合"), ("reference", "参考光源 / 拍摄条件")):
             ttk.Label(controls, text=title).pack(anchor="w", pady=(5, 0))
@@ -133,12 +128,10 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.baseline_combo.bind("<<ComboboxSelected>>", self.baseline_changed)
         self.keep_button = ttk.Checkbutton(controls, text="下一张沿用当前校准", variable=self.keep_settings)
         self.keep_button.pack(anchor="w", pady=8)
-        ttk.Label(controls, text="改机方式仅作记录，不套固定减红。\n同组 RAW 建议统一解码基准。\n校准强度只影响中性点校正，\n不自动识别或中和星云红色。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
-        self.save_button = ttk.Button(controls, text="保存设置…", command=self.save_settings)
+        self.save_button = ttk.Button(controls, text="保存校准预设…", command=self.save_settings)
         self.save_button.pack(fill="x", pady=5)
-        self.load_button = ttk.Button(controls, text="载入设置…", command=self.load_settings)
+        self.load_button = ttk.Button(controls, text="载入校准预设…", command=self.load_settings)
         self.load_button.pack(fill="x", pady=5)
-        ttk.Label(controls, text="零值保留当前解码结果。\n冷暖偏移不是绝对 K 值。\n无 ICC 的图像按 sRGB 处理。", style="Muted.TLabel", wraplength=220).pack(anchor="w", pady=12)
         # Keep export and destination alongside adjustments, away from the canvas footer.
         footer.pack_forget()
         output.pack_forget()
@@ -152,7 +145,6 @@ class WhiteBalanceWindow(tk.Toplevel):
         for child, row, column, span in (
             (self.export_button, 0, 0, 1), (self.cancel_button, 0, 1, 1),
             (self.batch_button, 1, 0, 2), (self.folder_button, 2, 0, 1),
-            (footer.winfo_children()[-1], 2, 1, 1),
         ):
             child.grid(row=row, column=column, columnspan=span, sticky="ew", pady=2)
         footer.columnconfigure(0, weight=1)
@@ -343,6 +335,8 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def pick_mode(self):
         self.canvas.configure(cursor="crosshair" if self.picker.get() else "")
+        if self.picker.get():
+            self.status.set("点击应呈灰／白色的区域；避开星云、星点和光污染。")
 
     def fit(self):
         if self.levels:

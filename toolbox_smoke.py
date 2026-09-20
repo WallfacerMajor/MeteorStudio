@@ -76,6 +76,12 @@ def widgets(parent):
 
 
 def capture(window, name):
+    # Check the visible UI's persistent copy even when screenshots are disabled.
+    for widget in widgets(window):
+        if isinstance(widget, (ttk.Label, ttk.LabelFrame, ttk.Button)):
+            text = str(widget.cget('text'))
+            assert not any(phrase in text for phrase in ('源素材只读', '原图只读', '本地处理', '独立输出', '共用同一本地模型', '16 位合成链路')), text
+            assert not (isinstance(widget, ttk.Button) and text == '运行日志'), text
     target = os.environ.get("NIGHTSCAPE_SCREENSHOTS")
     if target:
         folder = Path(target)

@@ -2246,14 +2246,13 @@ class MeteorComposer(tk.Tk):
         settings_menu_button(header).pack(side="left", padx=6)
         self.workspace_title_label = ttk.Label(header, text="流星合成工作区")
         self.workspace_title_label.pack(side="left", padx=12)
-        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="视频动态", command=self.open_video_workspace).pack(side="right")
         ttk.Button(header, text="星空对齐", command=self.open_alignment_workspace).pack(side="right", padx=(0, 6))
         ttk.Button(header, text="流星批量筛选…", command=self.open_screening_workspace).pack(side="right", padx=(0, 6))
         self.paths_toggle_button = ttk.Button(header, text="收起 1 流星合成功能", command=self._toggle_paths_panel)
         self.paths_toggle_button.pack(side="right", padx=(0, 6))
 
-        paths = ttk.LabelFrame(root, text="1  流星合成功能（源素材只读）", padding=8)
+        paths = ttk.LabelFrame(root, text="1  流星合成功能", padding=8)
         paths.pack(fill="x")
         self.paths_panel = paths
         mode_row = ttk.Frame(paths)
@@ -2278,7 +2277,7 @@ class MeteorComposer(tk.Tk):
         self.base_folder_button.pack(side="left", padx=(4, 0))
         ttk.Label(paths, textvariable=self.base_selection_summary).grid(row=2, column=4, sticky="w", padx=(4, 0))
         self._path_row(paths, 3, "输出文件夹（可留空）", self.output_dir, self._browse_output)
-        ttk.Button(paths, text="只读扫描", command=self.scan_inputs).grid(row=1, column=3, rowspan=3, padx=8, sticky="ns")
+        ttk.Button(paths, text="扫描素材", command=self.scan_inputs).grid(row=1, column=3, rowspan=3, padx=8, sticky="ns")
         paths.columnconfigure(1, weight=1)
         self._update_output_mode_ui()
 
@@ -3865,7 +3864,7 @@ F1：显示本快捷键表""")
 
     def auto_detect_all(self) -> None:
         if not self.files:
-            messagebox.showwarning(APP_NAME, "请先执行只读扫描")
+            messagebox.showwarning(APP_NAME, "请先扫描素材")
             return
         if any(self.strokes.get(str(path), []) for path in self.files):
             if not messagebox.askyesno(APP_NAME, "AI 自动检测会替换未锁定蒙版；锁定蒙版继续保留。继续吗？"):
@@ -4461,7 +4460,7 @@ F1：显示本快捷键表""")
         self.exact_preview_open_when_ready = open_when_ready
         self.exact_preview_status.set("精准预览：后台更新中…")
         self.progress["value"] = 0
-        self.status.set("正在按原始分辨率和 16 位导出链路更新当前画布…")
+        self.status.set("正在更新原始分辨率预览…")
         full_height, full_width = self.preview_base.shape[:2]
         quick_scale = min(1.0, 2400.0 / max(1, full_width, full_height))
         quick_shape = (
@@ -4853,7 +4852,7 @@ F1：显示本快捷键表""")
             )
             if exact_current:
                 shown = exact_full
-                self.preview_quality_status.set("当前画布：16 位合成链路 · 原始像素")
+                self.preview_quality_status.set("当前画布：原始像素")
                 self.exact_preview_status.set(f"精准预览：有效（{shown.shape[1]}×{shown.shape[0]}）")
             elif progressive_current and exact_partial.shape[:2] == self.preview_base.shape[:2]:
                 shown = exact_partial
@@ -8397,7 +8396,7 @@ F1：显示本快捷键表""")
         learning_choice = messagebox.askyesnocancel(
             APP_NAME + " — 导出与 AI 学习",
             export_summary +
-            f"源素材只读，结果写入新的运行目录：\n{output}\n\n"
+            f"结果输出到：\n{output}\n\n"
             "是否在导出完成后，用本次最终蒙版继续训练本地 AI？\n\n"
             "是：导出并自动学习\n否：仅导出\n取消：停止",
         )

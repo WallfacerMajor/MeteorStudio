@@ -832,7 +832,7 @@ class VideoMeteorWindow(tk.Toplevel):
         self.eraser_width = tk.IntVar(value=42)
         self.brush_feather = tk.IntVar(value=14)
         self.source_offset = tk.IntVar(value=0)
-        self.status = tk.StringVar(value="选择视频后执行自动分析。源视频始终只读。")
+        self.status = tk.StringVar(value="选择视频后开始分析")
 
         self.effect_mode = tk.StringVar(value="慢放并淡出")
         self.local_speed = tk.DoubleVar(value=20.0)
@@ -900,7 +900,6 @@ class VideoMeteorWindow(tk.Toplevel):
             text="只改变流星时间层；背景保持正常播放。所有输出写入新文件。",
         ).pack(side="left", padx=14)
         ttk.Button(header, text="返回流星合成工作区", command=self._return_to_composer).pack(side="right", padx=(6, 0))
-        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(6, 0))
         ttk.Button(header, text="保存视频项目", command=self.save_project).pack(side="right")
         ttk.Button(header, text="载入视频项目", command=self.load_project).pack(side="right", padx=6)
 
@@ -1054,12 +1053,6 @@ class VideoMeteorWindow(tk.Toplevel):
         row += 1
         ttk.Checkbutton(right, text="保留音频（背景变速时同步变速）", variable=self.keep_audio, command=self._schedule_autosave).grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 0))
         row += 1
-        ttk.Label(
-            right,
-            text="流星速度和背景速度互相独立。\n背景减速不会拉长流星动态。\n匹配源视频默认使用兼容编码。",
-            foreground="#9aafc5",
-            justify="left",
-        ).grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
         right.columnconfigure(1, weight=1)
 
         bottom = ttk.Frame(root)

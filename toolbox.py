@@ -49,7 +49,7 @@ TOOL_MENU = (
         WorkspaceSpec("white_balance", "白平衡与改机校准", "灰卡取样 · 机身／滤镜预设 · 整组 16 位导出", "open_white_balance_workspace"),
         WorkspaceSpec("light_pollution", "光污染渐变校正", "底部渐变 · 地景／星云保护 · 16 位导出", "open_light_pollution_workspace"),
     )),
-    ToolGroup("laboratory", "实验室", "探索星轨、降噪与画质分析 · 独立输出，保留原片", (
+    ToolGroup("laboratory", "实验室", "星轨叠加、已对齐降噪与画质分析", (
         WorkspaceSpec("trails", "星轨叠加", "固定机位 · 取亮叠加 · 16 位 TIFF", "open_lab_trails"),
         WorkspaceSpec("mean", "已对齐降噪", "平均叠加 · 保持原始尺寸 · 16 位 TIFF", "open_lab_mean"),
         WorkspaceSpec("quality", "批量画质体检", "清晰度 · 背景亮度 · 过曝比例 · CSV", "open_lab_quality"),
@@ -90,10 +90,11 @@ def settings_menu_button(parent):
     menu = tk.Menu(button, tearoff=False)
     owner = parent.winfo_toplevel()
     menu.add_command(label="外部软件与路径…", command=lambda: show_software_settings(owner))
-    submenu = tk.Menu(menu, tearoff=False)
-    for spec in SOFTWARE:
-        submenu.add_command(label=spec.title, command=lambda key=spec.key: show_software_settings(owner, (key,)))
-    menu.add_cascade(label="软件连接", menu=submenu)
+    from workspace_help import TOPICS, show_help
+    help_menu = tk.Menu(menu, tearoff=False)
+    for topic in TOPICS:
+        help_menu.add_command(label=topic, command=lambda topic=topic: show_help(owner, topic))
+    menu.add_cascade(label="使用说明", menu=help_menu)
     menu.add_separator()
     from error_dialog import show_runtime_log
     menu.add_command(label="运行日志…", command=lambda: show_runtime_log(owner))
@@ -271,10 +272,4 @@ def build_home(app, menu_path=()) -> ttk.Frame:
         cards.columnconfigure(col, weight=1, uniform="tool")
     for row in range((len(nodes) + 1) // 2):
         cards.rowconfigure(row, weight=1)
-    if menu_path:
-        footer = ttk.Frame(home)
-        footer.pack(fill="x", pady=(14, 0))
-        ttk.Label(footer, text="源素材只读   /   本地处理   /   独立输出", style="Muted.TLabel").pack(side="left")
-        return home
-    ttk.Label(home, text="源素材只读   /   本地处理   /   独立输出", style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
     return home

@@ -890,7 +890,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.filter_summary = tk.StringVar(value="显示 0/0")
         self.filter_after_id: str | None = None
         self.filtered_result_indices: list[int] = []
-        self.status = tk.StringVar(value="选择连续拍摄照片文件夹；原文件只读。")
+        self.status = tk.StringVar(value="选择照片文件夹开始筛选")
         self.summary = tk.StringVar(value="尚未分析")
         self.files: list[Path] = []
         self.results: list[ScreeningResult] = []
@@ -930,7 +930,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         self.manual_mark_mode = False
         self.manual_mark_start: tuple[int, int] | None = None
         self.manual_mark_label = tk.StringVar(value="手动标记漏检流星")
-        self.candidate_status = tk.StringVar(value="点击候选标记后，可逐条确认；照片保留不会自动训练AI。")
+        self.candidate_status = tk.StringVar(value="点击候选标记，确认是否为流星")
         self.autosave_status = tk.StringVar(value="自动保存：等待修改")
         self.autosave_after_id: str | None = None
         self._restoring_autosave = False
@@ -966,9 +966,7 @@ class MeteorScreeningWindow(tk.Toplevel):
         header = ttk.Frame(root)
         header.pack(fill="x", pady=(0, 8))
         ttk.Label(header, text="流星批量筛选", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="与流星合成共用同一本地模型 · 支持主流RAW/TIFF/JPG/PNG · 原图只读").pack(side="left", padx=12)
         ttk.Button(header, text="返回流星合成功能", command=self._return_to_composer).pack(side="right")
-        ttk.Button(header, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right", padx=(0, 6))
 
         inspector = ttk.Frame(root, width=320)
         self.edit_inspector = inspector
@@ -2502,7 +2500,7 @@ class MeteorScreeningWindow(tk.Toplevel):
             quality = "快速预览"
         self.status.set(
             f"{Path(result.path).name} · {self._decision_label(result)} · "
-            f"{quality} · AI流星可能性 {result.score}% · 照片判断不会作为候选训练标签"
+            f"{quality} · AI流星可能性 {result.score}%"
         )
 
     def _view_geometry(self) -> tuple[float, float, float, int, int] | None:

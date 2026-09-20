@@ -42,8 +42,7 @@ class LaboratoryWindow(tk.Toplevel):
         self.remove_button.pack(side="left", padx=(8, 0))
         self.clear_button = ttk.Button(actions, text="清空列表", command=self.clear)
         self.clear_button.pack(side="left", padx=8)
-        ttk.Button(actions, text="运行日志", command=lambda: show_runtime_log(self)).pack(side="right")
-        self.status = tk.StringVar(value="支持 TIFF / PNG / JPG；原始素材始终只读")
+        self.status = tk.StringVar(value="添加照片开始")
         self.summary = tk.StringVar()
         ttk.Label(body, textvariable=self.summary, style="Muted.TLabel").pack(anchor="w", pady=(10, 0))
         footer = ttk.Frame(inspector)
@@ -137,7 +136,7 @@ class LaboratoryWindow(tk.Toplevel):
 
     def refresh_controls(self):
         minimum = 1 if self.mode == "quality" else 2
-        self.summary.set(f"{len(self.paths)} 张照片  ·  {'体检至少 1 张' if minimum == 1 else '叠加至少 2 张'}  ·  原片只读，输出到独立目录")
+        self.summary.set(f"{len(self.paths)} 张照片  ·  {'体检至少 1 张' if minimum == 1 else '叠加至少 2 张'}")
         for widget in (self.add_button, self.destination_entry, self.browse_button):
             widget.configure(state="disabled" if self.busy else "normal")
         self.clear_button.configure(state="normal" if self.paths and not self.busy else "disabled")
