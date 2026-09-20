@@ -95,6 +95,12 @@ def run_smoke(app):
     app.white_balance_window._request_close()
     pump(app, 1.4)
     assert app.white_balance_window is None
+    click(app, app.toolbox_home.tool_buttons['light_pollution'])
+    from light_pollution_smoke import exercise_light_pollution
+    light_pollution_checks = exercise_light_pollution(app, app.light_pollution_window)
+    app.light_pollution_window._request_close()
+    pump(app, 1.4)
+    assert app.light_pollution_window is None
     app.show_toolbox()
     click(app, app.toolbox_home.tool_buttons["laboratory"])
     assert set(app.toolbox_home.tool_buttons) == {"trails", "mean", "quality"}
@@ -218,7 +224,7 @@ def run_smoke(app):
             assert not (owned_timers & remaining), (attr, owned_timers & remaining)
             pump(app, 1.4)
             assert getattr(app, attr) is None and app.composite_panel.winfo_ismapped()
-    return {**white_balance_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
+    return {**white_balance_checks, **light_pollution_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
 
 
 if __name__ == "__main__":

@@ -2636,7 +2636,7 @@ class MeteorComposer(tk.Tk):
     def navigate_tool(self, spec, menu_path) -> None:
         # A submenu can be used from any workspace. Honour its close/save and
         # cancellation flow before creating the next one.
-        for attribute in ("alignment_window", "screening_window", "video_window", "laboratory_window", "white_balance_window"):
+        for attribute in ("alignment_window", "screening_window", "video_window", "laboratory_window", "white_balance_window", "light_pollution_window"):
             window = getattr(self, attribute, None)
             if window is not None and window.winfo_exists():
                 close = getattr(window, "_request_close", None) or getattr(window, "_close_window", None) or window.destroy
@@ -2660,6 +2660,15 @@ class MeteorComposer(tk.Tk):
             return
         self.white_balance_window = WhiteBalanceWindow(self)
         self._activate_child_workspace(self.white_balance_window, "white_balance_window")
+
+    def open_light_pollution_workspace(self):
+        from light_pollution_workspace import LightPollutionWindow
+        previous = getattr(self, 'light_pollution_window', None)
+        if previous is not None and previous.winfo_exists():
+            previous.lift()
+            return
+        self.light_pollution_window = LightPollutionWindow(self)
+        self._activate_child_workspace(self.light_pollution_window, 'light_pollution_window')
 
     def open_lab_mean(self):
         self._open_laboratory("mean")
@@ -2749,7 +2758,7 @@ class MeteorComposer(tk.Tk):
         category_title = "控制点生成" if category[0] == "control_points" else "流星工具"
         if attribute == "laboratory_window":
             category, category_title = ("laboratory",), "实验室"
-        elif attribute == "white_balance_window":
+        elif attribute in ("white_balance_window", "light_pollution_window"):
             category, category_title = ("color",), "色彩工具"
         def return_home():
             close()

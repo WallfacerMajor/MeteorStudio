@@ -131,7 +131,7 @@ def make_pyramid(image, token):
     return levels
 
 
-def render_view(levels, settings, zoom, center, size, original=False):
+def render_view(levels, settings, zoom, center, size, original=False, processor=None):
     """Render only a screen-sized viewport; never transform an entire 8K frame."""
     h, w = levels[0].shape[:2]
     cw, ch = size
@@ -149,7 +149,7 @@ def render_view(levels, settings, zoom, center, size, original=False):
     matrix = np.array([[sx / zoom, 0, x0 * sx], [0, sy / zoom, y0 * sy]], np.float32)
     view = cv2.warpAffine(image, matrix, (out_w, out_h), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REPLICATE)
     if not original:
-        view = apply_lut(view, make_lut(settings))
+        view = processor(view, x0, y0, zoom) if processor else apply_lut(view, make_lut(settings))
     clipped = float(np.count_nonzero(np.max(view, axis=2) == 65535) / (out_w * out_h))
     return ((view.astype(np.uint32) + 128) // 257).astype(np.uint8), ((x0-left)*zoom, (y0-top)*zoom), clipped
 

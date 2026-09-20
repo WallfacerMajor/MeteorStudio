@@ -47,6 +47,7 @@ TOOL_MENU = (
     ToolGroup("control_points", "控制点生成", "连接外部软件，为星野照片自动生成控制点", (WORKSPACES[1],)),
     ToolGroup("color", "色彩工具", "白平衡与中性色校正 · 保留完整像素精度", (
         WorkspaceSpec("white_balance", "白平衡与改机校准", "灰卡取样 · 机身／滤镜预设 · 整组 16 位导出", "open_white_balance_workspace"),
+        WorkspaceSpec("light_pollution", "光污染渐变校正", "底部渐变 · 地景／星云保护 · 16 位导出", "open_light_pollution_workspace"),
     )),
     ToolGroup("laboratory", "实验室", "探索星轨、降噪与画质分析 · 独立输出，保留原片", (
         WorkspaceSpec("trails", "星轨叠加", "固定机位 · 取亮叠加 · 16 位 TIFF", "open_lab_trails"),
