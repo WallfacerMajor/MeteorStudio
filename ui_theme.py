@@ -9,9 +9,9 @@ def apply_theme(root):
     from app_icon import install_icon
     install_icon(root)
     families = set(tkfont.families(root))
-    family = next((name for name in ("Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", "Segoe UI") if name in families), "TkDefaultFont")
+    family = next((name for name in ("Noto Sans SC", "Noto Sans CJK SC", "PingFang SC", "Microsoft YaHei UI", "Segoe UI") if name in families), tkfont.nametofont('TkDefaultFont', root=root).actual('family'))
     for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
-        tkfont.nametofont(name, root=root).configure(family=family, size=9)
+        tkfont.nametofont(name, root=root).configure(family=family, size=10)
     style = ttk.Style(root)
     style.theme_use("clam")
     bg, panel, field = "#292929", "#353535", "#202020"
@@ -25,6 +25,7 @@ def apply_theme(root):
     root.option_add("*Text.insertBackground", text)
     root.option_add("*Listbox.background", field)
     root.option_add("*TCombobox*Listbox.background", field)
+    root.option_add("*Menu.font", 'TkMenuFont')
     # Windows draws native popup menus outside ttk's theme. A global light
     # foreground on its system light background makes their entries invisible.
     if sys.platform == 'win32':
@@ -44,7 +45,7 @@ def apply_theme(root):
     style.configure("Primary.TButton", background="#496c96", foreground="#ffffff", borderwidth=0, padding=(10, 5))
     style.map("Primary.TButton", background=[("disabled", panel), ("pressed", "#3e5c80"), ("active", "#587ead")], foreground=[("disabled", "#858585"), ("!disabled", "#ffffff")])
     style.configure("Quiet.TButton", background=bg, borderwidth=0, padding=(8, 4))
-    style.configure("Section.TLabel", foreground=text, font=(family, 10, "bold"))
+    style.configure("Section.TLabel", foreground=text, font=(family, 11, "bold"))
     style.configure("Value.TLabel", foreground=text, anchor="e")
     style.configure("Editor.Horizontal.TScale", borderwidth=0, troughcolor="#555555", background=bg, sliderlength=14, sliderthickness=12)
     style.configure("Thin.Horizontal.TProgressbar", thickness=3, borderwidth=0)
@@ -59,11 +60,11 @@ def apply_theme(root):
     for name in ("TCheckbutton", "TRadiobutton"):
         style.map(name, background=[("active", panel)], indicatorbackground=[("selected", accent), ("!selected", field)], foreground=[("disabled", "#64778c")])
     style.configure("TLabelframe", borderwidth=1, relief="solid", bordercolor="#404040")
-    style.configure("TLabelframe.Label", foreground=text, font=(family, 9, "bold"))
+    style.configure("TLabelframe.Label", foreground=text, font=(family, 10, "bold"))
     style.configure("Muted.TLabel", foreground=muted)
-    style.configure("Hero.TLabel", font=(family, 22, "bold"))
-    style.configure("Title.TLabel", font=(family, 12, "bold"))
-    style.configure("Treeview", background=field, fieldbackground=field, rowheight=27)
+    style.configure("Hero.TLabel", font=(family, 23, "bold"))
+    style.configure("Title.TLabel", font=(family, 13, "bold"))
+    style.configure("Treeview", background=field, fieldbackground=field, rowheight=max(29, tkfont.nametofont('TkDefaultFont', root=root).metrics('linespace')+8))
     style.configure("Treeview.Heading", background=panel, foreground=muted, padding=5)
     style.map("Treeview", background=[("selected", "#315574")], foreground=[("selected", "#ffffff")])
     style.configure("TNotebook", borderwidth=0)
