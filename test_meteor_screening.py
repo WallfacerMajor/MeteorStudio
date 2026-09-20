@@ -170,7 +170,7 @@ class TemporalReferenceTests(unittest.TestCase):
             )
         record = save.call_args.args[0]
         self.assertEqual(record["neighbor_paths"], [
-            "D:\\shoot\\frame_2.arw", "D:\\shoot\\frame_4.arw",
+            str(Path("D:/shoot/frame_2.arw")), str(Path("D:/shoot/frame_4.arw")),
         ])
         self.assertEqual(record["score_cutoff"], 58)
         self.assertEqual(record["result_snapshot"]["note"], "星空区域 82%")
