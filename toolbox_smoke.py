@@ -47,7 +47,15 @@ def run_smoke(app):
     pump(app, 0.4)
     assert app.toolbox_home.winfo_ismapped()
     capture(app, "toolbox.png")
-    assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points", "laboratory"}
+    assert set(app.toolbox_home.tool_buttons) == {"meteor", "control_points", "color", "laboratory"}
+    click(app, app.toolbox_home.tool_buttons["color"])
+    click(app, app.toolbox_home.tool_buttons["white_balance"])
+    from white_balance_smoke import exercise_white_balance
+    white_balance_checks = exercise_white_balance(app, app.white_balance_window)
+    app.white_balance_window._request_close()
+    pump(app, 1.4)
+    assert app.white_balance_window is None
+    app.show_toolbox()
     click(app, app.toolbox_home.tool_buttons["laboratory"])
     assert set(app.toolbox_home.tool_buttons) == {"trails", "mean", "quality"}
     click(app, app.toolbox_home.tool_buttons["mean"])
@@ -160,7 +168,7 @@ def run_smoke(app):
             assert not (owned_timers & remaining), (attr, owned_timers & remaining)
             pump(app, 1.4)
             assert getattr(app, attr) is None and app.composite_panel.winfo_ismapped()
-    return {**laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
+    return {**white_balance_checks, **laboratory_checks, "hierarchical_categories": "passed", "submenu_parent_navigation": "passed", "toolbox_navigation": "passed", "control_points_entry": "passed", "scan_nonblocking": "passed", "scan_inputs_disabled": "passed", "stale_scan_prevented": "passed", "return_and_delayed_close": "passed", "composite_navigation": "passed", "screening_video_timer_cleanup": "passed", "screening_filters_do_not_overlap": "passed", "empty_export_never_imports_cwd": "passed"}
 
 
 if __name__ == "__main__":
