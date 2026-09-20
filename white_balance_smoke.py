@@ -45,8 +45,37 @@ def exercise_white_balance(root, window):
         wait_for(lambda: window.levels is not None and window.photo is not None and not window.busy)
         assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         assert np.array_equal(window.levels[0], pixels)
+        before = window.settings()
+        reveal(window.suggest_button)
+        click(root, window.suggest_button)
+        wait_for(lambda: not window.finding_candidates and bool(window.candidates))
+        assert window.settings() == before
+        point = window.candidates[0]
+        px, py = window.point_position(point)
+        window.canvas.event_generate("<ButtonPress-1>", x=round(px), y=round(py))
+        window.canvas.event_generate("<ButtonRelease-1>", x=round(px), y=round(py))
+        pump(root, 1.5)
+        assert window.candidate_preview == 0 and window.settings() == before
+        assert str(window.export_button['state']) == 'disabled'
+        reveal(window.cancel_point_button)
+        click(root, window.cancel_point_button)
+        pump(root, 1.5)
+        assert window.candidate_preview is None and window.settings() == before
+        window.canvas.event_generate("<ButtonPress-1>", x=round(px), y=round(py))
+        window.canvas.event_generate("<ButtonRelease-1>", x=round(px), y=round(py))
+        reveal(window.confirm_point_button)
+        click(root, window.confirm_point_button)
+        pump(root, 1.5)
+        assert window.candidate_preview is None and window.neutral == point['gains']
+        reveal(window.reset_button)
+        click(root, window.reset_button)
+        reveal(window.sliders[0])
         click(root, window.actual_button)
         pump(root, .4)
+        expected = window.point_position(window.candidates[0])
+        outline = window.canvas.coords(window.canvas.find_withtag('reference')[0])
+        assert abs((outline[0]+outline[2])/2-expected[0]) < 1
+        assert abs((outline[1]+outline[3])/2-expected[1]) < 1
         cw, ch = window.canvas.winfo_width(), window.canvas.winfo_height()
         window.canvas.event_generate("<ButtonPress-1>", x=cw//2, y=ch//2)
         window.canvas.event_generate("<B1-Motion>", x=cw//2-35, y=ch//2-20)
@@ -66,6 +95,7 @@ def exercise_white_balance(root, window):
         assert view[:2] == (window.zoom, window.center)
         click(root, window.compare_button)
         click(root, window.fit_button)
+        reveal(window.pick_button)
         click(root, window.pick_button)
         window.canvas.event_generate("<ButtonPress-1>", x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
         window.canvas.event_generate("<ButtonRelease-1>", x=window.canvas.winfo_width()//2, y=window.canvas.winfo_height()//2)
@@ -104,6 +134,7 @@ def exercise_white_balance(root, window):
             click(root, window.open_button)
         wait_for(lambda: window.source == second and not window.busy)
         assert window.settings() == settings and window.keep_settings.get()
+        assert not window.candidates and window.candidate_preview is None
         previous = window.result
         broken = source / "broken.tif"
         broken.write_bytes(b"invalid")

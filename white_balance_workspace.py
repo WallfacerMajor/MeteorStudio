@@ -9,6 +9,7 @@ from background_tasks import BackgroundTaskScheduler
 from error_dialog import show_copyable_error, show_runtime_log, append_runtime_log
 from platform_utils import open_folder
 from ui_navigation import cancel_widget_timers
+from neutral_candidates import suggest_neutral_points
 from white_balance import read_source, make_pyramid, render_view, sample_neutral, export_image, export_batch, validate_settings, RAW_SUFFIXES
 
 
@@ -26,6 +27,10 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.busy = False
         self.load_id = self.render_id = self.export_id = 0
         self.preview_after = None
+        self.candidate_id = 0
+        self.candidates = []
+        self.candidate_preview = None
+        self.finding_candidates = False
         self.neutral = [1, 1, 1]
         self.zoom, self.center, self.fit_mode = 1., (0., 0.), True
         self.drag = None
@@ -105,6 +110,13 @@ class WhiteBalanceWindow(tk.Toplevel):
         ttk.Label(controls, textvariable=self.gain_info, style="Muted.TLabel", wraplength=220).pack(anchor="w", pady=10)
         self.reset_button = ttk.Button(controls, text="重置白平衡", command=self.reset)
         self.reset_button.pack(fill="x", pady=5)
+        self.suggest_button = ttk.Button(controls, text="自动推荐参考点", command=self.suggest_points)
+        self.suggest_button.pack(fill="x", pady=5)
+        ttk.Label(controls, text="点击画面编号预览，再确认应用。\n仅筛选平滑区域，不能证明中性灰；\n请排除地景、尘埃、星云和光污染。", style="Muted.TLabel", wraplength=215).pack(anchor="w")
+        self.confirm_point_button = ttk.Button(controls, text="应用此参考点", command=self.confirm_point)
+        self.confirm_point_button.pack(fill="x", pady=5)
+        self.cancel_point_button = ttk.Button(controls, text="取消参考点预览", command=self.cancel_point)
+        self.cancel_point_button.pack(fill="x")
         ttk.Separator(controls).pack(fill="x", pady=12)
         ttk.Label(controls, text="改机与滤镜校准", style="Title.TLabel").pack(anchor="w")
         ttk.Label(controls, text="打开灰卡参考 → 取中性点 →\n保存设备预设，再用于同组照片。", style="Muted.TLabel", wraplength=215).pack(anchor="w", pady=6)
@@ -164,16 +176,25 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def controls(self):
         editable = self.levels is not None and not self.busy
+        pending = self.candidate_preview is not None
         for widget in (*self.sliders, self.pick_button, self.reset_button, self.save_button, self.load_button):
             widget.configure(state="normal" if editable else "disabled")
         for widget in (self.open_button, self.output_entry, self.output_button):
             widget.configure(state="disabled" if self.busy else "normal")
-        self.export_button.configure(state="normal" if editable and self.destination.get().strip() else "disabled")
-        self.batch_button.configure(state="normal" if editable and self.destination.get().strip() else "disabled")
+        self.export_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
+        self.batch_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
+        self.suggest_button.configure(state="normal" if editable and not self.finding_candidates else "disabled")
+        for widget in (self.confirm_point_button, self.cancel_point_button):
+            widget.configure(state="normal" if editable and pending else "disabled")
+        if pending:
+            for widget in (*self.sliders, self.pick_button, self.save_button, self.load_button, self.baseline_combo):
+                widget.configure(state="disabled")
         self.keep_button.configure(state="disabled" if self.busy else "normal")
         self.baseline_combo.configure(state="disabled" if self.busy else "readonly")
         for widget in self.equipment_widgets:
             widget.configure(state="disabled" if self.busy else "readonly" if isinstance(widget, ttk.Combobox) else "normal")
+        if pending:
+            self.baseline_combo.configure(state="disabled")
 
     def open_image(self):
         path = filedialog.askopenfilename(parent=self, title="选择白平衡素材", filetypes=[("照片", "*.tif *.tiff *.png *.jpg *.jpeg *.arw *.nef *.nrw *.cr2 *.cr3 *.crw *.dng *.raf *.orf *.rw2")])
@@ -186,6 +207,11 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def load_photo(self, path, data, preserve_view=False):
         data = validate_settings(data)
+        self.candidate_id += 1
+        self.scheduler.cancel("candidates")
+        self.candidates, self.candidate_preview, self.finding_candidates = [], None, False
+        self.draw_candidates()
+        self.schedule_render()
         self.busy = True
         self.controls()
         self.status.set("读取原始像素并准备预览…")
@@ -214,6 +240,7 @@ class WhiteBalanceWindow(tk.Toplevel):
         self.status.set("RAW 基准已更改；请在相同基准下重新取灰卡或载入匹配预设")
 
     def apply_settings(self, settings):
+        self.candidate_preview = None
         data = validate_settings(settings)
         self.neutral = data["neutral"]
         self.warmth.set(data["warmth"])
@@ -224,6 +251,49 @@ class WhiteBalanceWindow(tk.Toplevel):
             variable.set(data["equipment"][key])
         self.gain_info.set("中性点 RGB：" + " / ".join(f"{v:.3f}" for v in self.neutral))
         self.schedule_render()
+        self.controls()
+
+    def suggest_points(self):
+        if self.busy or not self.levels or self.finding_candidates:
+            return
+        self.cancel_point()
+        self.picker.set(False)
+        self.pick_mode()
+        self.candidates = []
+        self.draw_candidates()
+        self.candidate_id += 1
+        identity, events, pixels = self.candidate_id, self.events, self.levels[0]
+        self.finding_candidates = True
+        self.controls()
+        self.status.set("正在筛选平滑、未过曝的参考区域…")
+        self.scheduler.submit("candidates", lambda token: suggest_neutral_points(pixels, token),
+            on_result=lambda result: events.put(("candidates", identity, result)),
+            on_error=lambda exc, detail: events.put(("candidates_error", identity, (str(exc), detail))))
+
+    def point_position(self, point):
+        return ((point['x']-self.center[0])*self.zoom+self.canvas.winfo_width()/2,
+                (point['y']-self.center[1])*self.zoom+self.canvas.winfo_height()/2)
+
+    def draw_candidates(self):
+        self.canvas.delete("reference")
+        for index, point in enumerate(self.candidates):
+            x, y = self.point_position(point)
+            color = "#ffcf70" if self.candidate_preview == index else "#70ded2"
+            self.canvas.create_oval(x-12, y-12, x+12, y+12, outline=color, width=2, tags="reference")
+            self.canvas.create_text(x+18, y-16, text=str(index+1), fill=color, tags="reference")
+
+    def cancel_point(self):
+        self.candidate_preview = None
+        self.controls()
+        self.schedule_render()
+
+    def confirm_point(self):
+        if self.candidate_preview is None or self.busy:
+            return
+        point = self.candidates[self.candidate_preview]
+        self.original.set(False)
+        self.apply_settings(dict(self.settings(), neutral=point['gains'], warmth=0, tint=0, neutral_strength=100))
+        self.status.set("已应用所选参考点；可降低校准强度，保留自然星野色彩")
 
     def reset(self):
         self.apply_settings(dict(self.settings(), warmth=0, tint=0, neutral=[1, 1, 1], neutral_strength=100))
@@ -291,6 +361,16 @@ class WhiteBalanceWindow(tk.Toplevel):
     def press(self, event):
         if not self.levels:
             return
+        if not self.busy and not self.picker.get():
+            for index, point in enumerate(self.candidates):
+                x, y = self.point_position(point)
+                if (event.x-x)**2 + (event.y-y)**2 <= 20**2:
+                    self.candidate_preview = index
+                    self.original.set(False)
+                    self.controls()
+                    self.schedule_render()
+                    self.status.set(f"参考点 {index+1} 预览 · 尚未应用；此处是否本应中性需人工确认")
+                    return
         if self.picker.get() and not self.busy:
             x, y = self.image_position(event.x, event.y)
             try:
@@ -336,6 +416,8 @@ class WhiteBalanceWindow(tk.Toplevel):
         if not self.levels:
             return
         levels, settings, zoom, center = self.levels, self.settings(), self.zoom, self.center
+        if self.candidate_preview is not None:
+            settings = dict(settings, neutral=self.candidates[self.candidate_preview]['gains'], warmth=0, tint=0, neutral_strength=100)
         size = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         original, identity, events = self.original.get(), self.render_id, self.events
         self.scheduler.submit("preview", lambda token: render_view(levels, settings, zoom, center, size, original),
@@ -356,7 +438,7 @@ class WhiteBalanceWindow(tk.Toplevel):
             self.export(paths)
 
     def export(self, batch_paths=None):
-        if self.busy or self.source is None or not self.destination.get().strip():
+        if self.busy or self.candidate_preview is not None or self.source is None or not self.destination.get().strip():
             return
         source, destination, settings = self.source, self.destination.get().strip(), self.settings()
         self.busy = True
@@ -398,10 +480,16 @@ class WhiteBalanceWindow(tk.Toplevel):
                 kind, identity, data = self.events.get_nowait()
             except queue.Empty:
                 break
-            current = self.load_id if kind in ("loaded", "load_error") else self.render_id if kind.startswith("preview") else self.export_id
+            current = self.candidate_id if kind.startswith("candidates") else self.load_id if kind in ("loaded", "load_error") else self.render_id if kind.startswith("preview") else self.export_id
             if identity != current:
                 continue
-            if kind == "loaded":
+            if kind == "candidates":
+                self.finding_candidates = False
+                self.candidates = data
+                self.draw_candidates()
+                self.controls()
+                self.status.set(f"找到 {len(data)} 个平滑参考候选；点击编号预览，确认后应用" if data else "未找到适合推荐的区域；请使用灰卡参考或手动取样")
+            elif kind == "loaded":
                 self.source, self.levels, parameters, preserve_view = data
                 self.loaded_baseline = parameters["raw_baseline"]
                 self.busy = False
@@ -423,7 +511,8 @@ class WhiteBalanceWindow(tk.Toplevel):
                 self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
                 self.canvas.itemconfigure(self.image_item, image=self.photo)
                 self.canvas.coords(self.image_item, *position)
-                self.info.set(f"{'原图' if original else '白平衡效果'} · {zoom*100:.1f}% · 可见区通道触顶 {clipped:.2%}")
+                self.draw_candidates()
+                self.info.set(f"{'原图' if original else '参考点预览（未应用）' if self.candidate_preview is not None else '白平衡效果'} · {zoom*100:.1f}% · 可见区通道触顶 {clipped:.2%}")
             elif kind == "progress":
                 self.progress.configure(value=data[0])
                 if not self.export_token.cancelled:
@@ -439,12 +528,15 @@ class WhiteBalanceWindow(tk.Toplevel):
                 else:
                     self.status.set("已取消，原片未修改")
             elif kind.endswith("error"):
+                if kind == "candidates_error":
+                    self.finding_candidates = False
                 if kind == "load_error" and self.source:
                     self.raw_baseline.set("固定日光（同组）" if self.loaded_baseline == "daylight" else "相机白平衡")
-                if kind != "preview_error":
+                if kind not in ("preview_error", "candidates_error"):
                     self.busy = False
                     self.controls()
                     self.cancel_button.configure(state="disabled")
+                self.controls()
                 self.status.set("操作未完成；详情见运行日志")
                 show_copyable_error("白平衡", data[0], parent=self, details=data[1])
         if self.busy and hasattr(self, "export_token") and self.export_token.cancelled and self.scheduler.active_count("export") == 0 and self.scheduler.active_count("load") == 0:
