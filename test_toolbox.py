@@ -12,8 +12,9 @@ from ptgui_pipeline import run_alignment_pipeline
 class ToolboxTests(unittest.TestCase):
     def test_all_tools_are_available_without_category_pages(self):
         entries = list(iter_tools(TOOL_MENU))
-        self.assertEqual(len(entries), 10)
-        self.assertEqual(len({spec.key for spec, path in entries}), 10)
+        self.assertEqual(len(entries), 11)
+        self.assertEqual(len({spec.key for spec, path in entries}), 11)
+        self.assertIn(('star_reduction', ('laboratory',)), [(spec.key, path) for spec, path in entries])
 
     def test_hierarchy_supports_nested_categories(self):
         nodes, ancestors = menu_level(("meteor",))

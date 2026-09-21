@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageTk
 TOOLS = {
     '流星批量筛选': 'search', '星空对齐': 'align', '流星合成功能': 'layers',
     '视频动态': 'film', 'Siril + PTGui 控制点': 'nodes', '白平衡与改机校准': 'temperature',
-    '光污染渐变校正': 'horizon', '星轨叠加': 'trails', '已对齐降噪': 'stack', '批量画质体检': 'chart',
+    '光污染渐变校正': 'horizon', '星轨叠加': 'trails', '已对齐降噪': 'stack', '批量画质体检': 'chart', '缩星': 'star_reduce',
 }
 TOGGLES = ('画笔', '橡皮擦', '查看原图', '原图精细预览', '候选标记', '取样', '最终效果', '来源标注', '保留音频', '拖框保护')
 
@@ -17,6 +17,8 @@ def action_key(text):
     if plain in TOOLS:
         return TOOLS[plain]
     if plain == '设置':return 'gear'
+    if plain == '恢复自动值':return 'spark'
+    if plain == '恢复原始融合':return 'reset'
     for words, key in (
         (('切换工具',), 'grid'),
         (('工具箱', '← 流星工具'), 'home'), (('返回',), 'back'),
@@ -67,7 +69,11 @@ def icon_image(key, size=22, color='#eeeeee'):
         end=4 if up else 15
         line([(12,20 if up else 3),(12,end)])
         line([(8,end+(4 if up else -4)),(12,end),(16,end+(4 if up else -4))])
-    if key in ('search','search_all'):
+    if key == 'star_reduce':
+        line([(12,8),(13,11),(16,12),(13,13),(12,16),(11,13),(8,12),(11,11),(12,8)])
+        line([(3,3),(7,7),(7,3)]);line([(7,7),(3,7)])
+        line([(21,21),(17,17),(21,17)]);line([(17,17),(17,21)])
+    elif key in ('search','search_all'):
         oval((3,3,16,16));line([(15,15),(21,21)])
         if key=='search_all':line([(5,9),(14,9)]);line([(9.5,5),(9.5,14)])
     elif key in ('open','folder'):
@@ -181,6 +187,12 @@ def is_icon_action(widget):
 
 def hint_text(widget):
     text = action_text(widget)
+    if text == '恢复自动值':
+        return '恢复自动值 · 恢复自动优化参数'
+    if text == '恢复原始融合':
+        return '恢复原始融合 · 关闭自动优化，保留手动参数与位置'
+    if widget.instate(['disabled']) and getattr(widget, '_disabled_reason', ''):
+        return text + ' · ' + widget._disabled_reason
     names = {'+': '放大', '−': '缩小', '◀': '上一帧', '▶': '下一帧',
              '1:1': '原始大小', '100%': '原始大小', '取样': '在照片上选取中性参考点'}
     if text in names:

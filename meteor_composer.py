@@ -1,4 +1,5 @@
 from __future__ import annotations
+from meteor_blending import BLEND_MODES, blend_kind, blend_signal, remove_mask_stars
 
 import json
 import os
@@ -114,6 +115,8 @@ class Stroke:
     # meteor extracted from the untouched frame can still be moved onto the
     # aligned clean-base canvas without forcing its neighbours back to raw.
     source_mode: str = "aligned"
+    star_removal: float = 0.0
+    mask_choke: float = 0.0
 
 
 def alignment_tracks_to_strokes(
@@ -1248,7 +1251,8 @@ def transformed_object_crop(
     source: np.ndarray, stroke: Stroke, fast: bool = False, *, bounds_only: bool = False,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, tuple[int, int, int, int]] | None:
     height, width = source.shape[:2]
-    original = Stroke(stroke.points, stroke.width, stroke.feather)
+    contraction = 1.0 - float(np.clip(stroke.mask_choke, 0, 80))/100.0 if not stroke.erase else 1.0
+    original = Stroke(stroke.points, max(1, round(stroke.width*contraction)), round(stroke.feather*contraction))
     if not original.points:
         return None
     if bounds_only:
@@ -1264,20 +1268,25 @@ def transformed_object_crop(
             return None
         alpha, (x0, y0, x1, y1) = built
         patch = source[y0:y1, x0:x1]
-    points = np.asarray([(x * (width - 1), y * (height - 1)) for x, y in stroke.points], dtype=np.float32)
+        if stroke.star_removal > 0 and not stroke.erase:
+            local_points = [(x*(width-1)-x0, y*(height-1)-y0) for x,y in stroke.points]
+            patch = remove_mask_stars(patch, alpha, local_points, original.width, stroke.star_removal)
+    # Keep affine geometry in double precision so translating an ROI origin
+    # cannot change the resampling phase during local edits or undo/redo.
+    points = np.asarray([(x * (width - 1), y * (height - 1)) for x, y in stroke.points], dtype=np.float64)
     center = points.mean(axis=0)
-    direction = points[-1] - points[0] if len(points) > 1 else np.asarray([1.0, 0.0], np.float32)
+    direction = points[-1] - points[0] if len(points) > 1 else np.asarray([1.0, 0.0], np.float64)
     theta = float(np.arctan2(direction[1], direction[0]))
     def rot(angle: float) -> np.ndarray:
-        return np.asarray([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]], np.float32)
+        return np.asarray([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]], np.float64)
     axis = rot(theta)
     linear = rot(np.deg2rad(stroke.rotation)) @ axis @ np.diag(
         [max(0.05, stroke.length_scale), max(0.05, stroke.width_scale)]
     ) @ axis.T
-    destination_center = center + np.asarray([stroke.offset_x, stroke.offset_y], np.float32)
+    destination_center = center + np.asarray([stroke.offset_x, stroke.offset_y], np.float64)
     translation = destination_center - linear @ center
-    full_matrix = np.column_stack((linear, translation)).astype(np.float32)
-    corners = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float32)
+    full_matrix = np.column_stack((linear, translation)).astype(np.float64)
+    corners = np.asarray([[x0, y0], [x1, y0], [x1, y1], [x0, y1]], np.float64)
     warped_corners = corners @ linear.T + translation
     dx0 = max(0, int(np.floor(warped_corners[:, 0].min())) - 2)
     dy0 = max(0, int(np.floor(warped_corners[:, 1].min())) - 2)
@@ -1288,8 +1297,8 @@ def transformed_object_crop(
     if bounds_only:
         return None, None, None, (dx0, dy0, dx1, dy1)
     local = full_matrix.copy()
-    local[:, 2] += linear @ np.asarray([x0, y0], np.float32)
-    local[:, 2] -= np.asarray([dx0, dy0], np.float32)
+    local[:, 2] += linear @ np.asarray([x0, y0], np.float64)
+    local[:, 2] -= np.asarray([dx0, dy0], np.float64)
     warped_source = cv2.warpAffine(
         patch, local, (dx1 - dx0, dy1 - dy0),
         flags=cv2.INTER_LINEAR if fast else cv2.INTER_LANCZOS4,
@@ -1315,7 +1324,7 @@ def transformed_mask_crop(
     for stroke in strokes:
         if not stroke.points:
             continue
-        transformed = transformed_object_crop(source, stroke, fast=True)
+        transformed = transformed_object_crop(source, replace(stroke, star_removal=0), fast=True)
         if transformed is None:
             continue
         _patch, alpha, _validity, box = transformed
@@ -1505,9 +1514,11 @@ def dominant_meteor_signal_gate(
         area = int(stats[index, cv2.CC_STAT_AREA])
         if area < 3:
             continue
-        component = labels == index
-        peak = float(np.percentile(luminance[component], 90.0))
-        core_overlap = float(np.mean(alpha[component]))
+        left, top, width, height = map(int, stats[index, :4])
+        region = np.s_[top:top + height, left:left + width]
+        component = labels[region] == index
+        peak = float(np.percentile(luminance[region][component], 90.0))
+        core_overlap = float(np.mean(alpha[region][component]))
         cy, cx = np.nonzero(component)
         elongation = 1.0
         if len(cx) >= 5:
@@ -1685,11 +1696,13 @@ def compose_meteor_objects(
     meteor_brightness: float = 100.0,
     background_cleanup: float = 70.0,
     auto_optimize: bool = True,
+    *, background: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     clip_max = 65535.0 if base.dtype == np.uint16 or source.dtype == np.uint16 else 255.0
     # Keep the full frame in its native dtype. Only small meteor patches become
     # float32, avoiding a 3–4× full-frame allocation for every source layer.
     result = base.copy()
+    extraction_base = base if background is None else background
     height, width = base.shape[:2]
     union = np.zeros((height, width), np.float16)
     ordered_strokes = list(strokes)
@@ -1735,7 +1748,8 @@ def compose_meteor_objects(
         # Every meteor must be extracted against the same immutable clean base.
         # Using ``result`` here made local matching and brightness depend on the
         # hidden stroke order whenever two transformed masks overlapped.
-        base_patch = base[y0:y1, x0:x1]
+        object_blend = blend_mode if stroke.blend_mode_override is None else stroke.blend_mode_override
+        base_patch = (extraction_base if blend_kind(object_blend) != 'legacy' else base)[y0:y1, x0:x1]
         raw_source = source_patch.astype(np.float32)
         object_cleanup = (
             stroke.background_cleanup_override
@@ -1910,7 +1924,6 @@ def compose_meteor_objects(
         # residual is allowed into the clean base, preventing stars, trees and
         # projection seams inside a broad feather from appearing in the result.
         source_float = base_patch + scaled_positive
-        object_blend = blend_mode if stroke.blend_mode_override is None else stroke.blend_mode_override
         if object_blend in {"normal", "普通粘贴"}:
             candidate = source_float
         elif object_blend in {"residual", "亮度残差"}:
@@ -1935,16 +1948,19 @@ def compose_meteor_objects(
                     highlight = (signal_luminance > 0.0).astype(np.float32)
                 # Preserve the bright core while leaving the feathered edge and
                 # faint tail smooth. This compensates for alpha and resampling loss.
-                effective_alpha = alpha + (1.0 - alpha) * highlight
+                opacity_ceiling = float(np.clip(stroke.opacity, 0, 1)) if blend_kind(object_blend) != 'legacy' else 1.0
+                effective_alpha = alpha + (opacity_ceiling - alpha) * highlight
         a = effective_alpha[..., None]
         blended = base_patch * (1.0 - a) + candidate * a
-        # Only positive meteor signal reaches this point. Merge independent
-        # objects with a maximum so changing list/source order cannot alter the
-        # final pixels or double an overlap into a clipped white patch.
+        # New modes accumulate isolated signal with the chosen blend formula;
+        # existing projects retain the original maximum-lighten merge.
         destination = result[y0:y1, x0:x1]
-        result[y0:y1, x0:x1] = np.maximum(
-            destination, np.clip(blended, 0, clip_max).astype(base.dtype)
-        )
+        if blend_kind(object_blend) != 'legacy':
+            result[y0:y1, x0:x1] = blend_signal(destination, scaled_positive, effective_alpha, clip_max, object_blend).astype(base.dtype)
+        else:
+            result[y0:y1, x0:x1] = np.maximum(
+                destination, np.clip(blended, 0, clip_max).astype(base.dtype)
+            )
         union[y0:y1, x0:x1] = np.maximum(
             union[y0:y1, x0:x1], alpha.astype(np.float16, copy=False)
         )
@@ -1956,7 +1972,7 @@ def compose_meteor_sources(
     original_source: np.ndarray,
     base: np.ndarray,
     strokes: Iterable[Stroke],
-    *settings,
+    *settings, background: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Composite one photograph whose meteors may use different pixel sources.
 
@@ -1969,14 +1985,16 @@ def compose_meteor_sources(
     result = base.copy()
     union = np.zeros(base.shape[:2], dtype=np.float16)
     sources = {"aligned": aligned_source, "original": original_source}
+    global_mode = settings[4] if len(settings) > 4 else 'natural'
+    accumulates = any(blend_kind(global_mode if s.blend_mode_override is None else s.blend_mode_override) != 'legacy' for s in ordered if not s.erase)
     for mode in ("aligned", "original"):
         selected = [item for item in ordered if normalized_source_mode(item) == mode]
         if not any(not item.erase and item.points for item in selected):
             continue
         source_result, source_mask = compose_meteor_objects(
-            sources[mode], base, selected, *settings
+            sources[mode], result if accumulates else base, selected, *settings, background=base if background is None else background
         )
-        result = np.maximum(result, source_result)
+        result = source_result if accumulates else np.maximum(result, source_result)
         union = np.maximum(union, source_mask)
     return result, union
 
@@ -2027,8 +2045,10 @@ class MeteorComposer(tk.Tk):
         self.selected_preserve = tk.BooleanVar(value=True)
         self.selected_match = tk.BooleanVar(value=False)
         self.selected_blend = tk.StringVar(value="自然融合")
+        self.selected_star_removal = tk.IntVar(value=0)
+        self.selected_mask_choke = tk.IntVar(value=0)
         self.selected_feather = tk.IntVar(value=10)
-        self.selected_source_mode = tk.StringVar(value="自动对齐素材")
+        self.selected_source_mode = tk.StringVar(value="对齐图")
         self.loading_selected_adjustments = False
         self.candidate_threshold = tk.IntVar(value=55)
         self.candidate_summary = tk.StringVar(value="当前图尚未分析候选")
@@ -2041,8 +2061,8 @@ class MeteorComposer(tk.Tk):
         # empty source canvas that requires the user to discover view button 3.
         self.view_mode = tk.StringVar(value="blend")
         self.source_state_label = tk.StringVar(value="当前素材：自动对齐图")
-        self.blend_preview_label = tk.StringVar(value="3 融合预览")
-        self.source_preview_label = tk.StringVar(value="4 来源标注")
+        self.blend_preview_label = tk.StringVar(value="显示融合")
+        self.source_preview_label = tk.StringVar(value="显示来源")
         self.show_mask = tk.BooleanVar(value=True)
         self.h_mask_held = False
         self.status = tk.StringVar(value="")
@@ -2206,6 +2226,7 @@ class MeteorComposer(tk.Tk):
         self._build_ui()
         from action_icons import iconize_actions
         iconize_actions(self)
+        self.composite_workflow.refresh()
         self._bind_shortcuts()
         self._setup_autosave()
         self.after(150, self._poll_queue)
@@ -2240,6 +2261,14 @@ class MeteorComposer(tk.Tk):
         self.workspace_title_label.pack(side="left", padx=12)
         self.paths_toggle_button = ttk.Button(header, text="收起 1 流星合成功能", command=self._toggle_paths_panel)
         self.paths_toggle_button.pack(side="right", padx=(0, 6))
+        from composite_workflow import FileActions
+        self.file_actions = FileActions(header)
+        self.file_actions.pack(side="right", padx=8)
+        self.load_project_button = self.file_actions.add("载入项目", self.load_project)
+        self.save_project_button = self.file_actions.add("保存项目", self.save_project)
+        self.export_button = self.file_actions.add("导出合成结果", self.export)
+        self.open_output_button = self.file_actions.add("打开导出文件夹", self._open_output_folder)
+        self.file_actions.add("快捷键 F1", self.show_shortcuts)
 
         paths = ttk.LabelFrame(root, text="1  流星合成功能", padding=8)
         paths.pack(fill="x")
@@ -2274,32 +2303,20 @@ class MeteorComposer(tk.Tk):
         self.edit_inspector = inspector
         inspector.pack(side="right", fill="y", padx=(10, 0))
         inspector.pack_propagate(False)
+        from composite_workflow import CompositeWorkflow
+        self.composite_workflow = CompositeWorkflow(inspector, self)
+        self.composite_workflow.pack(fill="x")
         body = ttk.Panedwindow(root, orient="horizontal")
         body.pack(fill="both", expand=True, pady=(10, 6))
 
         left = ttk.Frame(body, width=310)
         body.add(left, weight=0)
-        ttk.Label(left, text="TIFF 素材").pack(anchor="w")
-        self.tree = ttk.Treeview(left, columns=("status",), show="tree headings", selectmode="browse")
-        self.tree.heading("#0", text="文件")
-        self.tree.heading("status", text="蒙版")
-        self.tree.column("#0", width=210)
-        self.tree.column("status", width=70, anchor="center")
-        self.tree.pack(fill="both", expand=True, pady=4)
-        self.tree.bind("<ButtonPress-1>", self._tree_pointer_press)
-        self.tree.bind("<ButtonRelease-1>", self._tree_pointer_release)
+        from composite_material_list import MaterialList
+        self.material_list = MaterialList(left, self)
+        self.tree = self.material_list.tree
+        self.tree.bind("<ButtonPress-1>", self._tree_pointer_press, add=True)
+        self.tree.bind("<ButtonRelease-1>", self._tree_pointer_release, add=True)
         self.tree.bind("<<TreeviewSelect>>", self._tree_selection_changed)
-        source_state = ttk.Frame(inspector)
-        source_state.pack(fill="x", pady=(4, 0))
-        self.aligned_source_button = ttk.Button(
-            source_state, text="自动对齐图", command=lambda: self._set_current_source_state("aligned")
-        )
-        self.aligned_source_button.pack(side="left", fill="x", expand=True)
-        self.original_source_button = ttk.Button(
-            source_state, text="原始状态图", command=lambda: self._set_current_source_state("original")
-        )
-        self.original_source_button.pack(side="left", fill="x", expand=True, padx=(4, 0))
-        ttk.Label(inspector, textvariable=self.source_state_label).pack(anchor="w", pady=(2, 0))
 
         center = ttk.Frame(body)
         body.add(center, weight=1)
@@ -2363,8 +2380,8 @@ class MeteorComposer(tk.Tk):
         self.object_menu.add_command(label="一键恢复原始位置／形态", command=self._reset_selected_object)
         self.object_menu.add_command(label="精确变换参数…", command=self._transform_selected_object)
         self.object_menu.add_separator()
-        self.object_menu.add_command(label="使用自动对齐素材", command=lambda: self._set_selected_source_mode("aligned"))
-        self.object_menu.add_command(label="使用原始素材", command=lambda: self._set_selected_source_mode("original"))
+        self.object_menu.add_command(label="使用对齐图", command=lambda: self._set_selected_source_mode("aligned"))
+        self.object_menu.add_command(label="使用原始图", command=lambda: self._set_selected_source_mode("original"))
 
         self.control_notebook = ttk.Notebook(inspector)
         self.control_notebook.pack(fill="both", expand=True, pady=(0, 5))
@@ -2429,9 +2446,6 @@ class MeteorComposer(tk.Tk):
             mask_tools, text="自动检测全部", command=self.auto_detect_all
         )
         self.auto_detect_button.grid(row=2, column=2, pady=(7, 0), padx=3, sticky="ew")
-        ttk.Button(mask_tools, text="保存项目", command=self.save_project).grid(row=2, column=3, pady=(7, 0), padx=3, sticky="ew")
-        self.load_project_button = ttk.Button(mask_tools, text="载入项目", command=self.load_project)
-        self.load_project_button.grid(row=2, column=4, pady=(7, 0), padx=3, sticky="ew")
         for column in (4, 7, 10):
             mask_tools.columnconfigure(column, weight=1)
 
@@ -2445,7 +2459,7 @@ class MeteorComposer(tk.Tk):
         exposure_policy.pack(side="left")
         exposure_policy.bind("<<ComboboxSelected>>", self._match_exposure_policy_changed)
         ttk.Checkbutton(scope_row, text="导出16位TIFF", variable=self.export_tiff).pack(side="right")
-        blend_combo = ttk.Combobox(scope_row, textvariable=self.blend_mode, state="readonly", width=12, values=("自然融合", "亮度残差", "普通粘贴"))
+        blend_combo = ttk.Combobox(scope_row, textvariable=self.blend_mode, state="readonly", width=12, values=BLEND_MODES)
         blend_combo.pack(side="right", padx=(4, 12))
         blend_combo.bind("<<ComboboxSelected>>", lambda _event: self._render_preview())
         ttk.Label(scope_row, text="合成方式").pack(side="right")
@@ -2502,7 +2516,7 @@ class MeteorComposer(tk.Tk):
         self.reset_selected_button.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(5, 0), padx=(0, 8))
         source_mode = ttk.Combobox(
             selected_tools, textvariable=self.selected_source_mode, state="readonly", width=13,
-            values=("自动对齐素材", "原始素材"),
+            values=("对齐图", "原始图"),
         )
         source_mode.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0), padx=(0, 8))
         source_mode.bind("<<ComboboxSelected>>", self._selected_source_mode_changed)
@@ -2517,10 +2531,17 @@ class MeteorComposer(tk.Tk):
             value = ttk.Label(selected_tools, textvariable=variable, width=4)
             value.grid(row=0, column=column + 2)
             self.selected_object_controls.extend((scale, value))
+            if variable is self.selected_star_removal or variable is self.selected_mask_choke:
+                from action_icons import ActionHint
+                hint = ActionHint(scale, "去除轨迹两侧的点状星点；与流星亮核重叠的星点会保留。" if variable is self.selected_star_removal else "按比例收窄蒙版和羽化边缘；过高可能切掉弱尾迹。")
+                scale.bind('<Enter>', lambda event, h=hint: h.delay(), add=True)
+                scale.bind('<ButtonPress-1>', lambda event, h=hint: h.show(), add=True)
 
         selected_scale(2, "亮度%", self.selected_brightness, 50, 250)
         selected_scale(5, "背景净化", self.selected_cleanup, 0, 100)
         selected_scale(8, "饱和度%", self.selected_saturation, 0, 200)
+        selected_scale(12, "蒙版内去星%", self.selected_star_removal, 0, 100)
+        selected_scale(15, "蒙版收缩%", self.selected_mask_choke, 0, 80)
         preserve = ttk.Checkbutton(
             selected_tools, text="保持亮部", variable=self.selected_preserve,
             state="disabled", command=self._selected_adjustment_changed,
@@ -2534,7 +2555,7 @@ class MeteorComposer(tk.Tk):
         ttk.Label(selected_tools, text="混合方式").grid(row=1, column=7, sticky="e", pady=(5, 0))
         selected_blend = ttk.Combobox(
             selected_tools, textvariable=self.selected_blend, state="disabled", width=11,
-            values=("自然融合", "亮度残差", "普通粘贴"),
+            values=BLEND_MODES,
         )
         selected_blend.grid(row=1, column=8, sticky="w", padx=4, pady=(5, 0))
         selected_blend.bind("<<ComboboxSelected>>", self._selected_adjustment_changed)
@@ -2565,13 +2586,6 @@ class MeteorComposer(tk.Tk):
         ttk.Label(bottom, textvariable=self.autosave_status).pack(side="left", padx=8)
         self.progress = ttk.Progressbar(bottom, mode="determinate", length=220)
         self.progress.pack(side="left", padx=8)
-        export_actions = ttk.Frame(inspector)
-        export_actions.pack(fill="x", before=self.control_notebook, pady=5)
-        self.export_button = ttk.Button(export_actions, text="导出合成结果", command=self.export)
-        self.export_button.pack(side="left")
-        ttk.Button(export_actions, text="打开导出文件夹", command=self._open_output_folder).pack(side="right", padx=(0, 6))
-        ttk.Button(export_actions, text="快捷键 F1", command=self.show_shortcuts).pack(side="right", padx=(0, 6))
-
         from workspace_layout import scroll_controls
         for tab in (mask_tools, blend_tools, selected_tools):
             scroll_controls(tab, 330)
@@ -2628,6 +2642,10 @@ class MeteorComposer(tk.Tk):
 
     def open_lab_trails(self):
         self._open_laboratory("trails")
+
+    def open_star_reduction_workspace(self):
+        from star_reduction_launcher import open_star_reduction
+        open_star_reduction(self)
 
     def open_white_balance_workspace(self):
         from white_balance_workspace import WhiteBalanceWindow
@@ -2807,6 +2825,8 @@ class MeteorComposer(tk.Tk):
             inherited_tracks += self._import_alignment_tracks(
                 str(output_path), output_path, inherited, source_mode,
             )
+        if hasattr(self, "material_list"):
+            self.material_list.reset()
         self.tree.delete(*self.tree.get_children())
         status_by_path = {str(path): status for path, status in loaded_items}
         for index, path in enumerate(exported):
@@ -2814,6 +2834,8 @@ class MeteorComposer(tk.Tk):
             status = status_by_path.get(str(path), "")
             prefix = "[原始状态] " if "原始状态" in status else ("[创意] " if status == "创意放置" else "")
             self.tree.insert("", "end", iid=str(index), text=prefix + path.name, values=(count or "—",))
+        if hasattr(self, "material_list"):
+            self.material_list.refresh()
         unresolved = sum(item.status == "需处理" for item in result.items)
         review = sum("需复查" in item.status for item in result.items)
         creative = sum(item.status == "创意放置" for item in result.items)
@@ -2988,6 +3010,15 @@ class MeteorComposer(tk.Tk):
     def _select_relative(self, delta: int) -> None:
         if not self.files:
             return
+        if hasattr(self, "material_list"):
+            rows = list(self.tree.get_children())
+            if not rows:
+                return
+            current = str(self.files.index(self.current_path)) if self.current_path in self.files else None
+            index = rows.index(current) if current in rows else (-1 if delta > 0 else len(rows))
+            iid = rows[max(0, min(len(rows)-1, index+delta))]
+            MeteorComposer._select_tree_item(self, iid, load=True, focus=True)
+            return
         if self.current_path in self.files:
             index = self.files.index(self.current_path)
         else:
@@ -3125,9 +3156,8 @@ F1：显示本快捷键表""")
         return self.output_mode.get() == "combined"
 
     def _update_blend_preview_label(self) -> None:
-        shared = self._uses_shared_base()
-        self.blend_preview_label.set("总融合" if shared else "当前融合")
-        self.source_preview_label.set("总来源" if shared else "当前来源")
+        self.blend_preview_label.set("显示融合")
+        self.source_preview_label.set("显示来源")
 
     def _base_selection_signature(self) -> str:
         """Identify the clean-base selection represented by the active pair table."""
@@ -3295,11 +3325,15 @@ F1：显示本快捷键表""")
             MeteorComposer._restrict_project_to_active_keys(self, pairs)
             self.pairing_signature = self._base_selection_signature()
             self._update_blend_preview_label()
+            if hasattr(self, "material_list"):
+                self.material_list.reset()
             self.tree.delete(*self.tree.get_children())
             for index, path in enumerate(valid):
                 count = len(self.strokes.get(str(path), []))
                 prefix = "[原始状态] " if str(path) in self.use_original_sources else ""
                 self.tree.insert("", "end", iid=str(index), text=prefix + path.name, values=(count or "—",))
+            if hasattr(self, "material_list"):
+                self.material_list.refresh()
             base_label = "单张共享底图" if combined else f"同名底图 {len(base_files)} 张"
             message = f"TIFF {len(source_files)} 张，{base_label}；成功配对 {len(valid)} 对"
             if missing:
@@ -3517,6 +3551,8 @@ F1：显示本快捷键表""")
             return
         path = self.files[int(selection[0])]
         key = str(path)
+        if (key in self.use_original_sources) == (mode == "original"):
+            return
         if mode == "original":
             original = self.original_sources.get(key)
             if original is None or not original.is_file():
@@ -3525,9 +3561,9 @@ F1：显示本快捷键表""")
             self.use_original_sources.add(key)
         else:
             self.use_original_sources.discard(key)
-        self._update_source_state_ui(path)
         self._schedule_autosave()
         self.load_selected()
+        self._update_source_state_ui(path)
 
     def _update_source_state_ui(self, path: Path | None) -> None:
         if path is None:
@@ -3538,6 +3574,8 @@ F1：显示本快捷键表""")
         self.source_state_label.set(
             "当前素材：原始状态图（未对齐）" if original_active else "当前素材：自动对齐图"
         )
+        if hasattr(self, "material_list"):
+            self.material_list.refresh(key)
         if hasattr(self, "original_source_button"):
             self.original_source_button.configure(state="normal" if original_available else "disabled")
             self.aligned_source_button.configure(state="normal")
@@ -4306,7 +4344,7 @@ F1：显示本快捷键表""")
             return
         base_path = next(iter(self.pairs.values()))
         self.shared_base_loading_signature = signature
-        self.status.set("正在准备总融合预览…")
+        self.status.set("正在准备融合预览…")
         self._run_worker(self._load_shared_base_preview_worker, base_path, signature)
 
     def _load_shared_base_preview_worker(
@@ -4334,7 +4372,7 @@ F1：显示本快捷键表""")
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness,
                 (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale)))),
-                source_mode=item.source_mode,
+                source_mode=item.source_mode, star_removal=item.star_removal, mask_choke=item.mask_choke,
             ))
         live_stroke = self.live_erase_stroke
         if live_stroke is not None:
@@ -4567,6 +4605,7 @@ F1：显示本快捷键表""")
                 float(adjustment.get("meteor_brightness", 100)),
                 float(adjustment.get("background_cleanup", 70)),
                 bool(adjustment.get("auto_optimize", True)),
+                background=clean_base[y0:y1, x0:x1],
             )
             if token.cancelled or generation != self.exact_preview_generation:
                 return "exact_preview_cancelled", signature
@@ -4647,7 +4686,7 @@ F1：显示本快捷键表""")
                 item.match_exposure_override, item.blend_mode_override,
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness, item.auto_feather,
-                source_mode=item.source_mode,
+                source_mode=item.source_mode, star_removal=item.star_removal, mask_choke=item.mask_choke,
             ) for item in values]
             for key, values in self.strokes.items()
             if key in self.pairs and values
@@ -4655,7 +4694,7 @@ F1：显示本快捷键表""")
         self.global_preview_loading_signature = signature
         self.global_preview_generation = getattr(self, "global_preview_generation", 0) + 1
         generation = self.global_preview_generation
-        self.status.set(f"正在生成总融合预览：合成 {len(marked)} 张已标记图片…")
+        self.status.set(f"正在生成融合预览：合成 {len(marked)} 张已标记图片…")
         self._run_scheduled_worker(
             "global_preview_task", self._global_preview_worker_scheduled,
             signature, generation, self.preview_base.copy(), marked,
@@ -4734,7 +4773,7 @@ F1：显示本快捷键表""")
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness,
                 (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale_to_preview)))),
-                source_mode=item.source_mode,
+                source_mode=item.source_mode, star_removal=item.star_removal, mask_choke=item.mask_choke,
             ) for item in strokes]
             adjustment = {**adjustment_defaults, **adjustments.get(str(source_path), {})}
             result, mask = compose_meteor_sources(
@@ -4745,6 +4784,7 @@ F1：显示本快捷键表""")
                 float(adjustment.get("meteor_brightness", 100)),
                 float(adjustment.get("background_cleanup", 70)),
                 bool(adjustment.get("auto_optimize", True)),
+                background=base_preview,
             )
             if cancellation_token is not None and cancellation_token.cancelled:
                 return "global_preview_cancelled", signature
@@ -4767,7 +4807,7 @@ F1：显示本快捷键表""")
                 last_partial = now
             self.work_queue.put((
                 "progress", index / total * 100,
-                f"正在生成总融合预览 {index}/{len(marked)}：{source_path.name}",
+                f"正在生成融合预览 {index}/{len(marked)}：{source_path.name}",
             ))
         labeled, _records = annotate_meteor_sources(result, preview_annotations)
         return "global_preview", signature, result, labeled, included
@@ -4793,7 +4833,7 @@ F1：显示本快捷键表""")
             item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
             item.auto_cleanup, item.auto_brightness,
             (None if item.auto_feather is None else max(1, int(round(item.auto_feather * scale_to_preview)))),
-            source_mode=item.source_mode,
+            source_mode=item.source_mode, star_removal=item.star_removal, mask_choke=item.mask_choke,
         ) for item in self.strokes.get(str(self.current_path), [])]
         preview_mask_strokes = scaled_strokes
         live_stroke = self.live_erase_stroke
@@ -5670,7 +5710,7 @@ F1：显示本快捷键表""")
                 self.selected_override_enabled.set(False)
                 self._set_selected_controls_state(False)
                 self.reset_selected_button.configure(state="disabled")
-                self.selected_source_mode.set("自动对齐素材")
+                self.selected_source_mode.set("对齐图")
                 return
             key, index = self.selected_object
             image_values = {**self.adjustment_defaults, **self.image_adjustments.get(key, {})}
@@ -5678,16 +5718,16 @@ F1：显示本快捷键表""")
                 stroke.brightness_override, stroke.background_cleanup_override,
                 stroke.saturation_override, stroke.preserve_brightness_override,
                 stroke.match_exposure_override, stroke.blend_mode_override,
-            ))
+            )) or stroke.star_removal > 0 or stroke.mask_choke > 0
             ordinal = 1 + sum(
                 1 for item in self.strokes.get(key, [])[:index]
                 if not item.erase and item.points
             )
             transform_suffix = " · 已人工变换" if stroke_is_transformed(stroke) else ""
-            source_suffix = " · 原始素材" if normalized_source_mode(stroke) == "original" else " · 自动对齐素材"
+            source_suffix = " · 原始图" if normalized_source_mode(stroke) == "original" else " · 对齐图"
             self.selected_object_summary.set(f"{Path(key).stem} · 流星 {ordinal}{source_suffix}{transform_suffix}")
             self.selected_source_mode.set(
-                "原始素材" if normalized_source_mode(stroke) == "original" else "自动对齐素材"
+                "原始图" if normalized_source_mode(stroke) == "original" else "对齐图"
             )
             if not stroke.auto_blend_enabled:
                 self.selected_auto_summary.set("自动参数：已关闭（使用原始/手动融合）")
@@ -5726,6 +5766,8 @@ F1：显示本快捷键表""")
                 self.blend_mode.get() if stroke.blend_mode_override is None else stroke.blend_mode_override
             )
             self.selected_feather.set(int(stroke.feather))
+            self.selected_star_removal.set(round(stroke.star_removal))
+            self.selected_mask_choke.set(round(stroke.mask_choke))
             self._set_selected_controls_state(True, independent)
         finally:
             self.loading_selected_adjustments = False
@@ -5733,7 +5775,7 @@ F1：显示本快捷键表""")
     def _selected_source_mode_changed(self, _event=None) -> None:
         if self.loading_selected_adjustments:
             return
-        mode = "original" if self.selected_source_mode.get() == "原始素材" else "aligned"
+        mode = "original" if self.selected_source_mode.get() == "原始图" else "aligned"
         self._set_selected_source_mode(mode)
 
     def _set_selected_source_mode(self, mode: str) -> None:
@@ -5743,9 +5785,9 @@ F1：显示本快捷键表""")
         key, index = self.selected_object
         mode = "original" if mode == "original" else "aligned"
         if mode == "original" and key not in self.original_sources:
-            self.status.set("这张图片没有独立的原始素材；当前图层本身就是原始状态")
+            self.status.set("这张图片没有独立的原始图；当前图层本身就是原始状态")
             self.loading_selected_adjustments = True
-            self.selected_source_mode.set("自动对齐素材")
+            self.selected_source_mode.set("对齐图")
             self.loading_selected_adjustments = False
             return
         if normalized_source_mode(stroke) == mode:
@@ -5765,7 +5807,7 @@ F1：显示本快捷键表""")
         self._update_tree_status_for_key(key)
         self._load_selected_object_adjustments()
         self._schedule_autosave()
-        label = "原始素材" if mode == "original" else "自动对齐素材"
+        label = "原始图" if mode == "original" else "对齐图"
         self.status.set(f"当前流星已切换为{label}；其他流星保持原来的来源不变")
 
     def _selected_override_changed(self, *_args) -> None:
@@ -5783,6 +5825,8 @@ F1：显示本快捷键表""")
             stroke.preserve_brightness_override = bool(self.selected_preserve.get())
             stroke.match_exposure_override = bool(self.selected_match.get())
             stroke.blend_mode_override = self.selected_blend.get()
+            stroke.star_removal = float(self.selected_star_removal.get())
+            stroke.mask_choke = float(self.selected_mask_choke.get())
         else:
             stroke.brightness_override = None
             stroke.background_cleanup_override = None
@@ -5790,6 +5834,8 @@ F1：显示本快捷键表""")
             stroke.preserve_brightness_override = None
             stroke.match_exposure_override = None
             stroke.blend_mode_override = None
+            stroke.star_removal = 0.0
+            stroke.mask_choke = 0.0
         key, index = self.selected_object
         self._sync_matching_candidate(key, stroke)
         after = replace(stroke, points=stroke.points.copy())
@@ -5821,11 +5867,13 @@ F1：显示本快捷键表""")
             float(self.selected_saturation.get()), bool(self.selected_preserve.get()),
             bool(self.selected_match.get()), self.selected_blend.get(),
             int(round(self.selected_feather.get())),
+            float(self.selected_star_removal.get()), float(self.selected_mask_choke.get()),
         )
         current = (
             stroke.brightness_override, stroke.background_cleanup_override,
             stroke.saturation_override, stroke.preserve_brightness_override,
             stroke.match_exposure_override, stroke.blend_mode_override, stroke.feather,
+            stroke.star_removal, stroke.mask_choke,
         )
         if current == desired:
             return
@@ -5834,6 +5882,7 @@ F1：显示本快捷键表""")
             stroke.brightness_override, stroke.background_cleanup_override,
             stroke.saturation_override, stroke.preserve_brightness_override,
             stroke.match_exposure_override, stroke.blend_mode_override, stroke.feather,
+            stroke.star_removal, stroke.mask_choke,
         ) = desired
         key, index = self.selected_object
         self._sync_matching_candidate(key, stroke)
@@ -5966,6 +6015,13 @@ F1：显示本快捷键表""")
         self.status.set("正在移动流星…")
         return "break"
 
+    def _object_canvas_width(self, key: str) -> int:
+        # Stroke geometry belongs to the base canvas, even when pixels come
+        # from a smaller original photograph or a non-selected file row.
+        if self._uses_shared_base() or (self.current_path is not None and key == str(self.current_path)):
+            return self.current_dims[0]
+        return image_info(self.pairs.get(key, Path(key)))[0]
+
     def _preview_clone(self, stroke: Stroke, full_width: int) -> Stroke:
         scale = self.preview_base.shape[1] / max(1, full_width)
         return Stroke(
@@ -5979,7 +6035,7 @@ F1：显示本快捷键表""")
             stroke.auto_blend_enabled, stroke.auto_strength, stroke.auto_black_point,
             stroke.auto_cleanup, stroke.auto_brightness,
             (None if stroke.auto_feather is None else max(1, int(round(stroke.auto_feather * scale)))),
-            source_mode=stroke.source_mode,
+            source_mode=stroke.source_mode, star_removal=stroke.star_removal, mask_choke=stroke.mask_choke,
         )
 
     def _object_composite_settings(self, key: str) -> tuple:
@@ -6028,9 +6084,7 @@ F1：显示本快捷键表""")
                 preview_size = (self.preview_base.shape[1], self.preview_base.shape[0])
                 aligned_path = Path(key)
                 original_path = self.original_sources.get(key, aligned_path)
-                full_width = image_info(
-                    original_path if selected_mode == "original" else aligned_path
-                )[0]
+                full_width = self._object_canvas_width(key)
                 aligned_preview = self._cached_layer_preview(
                     aligned_path, preview_size[0], preview_size[1]
                 )
@@ -6056,7 +6110,7 @@ F1：显示本快捷键表""")
                 self._preview_clone(original, full_width),
                 bool(self.adjustment_defaults.get("auto_optimize", True)),
             )
-            old_crop = transformed_object_crop(self.preview_base, old_scaled, fast=True)
+            old_crop = transformed_object_crop(self.preview_base, replace(old_scaled, star_removal=0), fast=True)
             if old_crop is not None:
                 _old_patch, old_alpha, _validity, old_box = old_crop
                 ox0, oy0, ox1, oy1 = old_box
@@ -6101,7 +6155,7 @@ F1：显示本快捷键表""")
         transformed_source = transformed_object_crop(
             self.object_drag_live_source, scaled, fast=True
         )
-        transformed_base = transformed_object_crop(self.preview_base, scaled, fast=True)
+        transformed_base = transformed_object_crop(self.preview_base, replace(scaled, star_removal=0), fast=True)
         if transformed_source is None or transformed_base is None:
             old_box = self.object_drag_live_background_box
             old_patch = self.object_drag_live_background_patch
@@ -6151,9 +6205,9 @@ F1：显示本快捷键表""")
             source_patch.astype(np.float32) - base_patch.astype(np.float32), 0.0
         )
         live_alpha = np.clip(alpha * validity, 0.0, 1.0)[..., None]
-        shown[:] = np.clip(
-            destination + positive * live_alpha, 0, 255
-        ).astype(np.uint8)
+        live_mode = stroke.blend_mode_override or self.blend_mode.get()
+        shown[:] = (blend_signal(destination, positive, live_alpha[..., 0], 255., live_mode)
+                    if blend_kind(live_mode) != 'legacy' else np.clip(destination + positive * live_alpha, 0, 255)).astype(np.uint8)
         self.object_drag_live_box = box
         self.object_drag_live_last_patch = shown
         self.object_drag_live_last_patch_box = box
@@ -6272,6 +6326,11 @@ F1：显示本快捷键表""")
             cached = self.exact_preview_full_rgb if self.exact_preview_full_rgb is not None else self.preview_rgb
         if cached is None or cached.shape[:2] != self.preview_base.shape[:2]:
             return None
+        if blend_kind(self.blend_mode.get()) != 'legacy' or any(
+            blend_kind(item.blend_mode_override) != 'legacy'
+            for values in self.strokes.values() for item in values
+        ) or blend_kind(before.blend_mode_override) != 'legacy':
+            return None
         try:
             preview_h, preview_w = self.preview_base.shape[:2]
             if self.current_path is not None and key == str(self.current_path):
@@ -6281,7 +6340,7 @@ F1：显示本快捷键表""")
             else:
                 aligned_path = Path(key)
                 original_path = self.original_sources.get(key, aligned_path)
-                full_width = image_info(self._effective_source_path(aligned_path))[0]
+                full_width = self._object_canvas_width(key)
                 aligned = self._cached_layer_preview(aligned_path, preview_w, preview_h)
                 original = self._cached_layer_preview(original_path, preview_w, preview_h)
                 # Selecting an old layer can outlive the rolling preview cache.
@@ -6378,7 +6437,7 @@ F1：显示本快捷键表""")
             if self.current_path is not None and key == str(self.current_path):
                 full_width = self.current_dims[0]
             else:
-                full_width = image_info(self._effective_source_path(Path(key)))[0]
+                full_width = self._object_canvas_width(key)
             auto_enabled = bool(self.adjustment_defaults.get("auto_optimize", True))
             scaled_before = auto_optimized_stroke(
                 self._preview_clone(before, full_width), auto_enabled
@@ -6420,7 +6479,7 @@ F1：显示本快捷键表""")
                     other_width = (
                         self.current_dims[0]
                         if self.current_path is not None and other_key == str(self.current_path)
-                        else image_info(self._effective_source_path(Path(other_key)))[0]
+                        else self._object_canvas_width(other_key)
                     )
                 except Exception:
                     return None
@@ -6597,6 +6656,7 @@ F1：显示本快捷键表""")
                     original_preview[y0:y1, x0:x1],
                     replacement, cropped_relevant,
                     *self._object_composite_settings(other_key),
+                    background=self.preview_base[y0:y1, x0:x1],
                 )
             image[y0:y1, x0:x1] = replacement
             return image
@@ -6661,7 +6721,7 @@ F1：显示本快捷键表""")
             self._record_object_transform(before)
             if incremental is not None:
                 self._commit_incremental_global_preview(
-                    incremental, validate=False, dirty_box=self.last_incremental_box
+                    incremental, validate=False, realtime=True, dirty_box=self.last_incremental_box
                 )
                 self.status.set("流星局部已精确更新；未重绘画面其他区域")
             else:
@@ -6725,6 +6785,8 @@ F1：显示本快捷键表""")
         candidate.preserve_brightness_override = stroke.preserve_brightness_override
         candidate.match_exposure_override = stroke.match_exposure_override
         candidate.blend_mode_override = stroke.blend_mode_override
+        candidate.star_removal = stroke.star_removal
+        candidate.mask_choke = stroke.mask_choke
         candidate.auto_blend_enabled = stroke.auto_blend_enabled
         candidate.auto_strength = stroke.auto_strength
         candidate.auto_black_point = stroke.auto_black_point
@@ -6764,7 +6826,7 @@ F1：显示本快捷键表""")
                 if self.current_path is not None and key == str(self.current_path):
                     full_width = self.current_dims[0]
                 else:
-                    full_width = image_info(self._effective_source_path(Path(key)))[0]
+                    full_width = self._object_canvas_width(key)
             except Exception:
                 full_width = self.current_dims[0]
             scaled = [self._preview_clone(item, full_width) for item in values]
@@ -7406,7 +7468,7 @@ F1：显示本快捷键表""")
         self._render_preview()
         self._load_selected_object_adjustments()
         self._draw_selected_object_overlay()
-        scope = "总融合预览" if self._uses_shared_base() else "当前图融合预览"
+        scope = "融合预览" if self._uses_shared_base() else "当前图融合预览"
         self.status.set(
             f"已进入{scope}并选中流星：拖动主体移动，拖动手柄旋转或拉伸；"
             "右键可输入精确数值"
@@ -8064,6 +8126,8 @@ F1：显示本快捷键表""")
                     if meteors and original else (str(len(meteors)) if meteors else "—")
                 )
                 self.tree.set(str(index), "status", detail)
+        if hasattr(self, "material_list"):
+            self.material_list.refresh(key)
 
     def _setup_autosave(self) -> None:
         variables = (
@@ -8238,6 +8302,8 @@ F1：显示本快捷键表""")
                     preserve_brightness_override=item.get("preserve_brightness_override"),
                     match_exposure_override=item.get("match_exposure_override"),
                     blend_mode_override=item.get("blend_mode_override"),
+                    star_removal=float(item.get("star_removal", 0)),
+                    mask_choke=float(item.get("mask_choke", 0)),
                     auto_blend_enabled=bool(item.get("auto_blend_enabled", True)),
                     auto_strength=str(item.get("auto_strength", "标准")),
                     auto_black_point=(
@@ -8277,6 +8343,8 @@ F1：显示本快捷键表""")
             self.autosave_suspended = False
 
     def _schedule_autosave(self) -> None:
+        if hasattr(self, "composite_workflow"):
+            self.composite_workflow.refresh()
         if self.autosave_suspended:
             return
         if self.autosave_after_id is not None:
@@ -8350,13 +8418,17 @@ F1：显示本快捷键表""")
                 item.match_exposure_override, item.blend_mode_override,
                 item.auto_blend_enabled, item.auto_strength, item.auto_black_point,
                 item.auto_cleanup, item.auto_brightness, item.auto_feather,
-                source_mode=item.source_mode,
+                source_mode=item.source_mode, star_removal=item.star_removal, mask_choke=item.mask_choke,
             ) for item in value]
             for key, value in self.strokes.items()
             if key in self.pairs and value
         }
+        from composite_workflow import usable_mark
+        marked = {key: marks for key, marks in marked.items() if any(usable_mark(mark) for mark in marks)}
         if not marked:
-            messagebox.showwarning(APP_NAME, "还没有检测或标记任何流星蒙版")
+            self.control_notebook.select(self.mask_tools_tab)
+            self.composite_workflow.refresh()
+            self.status.set("请先检测或画出流星蒙版")
             return
         source = Path(self.source_dir.get())
         base_dir = Path(self.base_dir.get())
@@ -8533,6 +8605,7 @@ F1：显示本快捷键表""")
                     float(adjustment.get("meteor_brightness", 100)),
                     float(adjustment.get("background_cleanup", 70)),
                     bool(adjustment.get("auto_optimize", True)),
+                    background=(combined_clean_base if combined else base)[y0:y1, x0:x1],
                 )
             except cv2.error as exc:
                 raise RuntimeError(
@@ -8614,6 +8687,7 @@ F1：显示本快捷键表""")
                         "preserve_brightness": stroke.preserve_brightness_override,
                         "match_exposure": stroke.match_exposure_override,
                         "blend_mode": stroke.blend_mode_override,
+                        "star_removal": stroke.star_removal, "mask_choke": stroke.mask_choke,
                         "feather": stroke.feather,
                         "source_mode": normalized_source_mode(stroke),
                         "auto_blend": {
@@ -8834,7 +8908,7 @@ F1：显示本快捷键表""")
                     self.global_labeled_preview_rgb = labeled_image
                     self.progress["value"] = completed / max(1, total) * 100
                     self.status.set(
-                        f"总融合预览正在累积 {completed}/{total}：已加入 {included} 张流星素材"
+                        f"融合预览正在累积 {completed}/{total}：已加入 {included} 张流星素材"
                     )
                     if self.view_mode.get() in {"blend", "labeled"}:
                         self._render_preview()
@@ -8848,7 +8922,7 @@ F1：显示本快捷键表""")
                         self.global_preview_rgb = image
                         self.global_labeled_preview_rgb = labeled_image
                         self.progress["value"] = 100
-                        self.status.set(f"总融合预览完成：已合成 {included} 张图片中的全部流星")
+                        self.status.set(f"融合预览完成：已合成 {included} 张图片中的全部流星")
                         if self.view_mode.get() in {"blend", "labeled"}:
                             self._render_preview()
                     elif self.view_mode.get() in {"blend", "labeled"}:
@@ -8964,7 +9038,7 @@ F1：显示本快捷键表""")
                     if applied == 1 and requested == 1:
                         self.status.set(
                             f"当前流星自动融合优化完成（{strength}）；仅更新该流星局部，"
-                            "未启动总融合或原始像素整图任务"
+                            "未启动融合或原始像素整图任务"
                         )
                     else:
                         self.status.set(
@@ -9142,6 +9216,7 @@ F1：显示本快捷键表""")
                     show_copyable_error(APP_NAME, text, parent=self, details=details)
         except queue.Empty:
             pass
+        self.composite_workflow.refresh()
         self.after(150, self._poll_queue)
 
 
@@ -9150,7 +9225,73 @@ if __name__ == "__main__":
     smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
     editable_smoke_report = os.environ.get("METEOR_EDITABLE_SMOKE_REPORT")
     real_pointer_smoke_report = os.environ.get("METEOR_REAL_POINTER_SMOKE_REPORT")
-    if os.environ.get("METEOR_ALIGNMENT_SMOKE_REPORT"):
+    if os.environ.get("METEOR_STAR_LAB_SMOKE_REPORT"):
+        from star_reduction_smoke import run_smoke
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, '_restore_autosave'), patch.object(MeteorComposer, '_setup_autosave'):
+            application = MeteorComposer()
+        try:
+            result = run_smoke(application)
+            Path(os.environ['METEOR_STAR_LAB_SMOKE_REPORT']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            Path(os.environ['METEOR_STAR_LAB_SMOKE_REPORT']).write_text(json.dumps({'failure': traceback.format_exc()}), encoding='utf-8')
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("METEOR_DRAG_SMOKE_REPORT"):
+        from meteor_drag_smoke import run_smoke
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, '_restore_autosave'), patch.object(MeteorComposer, '_setup_autosave'):
+            application = MeteorComposer()
+        try:
+            result = run_smoke(application)
+            Path(os.environ['METEOR_DRAG_SMOKE_REPORT']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            Path(os.environ['METEOR_DRAG_SMOKE_REPORT']).write_text(json.dumps({'failure': traceback.format_exc()}), encoding='utf-8')
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("METEOR_MATERIAL_LIST_SMOKE_REPORT"):
+        from material_list_smoke import run_smoke
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, "_restore_autosave"), patch.object(MeteorComposer, "_setup_autosave"):
+            application = MeteorComposer()
+        try:
+            result = run_smoke(application)
+            Path(os.environ['METEOR_MATERIAL_LIST_SMOKE_REPORT']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            Path(os.environ['METEOR_MATERIAL_LIST_SMOKE_REPORT']).write_text(json.dumps({'failure': traceback.format_exc()}), encoding='utf-8')
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("METEOR_BLEND_SMOKE_REPORT"):
+        from composite_workflow_smoke import run_smoke
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, "_restore_autosave"), patch.object(MeteorComposer, "_setup_autosave"):
+            application = MeteorComposer()
+        try:
+            result = run_smoke(application, exercise_blending=True)
+            result['blend_controls_roi_history_cleanup_save_load_16bit_exports'] = 'passed'
+            Path(os.environ['METEOR_BLEND_SMOKE_REPORT']).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            Path(os.environ['METEOR_BLEND_SMOKE_REPORT']).write_text(json.dumps({'failure': traceback.format_exc()}), encoding='utf-8')
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("METEOR_WORKFLOW_SMOKE_REPORT"):
+        from composite_workflow_smoke import run_smoke
+        from unittest.mock import patch
+        with patch.object(MeteorComposer, "_restore_autosave"), patch.object(MeteorComposer, "_setup_autosave"):
+            application = MeteorComposer()
+        try:
+            result = run_smoke(application)
+            Path(os.environ["METEOR_WORKFLOW_SMOKE_REPORT"]).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            Path(os.environ["METEOR_WORKFLOW_SMOKE_REPORT"]).write_text(json.dumps({"failure": traceback.format_exc()}), encoding="utf-8")
+            raise SystemExit(1)
+        finally:
+            application.destroy()
+    elif os.environ.get("METEOR_ALIGNMENT_SMOKE_REPORT"):
         from alignment_regression_smoke import run_case
         from unittest.mock import patch
         with patch.object(MeteorComposer, "_restore_autosave"), patch.object(MeteorComposer, "_setup_autosave"):
@@ -9199,15 +9340,23 @@ if __name__ == "__main__":
             application.destroy()
     elif editable_smoke_report:
         from editable_composite_smoke import run_smoke
-
-        application = MeteorComposer()
+        from unittest.mock import patch
+        import tempfile
+        isolated_profile = tempfile.TemporaryDirectory()
+        with patch.object(MeteorComposer, '_restore_autosave'), patch.object(MeteorComposer, '_setup_autosave'):
+            application = MeteorComposer()
+        application.autosave_path = Path(isolated_profile.name) / 'autosave.json'
         try:
             smoke_result = run_smoke(application)
             Path(editable_smoke_report).write_text(
                 json.dumps(smoke_result, ensure_ascii=False, indent=2), encoding="utf-8"
             )
+        except Exception:
+            Path(editable_smoke_report).write_text(json.dumps({'failure': traceback.format_exc()}), encoding='utf-8')
+            raise SystemExit(1)
         finally:
             application.destroy()
+            isolated_profile.cleanup()
     elif smoke_project:
         from gui_interaction_smoke import run_smoke
 

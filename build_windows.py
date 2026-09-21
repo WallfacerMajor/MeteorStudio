@@ -35,6 +35,7 @@ def pyinstaller_arguments(ffmpeg: str | None) -> list[str]:
     arguments.extend((
         "--add-data", "meteor_ranker.json;.",
         "--add-data", "candidate_dataset.npz;.",
+        "--add-data", "experiments/star_reduction_compare/dist/StarReductionCompare;star_reduction",
     ))
     if ffmpeg:
         arguments.extend(("--add-binary", f"{ffmpeg};."))
@@ -52,6 +53,8 @@ def main() -> int:
     ffmpeg = shutil.which("ffmpeg")
     from app_icon import build_icons
     build_icons(ROOT / "build" / "app-icons")
+    from build_star_reduction import build
+    build()
     if ffmpeg is None:
         print("警告：未找到 FFmpeg，视频导出将要求目标电脑自行安装 FFmpeg。")
     subprocess.run(pyinstaller_arguments(ffmpeg), cwd=ROOT, check=True)

@@ -15,6 +15,7 @@ python_bin="$venv_dir/bin/python"
 "$python_bin" -m pip install --upgrade pip wheel
 "$python_bin" -m pip install -r requirements.txt pyinstaller
 "$python_bin" app_icon.py
+"$python_bin" build_star_reduction.py
 
 args=(
   --noconfirm
@@ -47,6 +48,7 @@ args=(
   --exclude-module tokenizers
   --add-data "meteor_ranker.json:."
   --add-data "candidate_dataset.npz:."
+  --add-data "experiments/star_reduction_compare/dist/StarReductionCompare:star_reduction"
 )
 
 if command -v ffmpeg >/dev/null 2>&1; then

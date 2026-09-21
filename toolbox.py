@@ -50,6 +50,7 @@ TOOL_MENU = (
         WorkspaceSpec("light_pollution", "光污染渐变校正", "底部渐变 · 地景／星云保护 · 16 位导出", "open_light_pollution_workspace"),
     )),
     ToolGroup("laboratory", "实验室", "星轨叠加、已对齐降噪与画质分析", (
+        WorkspaceSpec("star_reduction", "缩星", "本地方案与 Siril · 同步对比 · 16 位 TIFF", "open_star_reduction_workspace"),
         WorkspaceSpec("trails", "星轨叠加", "固定机位 · 取亮叠加 · 16 位 TIFF", "open_lab_trails"),
         WorkspaceSpec("mean", "已对齐降噪", "平均叠加 · 保持原始尺寸 · 16 位 TIFF", "open_lab_mean"),
         WorkspaceSpec("quality", "批量画质体检", "清晰度 · 背景亮度 · 过曝比例 · CSV", "open_lab_quality"),

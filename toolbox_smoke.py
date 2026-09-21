@@ -198,7 +198,7 @@ def run_smoke(app):
     pump(app, 0.3)
     assert app.toolbox_home.winfo_ismapped()
     capture(app, "toolbox.png")
-    assert set(app.toolbox_home.tool_buttons) == {"screening", "alignment", "composite", "video", "control_points", "white_balance", "light_pollution", "trails", "mean", "quality"}
+    assert set(app.toolbox_home.tool_buttons) == {"screening", "alignment", "composite", "video", "control_points", "white_balance", "light_pollution", "trails", "mean", "quality", "star_reduction"}
     assert not any(isinstance(w, ttk.Button) and w.cget('text') in ('打开子菜单  →', '进入工作区  →') for w in widgets(app.toolbox_home))
     app.geometry('1000x680+20+20')
     pump(app, 1.4)
