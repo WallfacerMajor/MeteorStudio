@@ -1,14 +1,38 @@
 """Real pointer regressions also executed inside the packaged application."""
 import hashlib
 import json
+import sys
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np
 import tifffile
 from PIL import ImageTk
 from white_balance import apply_lut, make_lut
+
+
+@contextmanager
+def hold_batch_record():
+    """Reproduce WinError 5 with an actual Windows handle during UI export."""
+    timers = []
+    original_replace = Path.replace
+    def replace(temporary, target):
+        target = Path(target)
+        if sys.platform == "win32" and target.name == "batch.json" and target.exists() and not timers:
+            locked = target.open("rb")
+            timer = threading.Timer(.7, locked.close)
+            timers.append(timer)
+            timer.start()
+        return original_replace(temporary, target)
+    try:
+        with patch.object(Path, "replace", replace):
+            yield timers
+    finally:
+        for timer in timers:
+            timer.join()
 
 
 def exercise_white_balance(root, window):
@@ -174,10 +198,23 @@ def exercise_white_balance(root, window):
         broken = source / "broken.tif"
         broken.write_bytes(b"invalid")
         logged = []
-        with patch("white_balance_workspace.append_runtime_log", side_effect=lambda *args: logged.append(args)):
-            with patch("white_balance_workspace.filedialog.askopenfilenames", return_value=(str(path), str(second), str(broken))):
-                click(root, window.batch_button)
-            wait_for(lambda: not window.busy and window.result != previous)
+        with hold_batch_record() as locks, patch("white_balance_workspace.append_runtime_log", side_effect=lambda *args: logged.append(args)):
+            ticks = []
+            timer_id = None
+            def pulse():
+                nonlocal timer_id
+                if any(lock.is_alive() for lock in locks):
+                    ticks.append(time.monotonic())
+                timer_id = root.after(25, pulse)
+            pulse()
+            try:
+                with patch("white_balance_workspace.filedialog.askopenfilenames", return_value=(str(path), str(second), str(broken))):
+                    click(root, window.batch_button)
+                wait_for(lambda: not window.busy and window.result != previous)
+            finally:
+                root.after_cancel(timer_id)
+            if sys.platform == "win32":
+                assert locks and len(ticks) >= 3, "UI must remain responsive while the report is locked"
         batch = json.loads((window.result / "batch.json").read_text(encoding="utf-8"))
         assert batch["status"] == "complete_with_errors" and len(batch["items"]) == 3
         assert logged and "broken.tif" in logged[0][0] and "成功 2 / 3" in window.status.get()
@@ -203,4 +240,4 @@ def exercise_white_balance(root, window):
         assert window.export_button.winfo_ismapped() and window.canvas.winfo_height() > 100
         assert window.control_canvas.winfo_rootx() >= window.canvas.winfo_rootx() + window.canvas.winfo_width()
         capture(window, "white-balance-small.png")
-    return {"modified_camera_preset": "passed", "modified_batch_consistency": "passed", "wb_viewport_stable": "passed", "wb_original_compare": "passed", "wb_neutral_sample": "passed", "wb_settings_roundtrip": "passed", "wb_16bit_export_readonly": "passed", "wb_small_window_controls": "passed"}
+    return {"batch_record_lock_recovery": "passed" if sys.platform == "win32" else "not applicable", "modified_camera_preset": "passed", "modified_batch_consistency": "passed", "wb_viewport_stable": "passed", "wb_original_compare": "passed", "wb_neutral_sample": "passed", "wb_settings_roundtrip": "passed", "wb_16bit_export_readonly": "passed", "wb_small_window_controls": "passed"}

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 import cv2
@@ -154,6 +155,29 @@ def render_view(levels, settings, zoom, center, size, original=False, processor=
     return ((view.astype(np.uint32) + 128) // 257).astype(np.uint8), ((x0-left)*zoom, (y0-top)*zoom), clipped
 
 
+def _write_export_record(path, data):
+    """Publish a closed JSON file, tolerating brief Windows reader/scan locks.
+
+    Never truncate the previous record or remove the pending one on failure.
+    This runs in the export worker; persistent errors still reach the caller.
+    """
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    delays = iter((.05, .1, .2, .4, .8, .45))
+    while True:
+        try:
+            temporary.replace(path)
+            return
+        except OSError as exc:
+            # Access denied, sharing violation, and lock violation can all be
+            # temporary on Windows. Do not retry unrelated/POSIX errors.
+            delay = next(delays, None) if getattr(exc, "winerror", None) in (5, 32, 33) else None
+            if delay is None:
+                exc.add_note(f"已生成的图片仍保留在输出目录；未提交的完整记录：{temporary}")
+                raise
+            time.sleep(delay)
+
+
 def export_image(source, destination, settings, token, progress=lambda *_: None):
     settings = validate_settings(settings)
     if not str(destination).strip():
@@ -170,9 +194,7 @@ def export_image(source, destination, settings, token, progress=lambda *_: None)
     folder.mkdir()
     manifest = dict(source=str(source), settings=settings, color_space="sRGB", status="running")
     def record():
-        temp = folder / "white_balance.json.tmp"
-        temp.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp.replace(folder / "white_balance.json")
+        _write_export_record(folder / "white_balance.json", manifest)
     record()
     output = None
     try:
@@ -219,9 +241,7 @@ def export_batch(sources, destination, settings, token, progress=lambda *_: None
     folder.mkdir()
     report = dict(settings=settings, sources=[str(p) for p in sources], status="running", items=[])
     def record():
-        temporary = folder / "batch.json.tmp"
-        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(folder / "batch.json")
+        _write_export_record(folder / "batch.json", report)
     record()
     try:
         for index, source in enumerate(sources):

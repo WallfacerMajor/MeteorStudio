@@ -166,6 +166,17 @@ def exercise_action_hints(app):
 
 
 def run_smoke(app):
+    if os.environ.get('NIGHTSCAPE_WHITE_BALANCE_ONLY'):
+        from white_balance_workspace import WhiteBalanceWindow
+        from white_balance_smoke import exercise_white_balance
+        app.withdraw()
+        window = WhiteBalanceWindow(app)
+        try:
+            pump(app, .4)
+            return exercise_white_balance(app, window)
+        finally:
+            window._request_close()
+            pump(app, 1.4)
     if os.environ.get('NIGHTSCAPE_DPI_ONLY'):
         from dpi_smoke import run_smoke as run_dpi_smoke
         return run_dpi_smoke(app)
