@@ -241,8 +241,10 @@ class ActionHint:
         popup.attributes('-topmost',True)
         text=self.text if self.text is not None else hint_text(w)
         if isinstance(w, ttk.Widget) and w.instate(['disabled']):text+='（当前不可用）'
-        tk.Label(popup,text=text,background='#181818',foreground='#eeeeee',
-                 padx=9,pady=6,wraplength=280,font='TkDefaultFont').pack()
+        popup.configure(background='#101010')
+        tk.Label(popup,text=text,background='#383838',foreground='#eeeeee',
+                 highlightthickness=1, highlightbackground='#515151',
+                 padx=9,pady=6,wraplength=280,font='TkDefaultFont').pack(padx=(0, 3), pady=(0, 3))
         popup.update_idletasks()
         anchor_x = w.winfo_rootx() + (position[0] if position else 0)
         anchor_y = w.winfo_rooty() + (position[1] if position else 0)
@@ -264,10 +266,16 @@ def show_canvas_hint(canvas, text, position):
 
 
 def iconize_actions(parent):
+    _iconize_actions(parent)
+    from dpi_support import scale_layout
+    scale_layout(parent)
+
+
+def _iconize_actions(parent):
     """Convert actions, not parameter labels; retain hidden labels for access and tests."""
     for widget in (parent,*parent.winfo_children()):
         if widget is not parent:
-            iconize_actions(widget)
+            _iconize_actions(widget)
     if getattr(parent,'_action_icon',False):return
     if not is_icon_action(parent):return
     is_toggle=isinstance(parent,(ttk.Checkbutton,ttk.Radiobutton))
@@ -278,14 +286,18 @@ def iconize_actions(parent):
         if hint:
             hint.update_text()
         key=action_key(action_text(parent))
-        if getattr(parent,'_action_key',None)==key:return
+        from dpi_support import pixels
+        size = pixels(parent, 22)
+        cache_key = (key, size)
+        if getattr(parent,'_action_cache_key',None)==cache_key:return
         parent._action_key=key
+        parent._action_cache_key=cache_key
         # Cache in the owning toplevel, so closed workspaces release their images.
         owner=parent.winfo_toplevel()
         if not hasattr(owner,'_action_images'):owner._action_images={}
-        if key not in owner._action_images:
-            owner._action_images[key]=ImageTk.PhotoImage(icon_image(key),master=owner)
-        original(image=owner._action_images[key],compound='none',width=3)
+        if cache_key not in owner._action_images:
+            owner._action_images[cache_key]=ImageTk.PhotoImage(icon_image(key, size=size),master=owner)
+        original(image=owner._action_images[cache_key],compound='none',width=3)
     refresh()
     # Icon targets keep a consistent size rather than stretching into empty bars.
     if parent.winfo_manager() == 'pack':

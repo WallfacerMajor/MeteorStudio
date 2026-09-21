@@ -37,6 +37,10 @@ LAB_CANVASES = {
 }
 
 
+class ReferenceFocalError(ValueError):
+    """Missing/invalid reference focal length, explained at its input."""
+
+
 class AlignmentWorkspace(tk.Toplevel):
     def __init__(self, master, on_ready: Callable[[AlignmentResult], None], control_points_only: bool = False) -> None:
         super().__init__(master)
@@ -67,6 +71,7 @@ class AlignmentWorkspace(tk.Toplevel):
         self.running = False
         self.last_result: AlignmentResult | None = None
         self._build_ui()
+        self.base_path.trace_add("write", lambda *_: self._refresh_reference_focal_ui(Path(self.base_path.get())))
         from action_icons import iconize_actions
         iconize_actions(self)
         self.protocol("WM_DELETE_WINDOW", self._request_close)
@@ -92,9 +97,12 @@ class AlignmentWorkspace(tk.Toplevel):
         self.edit_inspector = inspector
         inspector.pack(side="right", fill="y", padx=(12, 0))
         inspector.pack_propagate(False)
-        configuration = ttk.Notebook(inspector, height=300)
+        from dpi_support import pixels
+        configuration = ttk.Notebook(inspector, height=pixels(self, 400))
         configuration.pack(fill="x", pady=(0, 6))
+        self.configuration = configuration
         inputs_tab = ttk.Frame(configuration, padding=6)
+        self.inputs_tab = inputs_tab
         lens_tab = ttk.Frame(configuration, padding=6)
         configuration.add(inputs_tab, text="输入与输出")
         configuration.add(lens_tab, text="镜头与投影")
@@ -102,22 +110,22 @@ class AlignmentWorkspace(tk.Toplevel):
         self.input_panel = paths
         paths.pack(fill="x")
         self._path_row(paths, 0, "对齐参考图", self.base_path, self._choose_base, "选择文件…")
-        self._path_row(paths, 1, "完整流星原图文件夹", self.meteor_dir, self._choose_meteors, "选择文件夹…")
-        self._path_row(paths, 2, "输出文件夹（可选）", self.output_dir, self._choose_output, "另选文件夹…")
+        ttk.Label(paths, text="参考图焦距(mm)").grid(row=1, column=0, sticky="w")
+        self.reference_focal_input = ttk.Spinbox(
+            paths, from_=1, to=1000, increment=0.1,
+            textvariable=self.reference_focal_length, width=9,
+        )
+        self.reference_focal_input.grid(row=1, column=1, padx=(5, 18))
+        ttk.Label(paths, textvariable=self.reference_focal_status).grid(
+            row=1, column=2, columnspan=6, sticky="w",
+        )
+        self._path_row(paths, 2, "完整流星原图文件夹", self.meteor_dir, self._choose_meteors, "选择文件夹…")
+        self._path_row(paths, 3, "输出文件夹（可选）", self.output_dir, self._choose_output, "另选文件夹…")
         paths.columnconfigure(1, weight=1)
 
         settings = ttk.LabelFrame(lens_tab, text="镜头与星空区域", padding=8)
         self.settings_panel = settings
         settings.pack(fill="x", pady=(8, 0))
-        ttk.Label(settings, text="参考图焦距(mm)").grid(row=0, column=0, sticky="w")
-        self.reference_focal_input = ttk.Spinbox(
-            settings, from_=1, to=1000, increment=0.1,
-            textvariable=self.reference_focal_length, width=9,
-        )
-        self.reference_focal_input.grid(row=0, column=1, padx=(5, 18))
-        ttk.Label(settings, textvariable=self.reference_focal_status).grid(
-            row=0, column=2, columnspan=6, sticky="w",
-        )
         ttk.Label(settings, text="素材EXIF缺失兜底焦距(mm)").grid(row=1, column=0, sticky="w", pady=(5, 0))
         ttk.Spinbox(settings, from_=1, to=1000, increment=0.1, textvariable=self.focal_length, width=9).grid(row=1, column=1, padx=(5, 18), pady=(5, 0))
         ttk.Label(settings, text="传感器对角线(mm)").grid(row=1, column=2, sticky="w", pady=(5, 0))
@@ -220,9 +228,22 @@ class AlignmentWorkspace(tk.Toplevel):
         path = filedialog.askopenfilename(title="选择对齐参考图", filetypes=[("图像", "*.tif *.tiff *.jpg *.jpeg *.png")])
         if path:
             self.base_path.set(path)
-            self._refresh_reference_focal_ui(Path(path))
+
+    def _focus_reference_focal(self, message: str) -> None:
+        self.reference_focal_input.configure(state="normal")
+        self.reference_focal_status.set(message)
+        self.configuration.select(self.inputs_tab)
+        self.inputs_tab._inspector_canvas.yview_moveto(0)
+        self.edit_inspector._inspector_canvas.yview_moveto(0)
+        self.reference_focal_input.focus_set()
+        self.reference_focal_input.selection_range(0, "end")
 
     def _refresh_reference_focal_ui(self, path: Path) -> None:
+        if not path.is_file():
+            self.reference_focal_length.set("")
+            self.reference_focal_input.configure(state="normal")
+            self.reference_focal_status.set("")
+            return
         try:
             diagonal = float(self.sensor_diagonal.get())
             info = read_lens_info(path, 1.0, diagonal)
@@ -235,7 +256,7 @@ class AlignmentWorkspace(tk.Toplevel):
             else:
                 self.reference_focal_length.set("")
                 self.reference_focal_input.configure(state="normal")
-                self.reference_focal_status.set("参考图缺少 EXIF，请填写焦距")
+                self._focus_reference_focal("无 EXIF，请填写拍摄焦距")
         except (OSError, ValueError, TypeError):
             self.reference_focal_length.set("")
             self.reference_focal_input.configure(state="normal")
@@ -246,15 +267,19 @@ class AlignmentWorkspace(tk.Toplevel):
         probe = read_lens_info(base, 1.0, diagonal)
         if probe.source.startswith("EXIF"):
             return float(probe.focal_length), probe.source
+        self.reference_focal_input.configure(state="normal")
         text = self.reference_focal_length.get().strip()
         if not text:
-            raise ValueError("参考图没有EXIF，请填写“参考图焦距(mm)”后再开始")
+            self._focus_reference_focal("无 EXIF，请填写拍摄焦距")
+            raise ReferenceFocalError("请填写参考图焦距")
         try:
             focal = float(text)
         except ValueError as exc:
-            raise ValueError("参考图焦距必须是有效数字") from exc
+            self._focus_reference_focal("请输入有效的焦距数值")
+            raise ReferenceFocalError("参考图焦距必须是有效数字") from exc
         if not (math.isfinite(focal) and focal > 0):
-            raise ValueError("参考图焦距必须大于0")
+            self._focus_reference_focal("焦距必须是大于 0 的有限数值")
+            raise ReferenceFocalError("参考图焦距必须大于0")
         return focal, "用户填写（参考图EXIF缺失）"
 
     def _laboratory_changed(self) -> None:
@@ -323,6 +348,9 @@ class AlignmentWorkspace(tk.Toplevel):
             focal, diagonal = float(self.focal_length.get()), float(self.sensor_diagonal.get())
             if not all(math.isfinite(v) and v > 0 for v in (focal, diagonal)):
                 raise ValueError("镜头参数必须是有限的正数")
+        except ReferenceFocalError as exc:
+            self.status.set(str(exc))
+            return
         except Exception as exc:
             show_copyable_error("星空对齐", str(exc), parent=self)
             return
@@ -372,6 +400,9 @@ class AlignmentWorkspace(tk.Toplevel):
             canvas_scale = LAB_CANVASES.get(self.lab_canvas.get(), 1.0) if laboratory else 1.0
             if not (math.isfinite(focal) and math.isfinite(diagonal) and focal > 0 and diagonal > 0):
                 raise ValueError("EXIF缺失时使用的兜底镜头参数无效")
+        except ReferenceFocalError as exc:
+            self.status.set(str(exc))
+            return
         except Exception as exc:
             show_copyable_error("星空对齐", str(exc), parent=self)
             return

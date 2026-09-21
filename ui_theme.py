@@ -39,8 +39,8 @@ def apply_theme(root):
     for option, value in menu_colors.items():
         root.option_add(f'*Menu.{option}', value)
     style.configure(".", background=bg, foreground=text, bordercolor="#454545", lightcolor=panel, darkcolor=bg, troughcolor=field, selectbackground="#405b7a", selectforeground="#ffffff")
-    style.configure("TButton", background=panel, borderwidth=0, padding=(8, 4), focusthickness=1, focuscolor=accent)
-    style.map("TButton", background=[("disabled", bg), ("pressed", "#345977"), ("active", "#263c53")], foreground=[("disabled", "#64778c")])
+    style.configure("TButton", background=panel, borderwidth=1, relief="raised", lightcolor="#494949", darkcolor="#181818", padding=(8, 4), focusthickness=1, focuscolor=accent)
+    style.map("TButton", background=[("disabled", bg), ("pressed", "#345977"), ("active", "#414141")], lightcolor=[("pressed", "#202020"), ("active", "#565656")], darkcolor=[("pressed", "#484848"), ("active", "#181818")], foreground=[("disabled", "#64778c")])
     style.configure("Accent.TButton", foreground=accent)
     style.configure("Primary.TButton", background="#496c96", foreground="#ffffff", borderwidth=0, padding=(10, 5))
     style.map("Primary.TButton", background=[("disabled", panel), ("pressed", "#3e5c80"), ("active", "#587ead")], foreground=[("disabled", "#858585"), ("!disabled", "#ffffff")])
@@ -70,7 +70,7 @@ def apply_theme(root):
         style.map(name, fieldbackground=[("readonly", panel), ("disabled", bg)], foreground=[("disabled", "#64778c"), ("readonly", text)])
     for name in ("TCheckbutton", "TRadiobutton"):
         style.map(name, background=[("active", panel)], indicatorbackground=[("selected", accent), ("!selected", field)], foreground=[("disabled", "#64778c")])
-    style.configure("TLabelframe", borderwidth=1, relief="solid", bordercolor="#404040")
+    style.configure("TLabelframe", borderwidth=1, relief="raised", bordercolor="#202020", lightcolor="#414141", darkcolor="#191919")
     style.configure("TLabelframe.Label", foreground=text, font=(family, 10, "bold"))
     style.configure("Muted.TLabel", foreground=muted)
     style.configure("Hero.TLabel", font=(family, 23, "bold"))
@@ -78,13 +78,18 @@ def apply_theme(root):
     style.configure("Treeview", background=field, fieldbackground=field, rowheight=max(29, tkfont.nametofont('TkDefaultFont', root=root).metrics('linespace')+8))
     style.configure("Treeview.Heading", background=panel, foreground=muted, padding=5)
     style.map("Treeview", background=[("selected", "#315574")], foreground=[("selected", "#ffffff")])
-    style.configure("TNotebook", borderwidth=0)
-    style.configure("TNotebook.Tab", padding=(12, 6), background=field)
-    style.map("TNotebook.Tab", background=[("selected", "#414141")], foreground=[("selected", text)])
+    style.configure("TNotebook", borderwidth=0, background=field, tabmargins=(0, 0, 0, 0))
+    style.configure("TNotebook.Tab", padding=(12, 6), background=field, foreground=muted)
+    style.map("TNotebook.Tab", background=[("selected", bg), ("active", "#353535")],
+              foreground=[("disabled", "#777777"), ("selected", "#ffffff"), ("active", text), ("!selected", muted)],
+              padding=[], expand=[("selected", (0, 0, 0, 0))])
+    _notebook_surface(root, style, bg, field, accent)
     style.configure("Horizontal.TProgressbar", background=accent, borderwidth=0)
     for name in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
         style.configure(name, background=panel, arrowcolor=muted, borderwidth=0)
         style.map(name, background=[("active", "#345977"), ("pressed", "#315574")])
+    from dpi_support import scale_theme
+    scale_theme(root, style)
     # A quiet track and distinct thumb replace clam's bulky, ridged slider.
     if 'Editor.Scale.trough' in style.element_names():
         return
@@ -114,3 +119,31 @@ def apply_theme(root):
     progress_layout = [('Editor.Progress.trough', {'sticky': 'nswe', 'children': [('Editor.Progress.pbar', {'side': 'left', 'sticky': 'ns'})]})]
     style.layout('Horizontal.TProgressbar', progress_layout)
     style.layout('Thin.Horizontal.TProgressbar', progress_layout)
+
+
+def _notebook_surface(root, style, panel, recessed, accent):
+    """Selected tabs join the page; recessed tabs retain a bottom shadow."""
+    if 'Nightscape.tab' in style.element_names():
+        return
+    from dpi_support import pixels
+    edge = max(1, pixels(root, 1))
+    size = edge * 12
+    def surface(fill, selected=False):
+        image = tk.PhotoImage(master=root, width=size, height=size)
+        image.put(fill, to=(0, 0, size, size))
+        image.put('#454545' if selected else '#343434', to=(0, 0, size, edge))
+        image.put('#181818', to=(size-edge, edge, size, size))
+        if selected:
+            image.put(accent, to=(edge, 0, size-edge, edge*2))
+        else:
+            image.put('#191919', to=(0, size-edge*2, size, size-edge))
+            image.put('#222222', to=(0, size-edge, size, size))
+        return image
+    normal, hover, selected = surface(recessed), surface('#353535'), surface(panel, True)
+    root._notebook_surface_images = (normal, hover, selected)
+    style.element_create('Nightscape.tab', 'image', normal,
+                         ('selected', selected), ('active', hover), border=edge*3, sticky='nswe')
+    style.layout('TNotebook.Tab', [('Nightscape.tab', {'sticky':'nswe', 'children':[
+        ('Notebook.padding', {'side':'top', 'sticky':'nswe', 'children':[
+            ('Notebook.focus', {'side':'top', 'sticky':'nswe', 'children':[
+                ('Notebook.label', {'side':'top', 'sticky':''})]})]})]})])

@@ -30,6 +30,7 @@ exe = EXE(
     exclude_binaries=True,
     name='MeteorStudio',
     icon=str(icon_dir / 'nightscape.ico'),
+    manifest=str(Path(SPECPATH) / 'windows.manifest'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

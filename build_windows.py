@@ -25,6 +25,7 @@ def pyinstaller_arguments(ffmpeg: str | None) -> list[str]:
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--windowed", "--name", "MeteorStudio",
         "--icon", str(ROOT / "build" / "app-icons" / "nightscape.ico"),
+        "--manifest", str(ROOT / "windows.manifest"),
         "--collect-data", "setuptools._vendor.jaraco.text",
     ]
     for module in HIDDEN_IMPORTS:

@@ -1983,6 +1983,8 @@ def compose_meteor_sources(
 
 class MeteorComposer(tk.Tk):
     def __init__(self) -> None:
+        from dpi_support import enable_high_dpi
+        enable_high_dpi()
         super().__init__()
         apply_theme(self)
         self.title(f"{APP_NAME} — {APP_VERSION}")

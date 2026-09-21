@@ -166,6 +166,9 @@ def exercise_action_hints(app):
 
 
 def run_smoke(app):
+    if os.environ.get('NIGHTSCAPE_DPI_ONLY'):
+        from dpi_smoke import run_smoke as run_dpi_smoke
+        return run_dpi_smoke(app)
     app.show_toolbox()
     pump(app, 1.4)
     assert app.state() == 'normal', 'Startup must not maximize the window'

@@ -1335,12 +1335,19 @@ def run_smoke(app) -> dict:
     app._canvas_actual_size()
 
     exact_viewer = ExactPreviewViewer(app, source, source.copy(), "blend")
+    # This fixture exercises two physical viewport sizes below a 1200x800
+    # image. Override the DPI-scaled minimum so both resizes actually happen.
+    exact_viewer.minsize(760, 520)
     exact_viewer.geometry("900x620+10000+10000")
     exact_viewer.update()
+    if (exact_viewer.winfo_width(), exact_viewer.winfo_height()) != (900, 620):
+        raise AssertionError("Exact-preview initial physical viewport was not applied")
     exact_viewer.fit()
     fit_zoom = exact_viewer.zoom
     exact_viewer.geometry("1000x700+10000+10000")
     exact_viewer.update()
+    if (exact_viewer.winfo_width(), exact_viewer.winfo_height()) != (1000, 700):
+        raise AssertionError("Exact-preview physical resize was not applied")
     resized_fit_zoom = exact_viewer.zoom
     if not exact_viewer.fit_mode or resized_fit_zoom <= fit_zoom:
         raise AssertionError("Exact-preview fit mode did not follow a real window resize")

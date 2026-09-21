@@ -20,9 +20,11 @@ def parameter_slider(parent, title, variable, lower, upper, command=None, colors
                       command=command, style='Editor.Horizontal.TScale')
     scale.pack(fill='x', pady=(5, 0))
     if colors:
+        from dpi_support import pixels
         style = ttk.Style(parent)
         name = f'Gradient{next(_gradient_ids)}'
-        track = tk.PhotoImage(master=parent, width=1, height=14)
+        track_height = pixels(parent, 14)
+        track = tk.PhotoImage(master=parent, width=1, height=track_height)
         scale._gradient_image = track
         style.element_create(name+'.trough', 'image', track, sticky='we')
         style.layout(name+'.Horizontal.TScale', [(name+'.trough', {'sticky': 'we', 'children': [
@@ -32,7 +34,7 @@ def parameter_slider(parent, title, variable, lower, upper, command=None, colors
         def paint(event):
             width = max(2, event.width)
             track.configure(width=width)
-            track.put('#292929', to=(0, 0, width, 14))
+            track.put('#292929', to=(0, 0, width, track_height))
             row = []
             for x in range(width):
                 position = x/(width-1)*(len(stops)-1)
@@ -40,7 +42,7 @@ def parameter_slider(parent, title, variable, lower, upper, command=None, colors
                 fraction = position-index
                 rgb = [round(a+(b-a)*fraction) for a, b in zip(stops[index], stops[index+1])]
                 row.append('#%02x%02x%02x' % tuple(rgb))
-            track.put('{'+' '.join(row)+'}', to=(0, 4, width, 10))
+            track.put('{'+' '.join(row)+'}', to=(0, pixels(parent, 4), width, pixels(parent, 10)))
         scale.bind('<Configure>', paint, add=True)
     return scale
 
