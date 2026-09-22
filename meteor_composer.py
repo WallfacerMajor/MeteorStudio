@@ -43,7 +43,7 @@ from ui_theme import apply_theme
 
 
 APP_NAME = PRODUCT_NAME
-APP_VERSION = "0.3.4"
+APP_VERSION = "0.3.5"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 EDIT_HISTORY_LIMIT = 100
@@ -2316,6 +2316,9 @@ class MeteorComposer(tk.Tk):
         self.file_actions = FileActions(header)
         self.file_actions.pack(side="right", padx=8)
         self.load_project_button = self.file_actions.add("载入项目", self.load_project)
+        self.recent_projects_button, self.recent_projects_menu = self.file_actions.add_menu(
+            "最近项目", self._populate_recent_projects_menu
+        )
         self.save_project_button = self.file_actions.add("保存项目", self.save_project)
         self.export_button = self.file_actions.add("导出合成结果", self.export)
         self.open_output_button = self.file_actions.add("打开导出文件夹", self._open_output_folder)
@@ -8557,12 +8560,53 @@ F1：显示本快捷键表""")
         path = filedialog.asksaveasfilename(title="保存项目", defaultextension=".json", filetypes=[("流星项目", "*.json")])
         if not path:
             return
-        Path(path).write_text(json.dumps(self._project_data(), ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            Path(path).write_text(json.dumps(self._project_data(), ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            show_copyable_error("保存项目", str(exc), parent=self)
+            return
+        self._remember_project(path)
         self.status.set(f"项目已保存：{path}")
 
     def load_project(self) -> None:
+        if self.export_running:
+            self.status.set("导出完成后再载入项目")
+            return
         path = filedialog.askopenfilename(title="载入项目", filetypes=[("流星项目", "*.json")])
         if not path:
+            return
+        self._load_project_path(Path(path))
+
+    def _recent_project_paths(self) -> list[Path]:
+        from recent_projects import history_path, recent_projects
+        try:
+            return recent_projects(history_path(self.autosave_path))
+        except OSError:
+            return []
+
+    def _remember_project(self, path: str | Path) -> None:
+        from recent_projects import history_path, remember_project
+        try:
+            remember_project(history_path(self.autosave_path), path)
+        except OSError as exc:
+            from runtime_log import append_runtime_log
+            append_runtime_log("最近项目记录失败", str(exc))
+
+    def _populate_recent_projects_menu(self) -> None:
+        menu = self.recent_projects_menu
+        menu.delete(0, "end")
+        projects = self._recent_project_paths()
+        if not projects:
+            menu.add_command(label="暂无最近项目", state="disabled")
+        for path in projects:
+            menu.add_command(
+                label=f"{path.name}  ·  {path.parent.name}",
+                command=lambda selected=path: self._load_project_path(selected),
+            )
+
+    def _load_project_path(self, path: Path) -> None:
+        if self.export_running:
+            self.status.set("导出完成后再载入项目")
             return
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -8576,8 +8620,10 @@ F1：显示本快捷键表""")
         except (OSError, UnicodeError, ValueError) as exc:
             show_copyable_error("载入项目", str(exc), parent=self)
             return
+        self.show_composite_workspace()
         self._apply_project_data(data)
         paired = self.scan_inputs()
+        self._remember_project(path)
         self._schedule_autosave()
         self.status.set(
             f"项目已载入：{path}" if paired

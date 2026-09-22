@@ -17,6 +17,7 @@ def action_key(text):
     if plain in TOOLS:
         return TOOLS[plain]
     if plain == '设置':return 'gear'
+    if plain == '最近项目':return 'history'
     if plain == '恢复自动值':return 'spark'
     if plain == '恢复原始融合':return 'reset'
     for words, key in (
@@ -180,6 +181,8 @@ def action_text(widget):
 
 
 def is_icon_action(widget):
+    if getattr(widget, '_keep_text_action', False):
+        return False
     return isinstance(widget, (ttk.Button, ttk.Menubutton)) or (
         isinstance(widget, (ttk.Checkbutton, ttk.Radiobutton)) and
         any(word in action_text(widget) for word in TOGGLES))

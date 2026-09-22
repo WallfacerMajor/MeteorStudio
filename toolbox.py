@@ -273,6 +273,21 @@ def build_home(app, menu_path=()) -> ttk.Frame:
             home.tool_buttons[spec.key] = button
     for col in range(2):
         cards.columnconfigure(col, weight=1, uniform="tool")
+    home.recent_project_buttons = []
+    recent = app._recent_project_paths()[:4]
+    if recent:
+        section = ttk.LabelFrame(home, text="最近项目", padding=12)
+        section.pack(fill="x", pady=(16, 0))
+        for index, path in enumerate(recent):
+            button = ttk.Button(
+                section, text=f"{path.name}  ·  {path.parent.name}",
+                command=lambda selected=path: app._load_project_path(selected),
+            )
+            button._keep_text_action = True
+            button.grid(row=index // 2, column=index % 2, sticky="ew", padx=5, pady=4)
+            home.recent_project_buttons.append(button)
+        section.columnconfigure(0, weight=1)
+        section.columnconfigure(1, weight=1)
     from action_icons import iconize_actions
     iconize_actions(home)
     return home

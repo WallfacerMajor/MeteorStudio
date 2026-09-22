@@ -31,8 +31,8 @@
 无需安装 Python，可直接从 [GitHub Releases](https://github.com/WallfacerMajor/MeteorStudio/releases/latest) 下载：
 
 - `MeteorStudio-Windows-x64.zip`：Windows 64 位。
-- `MeteorStudio-0.3.4-arm64.dmg`：Apple Silicon Mac（M1/M2/M3/M4 等）。
-- `MeteorStudio-0.3.4-x86_64.dmg`：Intel Mac。
+- `MeteorStudio-0.3.5-arm64.dmg`：Apple Silicon Mac（M1/M2/M3/M4 等）。
+- `MeteorStudio-0.3.5-x86_64.dmg`：Intel Mac。
 
 Release 中的三个安装包由 GitHub Actions 在对应操作系统上从当前源码自动构建。macOS 安装包尚未使用 Apple Developer ID 公证，首次运行方法见 macOS 构建文档。
 
@@ -134,6 +134,7 @@ Release 中的三个安装包由 GitHub Actions 在对应操作系统上从当�
 - 自动保存采用临时文件写完后再原子替换，避免程序中断留下半份项目文件。
 - 图片项目沿用旧位置 `%APPDATA%\MeteorComposer\autosave.json`，保证升级后仍能恢复；视频项目保存于 `%APPDATA%\MeteorStudio\video_autosave.json`。macOS 使用对应的 `~/Library/Application Support/...` 目录。自动保存不会写入输入素材文件夹。
 - “保存项目”和“载入项目”仍可用于制作具名备份或在不同电脑之间迁移。
+- 保存或载入过的具名项目会出现在首页“最近项目”和合成工作区顶部的最近项目菜单中；缺失的文件会自动从列表移除。
 
 ## 内置 AI 模型
 

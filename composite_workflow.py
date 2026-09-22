@@ -1,4 +1,5 @@
 """Lightweight workflow guidance. Never reads pixels or invalidates previews."""
+import tkinter as tk
 from tkinter import ttk
 
 
@@ -8,6 +9,13 @@ class FileActions(ttk.Frame):
         button = ttk.Button(self, text=text, command=command)
         button.pack(side='left', padx=(0, 5))
         return button
+
+    def add_menu(self, text, populate):
+        button = ttk.Menubutton(self, text=text)
+        menu = tk.Menu(button, tearoff=False, postcommand=populate)
+        button.configure(menu=menu)
+        button.pack(side='left', padx=(0, 5))
+        return button, menu
 
 
 def usable_mark(stroke):
@@ -77,6 +85,7 @@ class CompositeWorkflow(ttk.Frame):
         reason = '请先选择素材并扫描' if not ready else '请先检测或画出流星蒙版' if not count else '正在导出' if busy else ''
         app.load_project_button.configure(state='disabled' if busy else 'normal')
         app.load_project_button._disabled_reason = '导出完成后再载入其他项目' if busy else ''
+        app.recent_projects_button.configure(state='disabled' if busy else 'normal')
         app.export_button._disabled_reason = reason
         app.export_button.configure(state='disabled' if reason else 'normal')
         app.open_output_button.configure(state='normal' if app.last_export_path else 'disabled')

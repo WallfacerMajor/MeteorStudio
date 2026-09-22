@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from meteor_composer import MeteorComposer, read_image
+from recent_projects import history_path, recent_projects
 
 
 def run():
@@ -33,14 +34,14 @@ def run():
             app.update()
             invalid = root / 'unrelated.json'
             invalid.write_text('{"unrelated": true}', encoding='utf-8')
-            button = app.load_project_button
-            def click():
+            def click(button):
+                assert button.winfo_ismapped(), 'Action is not visible'
                 x, y = button.winfo_width() // 2, button.winfo_height() // 2
                 button.event_generate('<ButtonPress-1>', x=x, y=y)
                 button.event_generate('<ButtonRelease-1>', x=x, y=y)
                 app.update()
             with patch('meteor_composer.filedialog.askopenfilename', return_value=str(invalid)), patch('meteor_composer.show_copyable_error') as error:
-                click()
+                click(app.load_project_button)
                 assert error.call_count == 1
                 assert app.blend_mode.get() == '线性减淡（添加）'
             data = app._project_data()
@@ -53,7 +54,7 @@ def run():
             project = root / 'old-project.json'
             project.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
             with patch('meteor_composer.filedialog.askopenfilename', return_value=str(project)) as chooser, patch('meteor_composer.show_copyable_error') as error:
-                click()
+                click(app.load_project_button)
                 deadline = time.monotonic() + 6
                 while app.preview_source is None and time.monotonic() < deadline:
                     app.update()
@@ -63,8 +64,38 @@ def run():
                 assert app.blend_mode.get() == '自然融合'
                 assert len(app.pairs) == 1 and app.preview_source is not None
                 assert app.strokes[str(source)][0].star_removal == 0
+            index = history_path(app.autosave_path)
+            assert recent_projects(index) == [project.resolve()]
+            saved = root / 'saved-project.json'
+            with patch('meteor_composer.filedialog.asksaveasfilename', return_value=str(saved)):
+                click(app.save_project_button)
+            assert saved.is_file() and recent_projects(index) == [saved.resolve(), project.resolve()]
+            app._populate_recent_projects_menu()
+            assert app.recent_projects_menu.index('end') == 1
+            assert app.recent_projects_button._action_key == 'history'
+            app.blend_mode.set('滤色')
+            app.show_toolbox()
+            app.update()
+            assert len(app.toolbox_home.recent_project_buttons) == 2
+            first = app.toolbox_home.recent_project_buttons[0]
+            assert 'saved-project.json' in first.cget('text')
+            assert not first.cget('image')
+            with patch('meteor_composer.filedialog.askopenfilename', side_effect=AssertionError('Unexpected file chooser')):
+                app.export_running = True
+                click(first)
+                assert app.toolbox_home.winfo_ismapped() and app.blend_mode.get() == '滤色'
+                app.export_running = False
+                click(first)
+            assert app.composite_panel.winfo_ismapped() and app.blend_mode.get() == '自然融合'
+            assert recent_projects(index) == [saved.resolve(), project.resolve()]
+            saved.unlink()
+            app.show_toolbox()
+            app.update()
+            assert len(app.toolbox_home.recent_project_buttons) == 1
+            assert recent_projects(index) == [project.resolve()]
             return {'project_button': 'passed', 'legacy_blend_restored': True,
-                    'compressed_16bit_photo_loaded': True, 'invalid_json_kept_session': True}
+                    'compressed_16bit_photo_loaded': True, 'invalid_json_kept_session': True,
+                    'recent_home_open': True, 'recent_saved_and_pruned': True}
         finally:
             app.destroy()
 
