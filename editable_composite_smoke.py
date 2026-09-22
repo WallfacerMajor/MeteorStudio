@@ -148,6 +148,8 @@ def run_smoke(app) -> dict:
         raise AssertionError("Second manual stroke replaced the previous stroke")
     if first_manual not in app.strokes[key]:
         raise AssertionError("First manual stroke disappeared after supplementing the mask")
+    if any(stroke.star_removal != 40 for stroke in app.strokes[key][-2:]):
+        raise AssertionError("Newly painted meteors did not receive default star cleanup")
 
     second_start = (int(x0 + (x1 - x0) * 0.70), int(y0 + (y1 - y0) * 0.69))
     second_end = (int(x0 + (x1 - x0) * 0.78), int(y0 + (y1 - y0) * 0.72))
@@ -690,6 +692,18 @@ def run_smoke(app) -> dict:
     slider_canvas_item = app.preview_image_item
     app.pairs[overlap_key] = Path("evicted_overlapping_base.tif")
     app.strokes[overlap_key] = [replace(app.strokes[key][0], points=app.strokes[key][0].points.copy())]
+    # The layer is absent from the rolling preview cache, but its source file
+    # remains readable. Simulate the local disk fallback without creating a
+    # synthetic file in the user's material directory.
+    real_slider_cached_layer = app._cached_layer_preview
+    real_slider_cached_full = app._cached_full_image
+    app._cached_layer_preview = lambda path, *args: (
+        None if str(path) == overlap_key else real_slider_cached_layer(path, *args)
+    )
+    app._cached_full_image = lambda path, precision=False: (
+        source if str(path) == overlap_key
+        else real_slider_cached_full(path, precision)
+    )
     slider_full_rebuilds = []
     slider_invalidations = 0
     real_slider_request = app._request_global_preview
@@ -723,12 +737,13 @@ def run_smoke(app) -> dict:
     app.global_exact_after_id = app.after(
         1220, lambda: delayed_fires.append("validation")
     )
-    app.selected_brightness.set(137)
-    app.selected_cleanup.set(84)
-    app.selected_saturation.set(112)
-    app.selected_match.set(True)
-    app.selected_feather.set(19)
-    app._selected_adjustment_changed()
+    for variable, value in (
+        (app.selected_brightness, 137), (app.selected_cleanup, 84),
+        (app.selected_saturation, 112), (app.selected_match, True),
+        (app.selected_feather, 19),
+    ):
+        variable.set(value)
+        app._selected_adjustment_changed(variable)
     # Cover both delayed pipelines (automatic exact at 320 ms and the former
     # global validation at 1200 ms). The previous immediate-only test restored
     # these spies before the user-visible duplicate jobs could begin.
@@ -743,6 +758,8 @@ def run_smoke(app) -> dict:
     app._render_preview = real_slider_render
     app._schedule_automatic_exact_preview = real_slider_auto_exact
     app._schedule_global_exact_validation = real_slider_validation
+    app._cached_layer_preview = real_slider_cached_layer
+    app._cached_full_image = real_slider_cached_full
     app.pairs.pop(overlap_key, None)
     app.strokes.pop(overlap_key, None)
     app.output_mode.set("separate")

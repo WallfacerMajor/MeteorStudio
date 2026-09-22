@@ -47,6 +47,9 @@ def run():
             data.update(source_dir=str(sources), base_dir=str(bases / 'one.jpg'),
                         output_dir=str(root / 'out'), output_mode='combined',
                         blend_mode='自然融合')
+            data['strokes'] = {str(source): [{
+                'points': [[.2, .3], [.7, .6]], 'width': 12, 'feather': 4,
+            }]}
             project = root / 'old-project.json'
             project.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
             with patch('meteor_composer.filedialog.askopenfilename', return_value=str(project)) as chooser, patch('meteor_composer.show_copyable_error') as error:
@@ -59,6 +62,7 @@ def run():
                 assert chooser.call_count == 1 and error.call_count == 0
                 assert app.blend_mode.get() == '自然融合'
                 assert len(app.pairs) == 1 and app.preview_source is not None
+                assert app.strokes[str(source)][0].star_removal == 0
             return {'project_button': 'passed', 'legacy_blend_restored': True,
                     'compressed_16bit_photo_loaded': True, 'invalid_json_kept_session': True}
         finally:

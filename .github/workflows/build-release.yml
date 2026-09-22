@@ -6,7 +6,7 @@ on:
       version:
         description: DMG version label
         required: false
-        default: 0.3.2
+        default: 0.3.3
   push:
     branches:
       - main
@@ -36,6 +36,7 @@ jobs:
           xvfb-run -a python release_color_smoke.py
           xvfb-run -a python release_video_smoke.py
           xvfb-run -a python project_import_smoke.py
+          xvfb-run -a python recommendation_controls_smoke.py
 
   windows:
     needs: test

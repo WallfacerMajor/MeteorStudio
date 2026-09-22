@@ -43,7 +43,7 @@ from ui_theme import apply_theme
 
 
 APP_NAME = PRODUCT_NAME
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.3.3"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 EDIT_HISTORY_LIMIT = 100
@@ -119,6 +119,11 @@ class Stroke:
     mask_choke: float = 0.0
 
 
+# New meteors receive modest off-axis star cleanup. Keep Stroke's neutral
+# default and project-load fallback at zero so existing saved work stays exact.
+NEW_METEOR_STAR_REMOVAL = 40.0
+
+
 def alignment_tracks_to_strokes(
     tracks: list[dict], width: int, height: int, source_mode: str = "aligned",
 ) -> list[Stroke]:
@@ -141,6 +146,7 @@ def alignment_tracks_to_strokes(
         result.append(Stroke(
             points, width=mask_width, feather=feather, locked=True,
             auto_score=int(track.get("score", 100)), source_mode=source_mode,
+            star_removal=NEW_METEOR_STAR_REMOVAL,
         ))
     return result
 
@@ -1535,11 +1541,22 @@ def dominant_meteor_signal_gate(
     count, labels, stats, _centers = cv2.connectedComponentsWithStats(seeds, connectivity=8)
     if count <= 1:
         return np.zeros_like(alpha, dtype=np.float32)
-    component_scores = []
-    for index in range(1, count):
+    best_component: tuple[float, int] | None = None
+    # Most seeds are compact stars. Their maximum possible score is bounded by
+    # their area, the brightest pixel anywhere in the mask, and the maximum
+    # core/shape weights. Once that bound loses to the current best component,
+    # no smaller component can become the meteor. Keep the exact scoring for
+    # every component that can still win.
+    score_ceiling_per_pixel = (
+        max(1.0, np.sqrt(float(values.max()))) * 1.5 * (0.55 + 4.0 * 0.28)
+    )
+    indices = np.argsort(-stats[1:, cv2.CC_STAT_AREA], kind="stable") + 1
+    for index in indices:
         area = int(stats[index, cv2.CC_STAT_AREA])
         if area < 3:
-            continue
+            break
+        if best_component is not None and area * score_ceiling_per_pixel < best_component[0]:
+            break
         left, top, width, height = map(int, stats[index, :4])
         region = np.s_[top:top + height, left:left + width]
         component = labels[region] == index
@@ -1559,13 +1576,15 @@ def dominant_meteor_signal_gate(
         # stars and block fragments are deliberately disadvantaged even when
         # locally bright.
         shape_weight = 0.55 + min(4.0, elongation) * 0.28
-        component_scores.append((
+        score = (
             area * max(1.0, np.sqrt(peak)) * (0.5 + core_overlap) * shape_weight,
-            index,
-        ))
-    if not component_scores:
+            int(index),
+        )
+        if best_component is None or score > best_component:
+            best_component = score
+    if best_component is None:
         return np.zeros_like(alpha, dtype=np.float32)
-    dominant_index = max(component_scores)[1]
+    dominant_index = best_component[1]
     dominant = (labels == dominant_index).astype(np.uint8)
     # The bright core and a faint taper can be disconnected at the high seed
     # threshold even when the user painted one complete meteor.  Starting from
@@ -2557,7 +2576,8 @@ class MeteorComposer(tk.Tk):
             ttk.Label(selected_tools, text=label).grid(row=0, column=column, sticky="e")
             scale = ttk.Scale(
                 selected_tools, from_=start, to=end, variable=variable, orient="horizontal",
-                state="disabled", length=80, command=self._selected_adjustment_changed,
+                state="disabled", length=80,
+                command=lambda _value, edited=variable: self._selected_adjustment_changed(edited),
             )
             scale.grid(row=0, column=column + 1, sticky="ew", padx=4)
             value = ttk.Label(selected_tools, textvariable=variable, width=4)
@@ -2576,12 +2596,12 @@ class MeteorComposer(tk.Tk):
         selected_scale(15, "蒙版收缩%", self.selected_mask_choke, 0, 80)
         preserve = ttk.Checkbutton(
             selected_tools, text="保持亮部", variable=self.selected_preserve,
-            state="disabled", command=self._selected_adjustment_changed,
+            state="disabled", command=lambda: self._selected_adjustment_changed(self.selected_preserve),
         )
         preserve.grid(row=1, column=2, columnspan=2, sticky="w", pady=(5, 0))
         match = ttk.Checkbutton(
             selected_tools, text="局部曝光/颜色匹配", variable=self.selected_match,
-            state="disabled", command=self._selected_adjustment_changed,
+            state="disabled", command=lambda: self._selected_adjustment_changed(self.selected_match),
         )
         match.grid(row=1, column=4, columnspan=3, sticky="w", pady=(5, 0))
         ttk.Label(selected_tools, text="混合方式").grid(row=1, column=7, sticky="e", pady=(5, 0))
@@ -2590,11 +2610,15 @@ class MeteorComposer(tk.Tk):
             values=BLEND_MODES,
         )
         selected_blend.grid(row=1, column=8, sticky="w", padx=4, pady=(5, 0))
-        selected_blend.bind("<<ComboboxSelected>>", self._selected_adjustment_changed)
+        selected_blend.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._selected_adjustment_changed(self.selected_blend),
+        )
         ttk.Label(selected_tools, text="羽化px").grid(row=1, column=9, sticky="e", pady=(5, 0))
         selected_feather = ttk.Scale(
             selected_tools, from_=0, to=120, variable=self.selected_feather,
-            orient="horizontal", state="disabled", command=self._selected_adjustment_changed,
+            orient="horizontal", state="disabled",
+            command=lambda _value: self._selected_adjustment_changed(self.selected_feather),
         )
         selected_feather.grid(row=1, column=10, sticky="ew", padx=4, pady=(5, 0))
         selected_feather_value = ttk.Label(selected_tools, textvariable=self.selected_feather, width=4)
@@ -4012,7 +4036,7 @@ F1：显示本快捷键表""")
             ]
             candidates.append(Stroke(
                 points, full_width, full_feather, False, False, int(score),
-                source_mode=source_mode,
+                source_mode=source_mode, star_removal=NEW_METEOR_STAR_REMOVAL,
             ))
         candidates.sort(key=lambda item: item.auto_score or 0, reverse=True)
         return "candidates", path, candidates, planes, source_mode
@@ -4118,6 +4142,7 @@ F1：显示本快捷键表""")
                 strokes.append(Stroke(
                     points, width=full_width, feather=full_feather, auto_score=int(score),
                     source_mode=source_modes.get(str(path), "aligned"),
+                    star_removal=NEW_METEOR_STAR_REMOVAL,
                 ))
             return str(path), strokes, planes
 
@@ -5823,11 +5848,21 @@ F1：显示本快捷键表""")
             )
             self.selected_override_enabled.set(independent)
             self.selected_brightness.set(int(round(
-                image_values.get("meteor_brightness", 100)
+                (
+                    stroke.auto_brightness
+                    if self.adjustment_defaults.get("auto_optimize", True)
+                    and stroke.auto_blend_enabled and stroke.auto_brightness is not None
+                    else image_values.get("meteor_brightness", 100)
+                )
                 if stroke.brightness_override is None else stroke.brightness_override
             )))
             self.selected_cleanup.set(int(round(
-                image_values.get("background_cleanup", 70)
+                (
+                    stroke.auto_cleanup
+                    if self.adjustment_defaults.get("auto_optimize", True)
+                    and stroke.auto_blend_enabled and stroke.auto_cleanup is not None
+                    else image_values.get("background_cleanup", 70)
+                )
                 if stroke.background_cleanup_override is None else stroke.background_cleanup_override
             )))
             self.selected_saturation.set(int(round(
@@ -5939,34 +5974,32 @@ F1：显示本快捷键表""")
             if self.selected_override_enabled.get() else "所选流星已恢复跟随当前图片"
         )
 
-    def _selected_adjustment_changed(self, *_args) -> None:
+    def _selected_adjustment_changed(self, edited: tk.Variable) -> None:
         if self.loading_selected_adjustments or not self.selected_override_enabled.get():
             return
         stroke = self._selected_stroke()
         if stroke is None or self.selected_object is None:
             return
-        desired = (
-            float(self.selected_brightness.get()), float(self.selected_cleanup.get()),
-            float(self.selected_saturation.get()), bool(self.selected_preserve.get()),
-            bool(self.selected_match.get()), self.selected_blend.get(),
-            int(round(self.selected_feather.get())),
-            float(self.selected_star_removal.get()), float(self.selected_mask_choke.get()),
+        fields = (
+            (self.selected_brightness, "brightness_override", float),
+            (self.selected_cleanup, "background_cleanup_override", float),
+            (self.selected_saturation, "saturation_override", float),
+            (self.selected_preserve, "preserve_brightness_override", bool),
+            (self.selected_match, "match_exposure_override", bool),
+            (self.selected_blend, "blend_mode_override", str),
+            (self.selected_feather, "feather", lambda value: int(round(value))),
+            (self.selected_star_removal, "star_removal", float),
+            (self.selected_mask_choke, "mask_choke", float),
         )
-        current = (
-            stroke.brightness_override, stroke.background_cleanup_override,
-            stroke.saturation_override, stroke.preserve_brightness_override,
-            stroke.match_exposure_override, stroke.blend_mode_override, stroke.feather,
-            stroke.star_removal, stroke.mask_choke,
-        )
-        if current == desired:
+        matching = next(((field, convert) for variable, field, convert in fields if edited is variable), None)
+        if matching is None:
+            return
+        field, convert = matching
+        desired = convert(edited.get())
+        if getattr(stroke, field) == desired:
             return
         before = replace(stroke, points=stroke.points.copy())
-        (
-            stroke.brightness_override, stroke.background_cleanup_override,
-            stroke.saturation_override, stroke.preserve_brightness_override,
-            stroke.match_exposure_override, stroke.blend_mode_override, stroke.feather,
-            stroke.star_removal, stroke.mask_choke,
-        ) = desired
+        setattr(stroke, field, desired)
         key, index = self.selected_object
         self._sync_matching_candidate(key, stroke)
         after = replace(stroke, points=stroke.points.copy())
@@ -7833,6 +7866,7 @@ F1：显示本快捷键表""")
                 self.active_points.copy(), self.active_tool_width or self._tool_width(),
                 self.active_tool_feather, False,
                 source_mode=self._current_source_mode(),
+                star_removal=NEW_METEOR_STAR_REMOVAL,
             )
             values = self.strokes.setdefault(str(self.current_path), [])
             self.active_action_index = len(values)
@@ -9110,6 +9144,11 @@ F1：显示本快捷键表""")
                         stroke.auto_cleanup = float(parameters["cleanup"])
                         stroke.auto_brightness = float(parameters["brightness"])
                         stroke.auto_feather = int(parameters["feather"])
+                        # Running the recommendation is an explicit request to
+                        # use its cleanup and brightness. Existing per-object
+                        # manual overrides otherwise silently hide both values.
+                        stroke.background_cleanup_override = None
+                        stroke.brightness_override = None
                         self._sync_matching_candidate(key, stroke)
                         after = replace(stroke, points=stroke.points.copy())
                         if before != after:

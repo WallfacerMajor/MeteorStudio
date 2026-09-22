@@ -42,6 +42,7 @@ class AlignmentTrackImportTests(unittest.TestCase):
         self.assertEqual(strokes[0].auto_score, 93)
         self.assertEqual(strokes[0].source_mode, "aligned")
         self.assertGreater(strokes[0].width, 12)
+        self.assertEqual(strokes[0].star_removal, 40)
 
 
 class FakeVar:
