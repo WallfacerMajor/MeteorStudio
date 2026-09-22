@@ -53,20 +53,50 @@ def run():
             assert app.selected_override_enabled.get() and latency<.2,latency
             scale=next(w for w in app.selected_object_controls if isinstance(w,ttk.Scale) and str(w.cget('variable'))==str(app.selected_brightness))
             siblings=list(scale.master.winfo_children());idx=siblings.index(scale);label,value=siblings[idx-1],siblings[idx+1]
+            fast_events=[]
+            started=[0.0]
+            original_fast=app._paste_display_preview_patch
+            def fast_preview(patch,box):
+                shown=original_fast(patch,box)
+                fast_events.append((time.monotonic()-started[0],shown,patch.shape,box))
+                return shown
+            app._paste_display_preview_patch=fast_preview
             click(scale);settle();scale.focus_force()
             prior=app.selected_brightness.get()
             scale.event_generate('<Right>');pump(.02);scale.event_generate('<Left>');settle()
             assert app.selected_brightness.get()==prior
-            click(value);entry=value._value_entry;entry.delete(0,'end');entry.insert(0,'143');entry.event_generate('<Return>');settle()
+            click(value);entry=value._value_entry;entry.delete(0,'end');entry.insert(0,'143');fast_events.clear()
+            started[0]=time.monotonic();entry.event_generate('<Return>');settle()
             assert stroke.brightness_override==143
+            assert any(shown and elapsed<.1 for elapsed,shown,_,_ in fast_events),fast_events
             click(label);settle();assert stroke.brightness_override==100
+            original_recompose=MeteorComposer._incremental_recomposed_object_image
+            original_commit=app._commit_incremental_global_preview
+            drag_commits=[]
+            def slow_recompose(self,*args,**kwargs):
+                time.sleep(.25)
+                return original_recompose(self,*args,**kwargs)
+            def record_commit(*args,**kwargs):
+                drag_commits.append(stroke.brightness_override)
+                return original_commit(*args,**kwargs)
+            MeteorComposer._incremental_recomposed_object_image=slow_recompose
+            app._commit_incremental_global_preview=record_commit
             coords=scale.coords();scale.event_generate('<ButtonPress-1>',x=int(coords[0]),y=int(coords[1]))
             t=time.monotonic()
             for fraction in (.2,.4,.6,.8):
                 scale.event_generate('<B1-Motion>',x=int(scale.winfo_width()*fraction),y=int(coords[1]),state=0x100)
-                pump(.01)
+                pump(.08)
             scale.event_generate('<ButtonRelease-1>',x=int(scale.winfo_width()*.8),y=int(coords[1]));response=time.monotonic()-t
             settle()
+            MeteorComposer._incremental_recomposed_object_image=original_recompose
+            app._commit_incremental_global_preview=original_commit
+            assert drag_commits==[stroke.brightness_override],(drag_commits,stroke.brightness_override,getattr(app,'_parameter_pending',None),app.status.get())
+            star_scale=next(w for w in app.selected_object_controls if isinstance(w,ttk.Scale) and str(w.cget('variable'))==str(app.selected_star_removal))
+            sx,sy=star_scale.coords()
+            star_scale.event_generate('<ButtonPress-1>',x=int(sx),y=int(sy))
+            star_scale.event_generate('<B1-Motion>',x=int(star_scale.winfo_width()*.5),y=int(sy),state=0x100)
+            star_scale.event_generate('<ButtonRelease-1>',x=int(star_scale.winfo_width()*.5),y=int(sy))
+            settle();assert stroke.star_removal>0
             # Cache miss: deliberately slow disk decode must leave Tk responsive.
             app.current_path=Path(directory)/'other.tif'
             app._cached_layer_preview=lambda *a:None
@@ -84,7 +114,7 @@ def run():
             np.testing.assert_array_equal(app.global_preview_rgb,expected)
             assert not forbidden,forbidden
             box=app.last_incremental_box;assert (box[2]-box[0])*(box[3]-box[1])<w*h//10
-            return {'cache_miss_event_seconds':cold_latency,'override_click_seconds':latency,'four_drag_events_seconds':response,'keyboard_numeric_reset':'passed','latest_pixels_match_export':'passed','no_delayed_full_rebuild':'passed','roi':box}
+            return {'cache_miss_event_seconds':cold_latency,'override_click_seconds':latency,'four_drag_events_seconds':response,'fast_preview_seconds':fast_events[0][0],'keyboard_numeric_reset':'passed','latest_pixels_match_export':'passed','no_delayed_full_rebuild':'passed','roi':box}
         finally:app.destroy()
 
 if __name__=='__main__':print(json.dumps(run()))

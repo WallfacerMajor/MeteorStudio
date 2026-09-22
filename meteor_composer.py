@@ -43,7 +43,7 @@ from ui_theme import apply_theme
 
 
 APP_NAME = PRODUCT_NAME
-APP_VERSION = "0.3.3"
+APP_VERSION = "0.3.4"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 EDIT_HISTORY_LIMIT = 100
@@ -7125,6 +7125,53 @@ F1：显示本快捷键表""")
             self._draw_selected_object_overlay()
             return True
         except (tk.TclError, ValueError):
+            return False
+
+    def _paste_display_preview_patch(
+        self, patch: np.ndarray, bounds: tuple[int, int, int, int],
+    ) -> bool:
+        """Show a coarse local result in the existing photo; exact state stays untouched."""
+        if (
+            self.view_mode.get() != "blend" or self.preview_photo is None
+            or self.preview_rgb is None or self.preview_display_size is None
+        ):
+            return False
+        try:
+            height, width = self.preview_rgb.shape[:2]
+            canvas_w = max(10, self.canvas.winfo_width())
+            canvas_h = max(10, self.canvas.winfo_height())
+            origin_x, origin_y = self._canvas_view_origin()
+            crop_x0 = max(0, int(np.floor(origin_x)))
+            crop_y0 = max(0, int(np.floor(origin_y)))
+            crop_x1 = min(width, int(np.ceil(origin_x + canvas_w / self.canvas_zoom)))
+            crop_y1 = min(height, int(np.ceil(origin_y + canvas_h / self.canvas_zoom)))
+            bx0, by0, bx1, by1 = bounds
+            x0, y0 = max(crop_x0,bx0), max(crop_y0,by0)
+            x1, y1 = min(crop_x1,bx1), min(crop_y1,by1)
+            if x1<=x0 or y1<=y0:
+                return True
+            dx0 = int(round((x0-crop_x0)*self.canvas_zoom))
+            dy0 = int(round((y0-crop_y0)*self.canvas_zoom))
+            dx1 = int(round((x1-crop_x0)*self.canvas_zoom))
+            dy1 = int(round((y1-crop_y0)*self.canvas_zoom))
+            if dx1<=dx0 or dy1<=dy0:
+                return False
+            source_h, source_w = patch.shape[:2]
+            px0 = int(round((x0-bx0)*source_w/max(1,bx1-bx0)))
+            py0 = int(round((y0-by0)*source_h/max(1,by1-by0)))
+            px1 = int(round((x1-bx0)*source_w/max(1,bx1-bx0)))
+            py1 = int(round((y1-by0)*source_h/max(1,by1-by0)))
+            px0,py0 = min(source_w-1,max(0,px0)),min(source_h-1,max(0,py0))
+            px1,py1 = min(source_w,max(px0+1,px1)),min(source_h,max(py0+1,py1))
+            small = Image.fromarray(patch[py0:py1,px0:px1])
+            if small.size != (dx1-dx0,dy1-dy0):
+                small = small.resize((dx1-dx0,dy1-dy0),
+                    Image.Resampling.LANCZOS if self.canvas_zoom < 1.0 else Image.Resampling.BILINEAR)
+            photo = ImageTk.PhotoImage(small,master=self.canvas)
+            self.canvas.tk.call(str(self.preview_photo),"copy",str(photo),
+                                "-from",0,0,dx1-dx0,dy1-dy0,"-to",dx0,dy0)
+            return True
+        except (tk.TclError,ValueError):
             return False
 
     def _schedule_realtime_label_refresh(self) -> None:
