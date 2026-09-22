@@ -22,7 +22,7 @@ def command():
 
 def open_star_reduction(app):
     from toolbox import SoftwareRegistry
-    from error_dialog import show_copyable_error
+    from runtime_log import append_runtime_log, show_runtime_log
     previous = getattr(app, 'star_reduction_process', None)
     if previous is not None and previous.poll() is None:
         return
@@ -34,7 +34,7 @@ def open_star_reduction(app):
         process = subprocess.Popen(command(), env=env,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     except OSError as exc:
-        show_copyable_error('缩星', str(exc), parent=app)
+        append_runtime_log('无法启动缩星',str(exc));show_runtime_log(app)
         return
     app.star_reduction_process = process
     app.withdraw()
@@ -48,5 +48,5 @@ def open_star_reduction(app):
         app.deiconify()
         app.lift()
         if code:
-            show_copyable_error('缩星', f'缩星组件退出，错误代码 {code}。请检查组件运行日志。', parent=app)
+            append_runtime_log(f'缩星组件退出，错误代码 {code}。');show_runtime_log(app)
     app.after(150, poll)

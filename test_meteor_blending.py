@@ -50,6 +50,19 @@ class BlendingTests(unittest.TestCase):
             self.assertGreater(half[62,80,0],cleaned[62,80,0])
             np.testing.assert_array_equal(remove_mask_stars(src,alpha,[(20,50),(140,50)],40,0),src)
 
+    def test_off_axis_fragments_and_halo_are_not_partly_inpainted(self):
+        for dtype,maximum in ((np.uint8,255),(np.uint16,65535)):
+            source=np.full((100,160,3),maximum//10,dtype)
+            # A rough hand mask misses the meteor centre by five pixels. Its
+            # separated bright knots and halo are compact, like star detections.
+            for x in (35,60,90,125):
+                cv2.circle(source,(x,55),5,(int(maximum*.45),)*3,-1)
+                cv2.circle(source,(x,55),2,(int(maximum*.85),)*3,-1)
+            cv2.circle(source,(75,70),2,(maximum,)*3,-1)
+            result=remove_mask_stars(source,np.ones((100,160),np.float32),[(20,50),(140,50)],40,100)
+            np.testing.assert_array_equal(result[49:61,20:141],source[49:61,20:141])
+            self.assertLess(result[70,75,0],maximum*.3)
+
     def test_contraction_and_transform(self):
         src = np.full((100,160,3),100,np.uint8)
         stroke = Stroke([(.2,.5),(.8,.5)],40,6)

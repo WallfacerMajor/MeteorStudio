@@ -30,7 +30,10 @@ def run_smoke(app):
         assert button._action_key == 'star_reduce'
         report = root / 'comparison.json'
         fixtures = Path(os.environ.get('STAR_COMPARE_SMOKE_ROOT', 'experiments/star_reduction_compare')).resolve()
-        with patch.dict(os.environ, STAR_COMPARE_SMOKE_REPORT=str(report), STAR_COMPARE_SMOKE_ROOT=str(fixtures)):
+        log_path=root/'runtime.log'
+        with patch.dict(os.environ, STAR_COMPARE_SMOKE_REPORT=str(report), STAR_COMPARE_SMOKE_ROOT=str(fixtures), METEOR_RUNTIME_LOG=str(log_path)):
+            from runtime_log import append_runtime_log
+            append_runtime_log('工具箱共享日志回归')
             try:
                 click(app, button)
             except AssertionError as exc:
@@ -50,6 +53,15 @@ def run_smoke(app):
         result = json.loads(report.read_text(encoding='utf-8'))
         assert all(value == 'passed' for value in result.values()), result
         assert app.state() != 'withdrawn' and app.toolbox_home.winfo_ismapped()
+        with patch.dict(os.environ,METEOR_RUNTIME_LOG=str(log_path)):
+            from runtime_log import show_runtime_log
+            panel=show_runtime_log(app);pump(app,.6)
+            text=panel.text.get('1.0','end')
+            assert '工具箱共享日志回归' in text and '缩星保存完成' in text
+            if os.environ.get('METEOR_STAR_LAB_SMOKE_REPORT'):
+                Path(os.environ['METEOR_STAR_LAB_SMOKE_REPORT']).with_suffix('.log').write_text(text,encoding='utf-8')
+            click(app,panel.hide_button);assert not panel.winfo_ismapped()
+        result['shared_cross_process_log']='passed'
         result.update(laboratory_entry='passed', single_workspace='passed', return_to_toolbox='passed')
         return result
 

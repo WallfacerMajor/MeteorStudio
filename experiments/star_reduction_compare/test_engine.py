@@ -1,9 +1,19 @@
 import unittest
 import numpy as np
-from engine import midtones, reduce_local
+from engine import midtones, reduce_local, reduce_siril_preview
 
 
 class ReductionTests(unittest.TestCase):
+    def test_siril_preserves_highlights_and_bounds(self):
+        background=np.full((20,30,3),.12,np.float32)
+        original=np.random.default_rng(41).uniform(.12,1,(20,30,3)).astype(np.float32)
+        original[0,0]=1
+        mild=reduce_siril_preview(original,background,.3)
+        strong=reduce_siril_preview(original,background,.8)
+        self.assertTrue(np.all(strong>=background-1e-6))
+        self.assertTrue(np.all(strong<=mild+1e-6) and np.all(mild<=original+1e-6))
+        np.testing.assert_array_equal(strong[0,0],original[0,0])
+        np.testing.assert_array_equal(reduce_siril_preview(original,background,0),original)
     def test_identity(self):
         original=np.random.default_rng(5).random((20,30,3),dtype=np.float32)
         np.testing.assert_array_equal(reduce_local(original,original*.7,0),original)

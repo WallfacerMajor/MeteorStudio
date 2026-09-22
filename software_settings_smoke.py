@@ -33,7 +33,7 @@ def exercise_settings(app):
             menu = app.nametowidget(str(button.cget('menu')))
             assert menu.entrycget(0, 'label') == '外部软件与路径…'
             labels = [menu.entrycget(i, 'label') for i in range(menu.index('end')+1) if menu.type(i) != 'separator']
-            assert labels == ['外部软件与路径…', '使用说明', '运行日志…'], labels
+            assert labels == ['外部软件与路径…', '使用说明', '运行日志 · Ctrl+L'], labels
             help_menu = app.nametowidget(menu.entrycget(1, 'menu'))
             with patch('workspace_help.messagebox.showinfo') as show_help:
                 help_menu.invoke(0)

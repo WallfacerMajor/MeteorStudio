@@ -48,6 +48,28 @@ def midtones(x, m):
     return ((1-m)*x)/np.maximum(1e-12, m-(2*m-1)*x)
 
 
+def reduce_siril_preview(original, starless, amount):
+    """Algebraic form of the DSA/Siril transfer below, including its RGB channels.
+
+    Cancel the background complement analytically to avoid 0/0 at white pixels.
+    The GPL attribution for the transfer expression also applies to this function.
+    """
+    amount=float(np.clip(amount,0,1))
+    if amount==0:return original.copy()
+    m=.5+.45*amount
+    return np.clip(1-(1-original)*(m-(2*m-1)*starless)/(m-(2*m-1)*original),0,1)
+
+
+def preview_levels(original, starless):
+    import cv2
+    if original.shape!=starless.shape:raise ValueError('原图与无星背景的尺寸不一致')
+    levels=[(original,starless)]
+    while max(levels[-1][0].shape[:2])>1600:
+        a,b=levels[-1];size=(max(1,a.shape[1]//2),max(1,a.shape[0]//2))
+        levels.append((cv2.resize(a,size,interpolation=cv2.INTER_AREA),cv2.resize(b,size,interpolation=cv2.INTER_AREA)))
+    return levels
+
+
 def reduce_local(original, starless, amount):
     """Screen-residual tone compression with one linked RGB gain per pixel.
 

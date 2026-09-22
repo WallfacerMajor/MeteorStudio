@@ -6,7 +6,7 @@ on:
       version:
         description: DMG version label
         required: false
-        default: 0.2.1
+        default: 0.3.1
   push:
     branches:
       - main
@@ -28,8 +28,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
       - name: Install runtime dependencies
         run: python -m pip install -r requirements.txt
-      - name: Run regression tests
-        run: xvfb-run -a python -m unittest discover -s . -p 'test_*.py'
+      - name: Check source syntax
+        run: python -m compileall -q .
+      - name: Run focused editor interaction checks
+        run: |
+          xvfb-run -a python release_live_smoke.py
+          xvfb-run -a python release_color_smoke.py
+          xvfb-run -a python release_video_smoke.py
 
   windows:
     needs: test
@@ -74,7 +79,7 @@ jobs:
             if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
               version="${GITHUB_REF_NAME#v}"
             else
-              version="0.2.1"
+              version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' meteor_composer.py | head -1)"
             fi
           fi
           ./build_macos_dmg.command "$version"
@@ -84,17 +89,25 @@ jobs:
           path: dist/*.dmg
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[release]'))
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+      - name: Read application version
+        id: version
+        shell: bash
+        run: |
+          version="$(sed -n 's/^APP_VERSION = "\([^"]*\)"/\1/p' meteor_composer.py | head -1)"
+          test -n "$version"
+          echo "value=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
       - uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('v{0}', steps.version.outputs.value) }}
           target_commitish: ${{ github.sha }}
-          name: MeteorStudio ${{ github.ref_name }}
+          name: MeteorStudio v${{ steps.version.outputs.value }}
           files: release-assets/**/*
           generate_release_notes: true

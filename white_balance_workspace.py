@@ -228,8 +228,10 @@ class WhiteBalanceWindow(tk.Toplevel):
             widget.configure(state="normal" if editable else "disabled")
         for widget in (self.open_button, self.empty_button, self.output_entry, self.output_button):
             widget.configure(state="disabled" if self.busy else "normal")
-        self.export_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
-        self.batch_button.configure(state="normal" if editable and not pending and self.destination.get().strip() else "disabled")
+        self.export_button.configure(state="normal" if editable and not pending else "disabled")
+        self.batch_button.configure(state="normal" if editable and not pending else "disabled")
+        reason="请先打开照片" if self.levels is None else "正在处理" if self.busy else "请应用或取消参考点预览" if pending else ""
+        self.export_button._disabled_reason=self.batch_button._disabled_reason=reason
         self.suggest_button.configure(state="normal" if editable and not self.finding_candidates else "disabled")
         for widget in (self.confirm_point_button, self.cancel_point_button):
             widget.configure(state="normal" if editable and pending else "disabled")
@@ -503,9 +505,8 @@ class WhiteBalanceWindow(tk.Toplevel):
 
     def schedule_render(self):
         self.render_id += 1
-        if self.preview_after:
-            self.after_cancel(self.preview_after)
-        self.preview_after = self.after(35, self.render)
+        if self.preview_after is None:
+            self.preview_after = self.after(25, self.render)
 
     def render(self):
         self.preview_after = None
@@ -516,9 +517,11 @@ class WhiteBalanceWindow(tk.Toplevel):
             settings = dict(settings, neutral=self.pending_point['gains'], warmth=0, tint=0, neutral_strength=100)
         size = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         original, identity, events = self.original.get(), self.render_id, self.events
-        self.scheduler.submit("preview", lambda token: render_view(levels, settings, zoom, center, size, original),
-            on_result=lambda result: events.put(("preview", identity, (result, zoom, original))),
-            on_error=lambda exc, detail: events.put(("preview_error", identity, (str(exc), detail))))
+        from live_preview import submit
+        key=(id(levels),zoom,center,size,original,self.candidate_preview)
+        submit(self,key,lambda:render_view(levels,settings,zoom,center,size,original),
+            lambda result:events.put(("preview",self.render_id,(result,zoom,original))),
+            lambda exc:events.put(("preview_error",self.render_id,(str(exc),repr(exc)))))
 
     def choose_output(self):
         path = filedialog.askdirectory(parent=self)
@@ -534,8 +537,11 @@ class WhiteBalanceWindow(tk.Toplevel):
             self.export(paths)
 
     def export(self, batch_paths=None):
-        if self.busy or self.candidate_preview is not None or self.source is None or not self.destination.get().strip():
+        if self.busy or self.candidate_preview is not None or self.source is None:
             return
+        if not self.destination.get().strip():
+            self.choose_output()
+            if not self.destination.get().strip():return
         source, destination, settings = self.source, self.destination.get().strip(), self.settings()
         self.busy = True
         self.controls()
@@ -604,7 +610,9 @@ class WhiteBalanceWindow(tk.Toplevel):
                 self.status.set(f"{self.source.name} · {w} × {h}")
             elif kind == "preview" and data[0] is not None:
                 (pixels, position, clipped), zoom, original = data
-                self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
+                if self.photo is not None and (self.photo.width(),self.photo.height())==(pixels.shape[1],pixels.shape[0]):
+                    self.photo.paste(Image.fromarray(pixels))
+                else:self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
                 self.canvas.itemconfigure(self.image_item, image=self.photo)
                 self.canvas.coords(self.image_item, *position)
                 self.draw_candidates()

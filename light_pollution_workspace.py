@@ -5,7 +5,7 @@ from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 from background_tasks import BackgroundTaskScheduler
-from error_dialog import show_copyable_error, show_runtime_log
+from error_dialog import show_copyable_error, show_runtime_log, append_runtime_log
 from platform_utils import open_folder
 from white_balance import read_source, make_pyramid, render_view
 from white_balance_workspace import WhiteBalanceWindow
@@ -27,6 +27,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.busy = False
         self.generation = self.render_id = 0
         self.preview_after = None
+        self.model_pending=False;self.model_revision=0;self.model_after=None
         self.zoom, self.center, self.fit_mode = 1., (0., 0.), True
         self.drag = self.rectangle_start = None
         self.protected = []
@@ -87,9 +88,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.clear_button.pack(side='left')
         self.reset_button = ttk.Button(actions, text='重置参数', style='Quiet.TButton', command=self.reset)
         self.reset_button.pack(side='right')
-        self.analyze_button = ttk.Button(protection, text='估计光污染背景', style='Primary.TButton', command=self.analyze)
-        self.analyze_button.pack(fill='x', pady=(10, 4))
-        self.editor_widgets += [self.protect_button, self.clear_button, self.analyze_button, self.reset_button]
+        self.editor_widgets += [self.protect_button, self.clear_button, self.reset_button]
         canvas = scroll_controls(inspector, 275, reflow=False)
         # Export remains visible while the adjustment groups scroll independently.
         output = ttk.Frame(inspector, padding=(12, 10))
@@ -141,7 +140,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
 
     def show_help(self):
         messagebox.showinfo('光污染校正说明',
-            '先框选保护地景、银河和星云，再估计背景。\n调整方向、起点、曲线或保护区后，请重新估计。\n\n本工具处理单方向平滑渐变，不会自动识别天空。\n均匀星云可能被误当背景；请与原图对比。\n过曝、灯光眩光和复杂局部色块不适用。', parent=self)
+            '先框选保护地景、银河和星云，再估计背景。\n调整方向、起点、曲线或保护区后，会自动更新背景。\n\n本工具处理单方向平滑渐变，不会自动识别天空。\n均匀星云可能被误当背景；请与原图对比。\n过曝、灯光眩光和复杂局部色块不适用。', parent=self)
 
     def pollution_settings(self):
         return dict(direction=DIRECTIONS[self.direction.get()], start=self.start.get()/100,
@@ -153,7 +152,8 @@ class LightPollutionWindow(WhiteBalanceWindow):
             widget.configure(state=('readonly' if isinstance(widget, ttk.Combobox) else 'normal') if enabled else 'disabled')
         for widget in (self.open_button, self.empty_button, self.output_entry, self.output_button):
             widget.configure(state='disabled' if self.busy else 'normal')
-        self.export_button.configure(state='normal' if enabled and self.model is not None and self.destination.get().strip() else 'disabled')
+        self.export_button.configure(state='normal' if enabled and self.model is not None and not self.model_pending else 'disabled')
+        self.export_button._disabled_reason='请先打开照片' if self.levels is None else '正在处理' if self.busy else '正在更新背景' if self.model_pending else '未能估计背景，请调整保护区域' if self.model is None else ''
         self.cancel_button.configure(state='normal' if self.busy else 'disabled')
 
     def open_image(self):
@@ -176,10 +176,28 @@ class LightPollutionWindow(WhiteBalanceWindow):
             on_error=lambda exc, detail: events.put(('error', identity, (str(exc), detail))))
 
     def invalidate(self):
-        self.model = None
-        self.controls()
-        self.schedule_render()
-        self.status.set('区域或渐变形状已改变，请重新估计背景')
+        if self.levels is None:return
+        self.model_revision+=1;self.model_pending=True
+        self.controls();self.schedule_render()
+        self.status.set('正在更新光污染背景…')
+        if self.model_after is None:self.model_after=self.after(50,self._update_model)
+
+    def _update_model(self):
+        self.model_after=None
+        if self.levels is None or self.busy:return
+        from live_preview import LivePreview
+        from background_tasks import CancellationToken
+        if not hasattr(self,'_model_renderer'):self._model_renderer=LivePreview(self)
+        levels,settings,revision=self.levels,self.pollution_settings(),self.model_revision
+        def done(model):
+            if self.levels is not levels or revision!=self.model_revision:return
+            self.model=model;self.model_pending=False;self.controls();self.schedule_render()
+            self.status.set(f"背景已更新 · {model['samples']} 个样本")
+        def failed(exc):
+            if self.levels is not levels or revision!=self.model_revision:return
+            self.model_pending=False;self.model=None;self.controls();self.schedule_render()
+            self.status.set(str(exc));append_runtime_log('光污染背景估计',str(exc))
+        self._model_renderer.submit(id(levels),lambda:estimate(levels[0],settings,CancellationToken('model',revision)),done,failed)
 
     def reset(self):
         self.start.set(0)
@@ -193,10 +211,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.invalidate()
 
     def analyze(self):
-        if self.busy or not self.levels:
-            return
-        pixels, settings = self.levels[0], self.pollution_settings()
-        self.submit('modeled', lambda token: estimate(pixels, settings, token))
+        if not self.busy:self.invalidate()
 
     def render(self):
         self.preview_after = None
@@ -207,13 +222,12 @@ class LightPollutionWindow(WhiteBalanceWindow):
         size = max(1, self.canvas.winfo_width()), max(1, self.canvas.winfo_height())
         original = self.original.get() or model is None
         identity, events = self.render_id, self.events
-        def work(token):
-            token.raise_if_cancelled()
-            return render_view(levels, {}, zoom, center, size, original,
-                processor=lambda view, x, y, z: correct(view, settings, model, levels[0].shape[:2], (x, y), 1/z))
-        self.scheduler.submit('preview', work,
-            on_result=lambda data: events.put(('preview', identity, (data, original))),
-            on_error=lambda exc, detail: events.put(('preview_error', identity, (str(exc), detail))))
+        from live_preview import submit
+        submit(self,(id(levels),zoom,center,size,original),
+            lambda:render_view(levels,{},zoom,center,size,original,
+                processor=lambda view,x,y,z:correct(view,settings,model,levels[0].shape[:2],(x,y),1/z)),
+            lambda data:events.put(('preview',self.render_id,(data,original))),
+            lambda exc:events.put(('preview_error',self.render_id,(str(exc),repr(exc)))))
 
     def point(self, x, y):
         h, w = self.levels[0].shape[:2]
@@ -259,8 +273,11 @@ class LightPollutionWindow(WhiteBalanceWindow):
         self.drag = None
 
     def export(self):
-        if self.busy or self.model is None or not self.destination.get().strip():
+        if self.busy or self.model is None or self.model_pending:
             return
+        if not self.destination.get().strip():
+            self.choose_output()
+            if not self.destination.get().strip():return
         source, destination, settings, model = self.source, self.destination.get(), self.pollution_settings(), dict(self.model)
         events, identity = self.events, self.generation+1
         self.submit('exported', lambda token: export_image(source, destination, settings, model, token,
@@ -293,7 +310,9 @@ class LightPollutionWindow(WhiteBalanceWindow):
                 result, original = data
                 if result:
                     pixels, position, clipped = result
-                    self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
+                    if self.photo is not None and (self.photo.width(),self.photo.height())==(pixels.shape[1],pixels.shape[0]):
+                        self.photo.paste(Image.fromarray(pixels))
+                    else:self.photo = ImageTk.PhotoImage(Image.fromarray(pixels), master=self.canvas)
                     self.canvas.itemconfigure(self.image_item, image=self.photo)
                     self.canvas.coords(self.image_item, *position)
                     self.draw_protection()
@@ -310,7 +329,7 @@ class LightPollutionWindow(WhiteBalanceWindow):
                 self.protect_mode.set(False)
                 self.canvas.itemconfigure(self.empty_item, state='hidden')
                 self.fit()
-                self.status.set('照片已加载；请先保护地景／星云，再估计背景')
+                self.invalidate()
             elif kind == 'modeled':
                 self.model = data
                 self.original.set(False)

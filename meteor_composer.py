@@ -43,7 +43,7 @@ from ui_theme import apply_theme
 
 
 APP_NAME = PRODUCT_NAME
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 EDIT_HISTORY_LIMIT = 100
@@ -344,11 +344,22 @@ def meteor_mask_boxes(mask: np.ndarray, preview_limit: int = 2000) -> list[tuple
 
 
 def annotate_meteor_sources(
-    image16: np.ndarray, annotations: list[dict]
+    image16: np.ndarray, annotations: list[dict], *, origin=(0, 0), full_shape=None
 ) -> tuple[np.ndarray, list[dict]]:
     """Create an 8-bit review copy with source names beside each meteor region."""
-    shown = np.right_shift(to_uint16(image16), 8).astype(np.uint8)
-    height, width = shown.shape[:2]
+    shown = image16.copy() if image16.dtype==np.uint8 else np.right_shift(to_uint16(image16),8).astype(np.uint8)
+    height,width=full_shape or shown.shape[:2]
+    class Painter:
+        def __getattr__(self,name):
+            function=getattr(cv2,name)
+            def draw(image,*args,**kwargs):
+                args=list(args)
+                positions=(1,) if name=='putText' else (0,1)
+                for index in positions:
+                    point=args[index];args[index]=(int(point[0]-origin[0]),int(point[1]-origin[1]))
+                return function(image,*args,**kwargs)
+            return draw
+    paint=Painter()
     longest = max(width, height)
     font_scale = float(np.clip(longest / 3600.0, 0.65, 2.4))
     thickness = max(1, round(font_scale * 1.6))
@@ -376,8 +387,8 @@ def annotate_meteor_sources(
         )
         banner_height = min(height, warning_height + warning_baseline + pad * 3)
         banner_bottom = banner_height
-        cv2.rectangle(shown, (0, 0), (min(width - 1, warning_width + pad * 3), banner_height), (145, 0, 0), -1)
-        cv2.putText(
+        paint.rectangle(shown, (0, 0), (min(width - 1, warning_width + pad * 3), banner_height), (145, 0, 0), -1)
+        paint.putText(
             shown, warning, (pad, warning_height + pad), cv2.FONT_HERSHEY_SIMPLEX,
             warning_scale, (255, 235, 80), warning_thickness, cv2.LINE_AA,
         )
@@ -391,11 +402,11 @@ def annotate_meteor_sources(
         notice_top = min(height - 1, banner_bottom)
         notice_bottom = min(height, notice_top + notice_height + notice_baseline + pad * 3)
         if notice_bottom > notice_top:
-            cv2.rectangle(
+            paint.rectangle(
                 shown, (0, notice_top),
                 (min(width - 1, notice_width + pad * 3), notice_bottom), (75, 35, 0), -1,
             )
-            cv2.putText(
+            paint.putText(
                 shown, notice, (pad, min(height - pad, notice_top + notice_height + pad)),
                 cv2.FONT_HERSHEY_SIMPLEX, notice_scale, (255, 190, 45),
                 notice_thickness, cv2.LINE_AA,
@@ -414,7 +425,7 @@ def annotate_meteor_sources(
             segment_end = min(distance, position + dash)
             a = start + direction * position
             b = start + direction * segment_end
-            cv2.line(
+            paint.line(
                 shown, tuple(np.rint(a).astype(int)), tuple(np.rint(b).astype(int)),
                 color, line_width,
             )
@@ -452,7 +463,7 @@ def annotate_meteor_sources(
                 prefix_parts.append("!! TRANSFORMED !!")
             prefix = (" ".join(prefix_parts) + " ") if prefix_parts else ""
             label = (prefix + source_name + suffix).encode("ascii", "replace").decode("ascii")
-            cv2.rectangle(shown, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), color, thickness)
+            paint.rectangle(shown, (x0, y0), (max(x0, x1 - 1), max(y0, y1 - 1)), color, thickness)
             original_box = original_boxes[region_index - 1] if region_index <= len(original_boxes) else None
             if transformed and original_box is not None:
                 dashed_rectangle(original_box, (55, 230, 255), max(1, thickness))
@@ -460,13 +471,13 @@ def annotate_meteor_sources(
                 original_center = ((ox0 + ox1) // 2, (oy0 + oy1) // 2)
                 transformed_center = ((x0 + x1) // 2, (y0 + y1) // 2)
                 if original_center != transformed_center:
-                    cv2.arrowedLine(
+                    paint.arrowedLine(
                         shown, original_center, transformed_center, (55, 230, 255),
                         max(1, thickness), cv2.LINE_AA, tipLength=0.12,
                     )
             if original_state:
                 inset = max(2, thickness * 2)
-                cv2.rectangle(
+                paint.rectangle(
                     shown, (max(0, x0 - inset), max(0, y0 - inset)),
                     (min(width - 1, x1 - 1 + inset), min(height - 1, y1 - 1 + inset)),
                     (255, 230, 40), max(1, thickness),
@@ -479,17 +490,17 @@ def annotate_meteor_sources(
             if preferred_y - text_height - baseline < 0:
                 preferred_y = min(height - baseline - pad, y1 + text_height + pad * 2)
             text_y = int(np.clip(preferred_y, text_height + pad, height - baseline - pad))
-            cv2.rectangle(
+            paint.rectangle(
                 shown,
                 (label_x, text_y - text_height - pad),
                 (min(width - 1, label_x + text_width + pad * 2), min(height - 1, text_y + baseline + pad)),
                 (10, 10, 10), -1,
             )
-            cv2.putText(
+            paint.putText(
                 shown, label, (label_x + pad, text_y), cv2.FONT_HERSHEY_SIMPLEX,
                 font_scale, color, thickness, cv2.LINE_AA,
             )
-            cv2.line(shown, (x0, y0), (label_x + pad, text_y + baseline), color, thickness)
+            paint.line(shown, (x0, y0), (label_x + pad, text_y + baseline), color, thickness)
             label_records.append({
                 "label": label, "source": source_name, "box": [x0, y0, x1, y1],
                 "original_state": original_state,
@@ -1634,6 +1645,12 @@ def dominant_meteor_signal_gate(
     # At the default 70%, only 2.7% of a below-black-point residual survives
     # (the previous quadratic mapping retained 9%, visible on dark skies).
     amount = 1.0 - (1.0 - float(np.clip(cleanup_strength / 100.0, 0.0, 1.0))) ** 3
+    # Keep existing projects identical through 100. The extended range tightens
+    # only the residual tone gate, never over-subtracts the fitted RGB sky or
+    # raises the detection threshold that finds the meteor's faint tail.
+    extra = float(np.clip(cleanup_strength / 100.0 - 1.0, 0.0, 2.0))
+    if extra > 0:
+        levels = levels ** (1.0 + extra)
     tonal_gate = (1.0 - amount) + amount * levels
     if np.any(protected != dominant):
         tail_floor = cv2.GaussianBlur(
@@ -2044,7 +2061,7 @@ class MeteorComposer(tk.Tk):
         self.selected_saturation = tk.IntVar(value=100)
         self.selected_preserve = tk.BooleanVar(value=True)
         self.selected_match = tk.BooleanVar(value=False)
-        self.selected_blend = tk.StringVar(value="自然融合")
+        self.selected_blend = tk.StringVar(value="线性减淡（添加）")
         self.selected_star_removal = tk.IntVar(value=0)
         self.selected_mask_choke = tk.IntVar(value=0)
         self.selected_feather = tk.IntVar(value=10)
@@ -2055,7 +2072,7 @@ class MeteorComposer(tk.Tk):
         self.ai_model_status = tk.StringVar()
         self.autosave_status = tk.StringVar(value="自动保存：等待更改")
         self.export_tiff = tk.BooleanVar(value=False)
-        self.blend_mode = tk.StringVar(value="自然融合")
+        self.blend_mode = tk.StringVar(value="线性减淡（添加）")
         self.edit_mode = tk.StringVar(value="paint")
         # A restored/opened project should immediately show its result, not an
         # empty source canvas that requires the user to discover view button 3.
@@ -2484,7 +2501,7 @@ class MeteorComposer(tk.Tk):
         self.current_brightness_scale.pack(side="left", fill="x", expand=True)
         ttk.Label(brightness_row, textvariable=self.meteor_brightness, width=4).pack(side="left")
         ttk.Label(brightness_row, text="全局背景净化").pack(side="left", padx=(16, 4))
-        ttk.Scale(brightness_row, from_=0, to=100, variable=self.default_background_cleanup, orient="horizontal", command=self._background_cleanup_default_changed).pack(side="left", fill="x", expand=True)
+        ttk.Scale(brightness_row, from_=0, to=300, variable=self.default_background_cleanup, orient="horizontal", command=self._background_cleanup_default_changed).pack(side="left", fill="x", expand=True)
         ttk.Label(brightness_row, textvariable=self.default_background_cleanup, width=4).pack(side="left")
 
         base_row = ttk.Frame(blend_tools)
@@ -2538,7 +2555,7 @@ class MeteorComposer(tk.Tk):
                 scale.bind('<ButtonPress-1>', lambda event, h=hint: h.show(), add=True)
 
         selected_scale(2, "亮度%", self.selected_brightness, 50, 250)
-        selected_scale(5, "背景净化", self.selected_cleanup, 0, 100)
+        selected_scale(5, "背景净化", self.selected_cleanup, 0, 300)
         selected_scale(8, "饱和度%", self.selected_saturation, 0, 200)
         selected_scale(12, "蒙版内去星%", self.selected_star_removal, 0, 100)
         selected_scale(15, "蒙版收缩%", self.selected_mask_choke, 0, 80)
@@ -3767,7 +3784,48 @@ F1：显示本快捷键表""")
         if self.loading_adjustments:
             return
         self._schedule_autosave()
-        self._render_preview()
+        mode = self.view_mode.get()
+        if mode in {"base", "blend", "labeled"} and self.preview_base is not None:
+            from live_preview import submit
+            base = self.preview_base
+            raw = base if mode == "base" else self.global_preview_rgb
+            if raw is None or (mode != "base" and self.global_preview_signature != self._global_preview_state_signature()):
+                self._render_preview()
+                return
+            # Exposure changes only the base layer. Reuse the committed meteor
+            # frame and calculate the full-resolution display away from Tk.
+            self._cancel_deferred_full_preview_work()
+            key = (id(base), id(raw), mode)
+            annotations = self._global_annotations_from_state() if mode == "labeled" else None
+            def work():
+                plain = adjust_composite_base_exposure(raw, base, ev)
+                frame = plain
+                if annotations is not None:
+                    frame, _records = annotate_meteor_sources(frame, annotations)
+                return plain, frame
+            def done(result):
+                plain, frame = result
+                if self.preview_base is not base or self.view_mode.get() != mode:
+                    return
+                current = self.base_exposure_tenths.get() / 10.0 == ev
+                if current and mode in {"blend", "labeled"}:
+                    self.exact_preview_full_rgb = plain
+                    self.exact_preview_rgb = plain
+                    if mode == "blend":
+                        self.exact_labeled_preview_full_rgb = None
+                        self.exact_labeled_preview_rgb = None
+                    else:
+                        self.exact_labeled_preview_full_rgb = frame
+                        self.exact_labeled_preview_rgb = frame
+                    self.exact_preview_signature = self._exact_preview_state_signature()
+                self._present_preview_image(frame, mode in {"blend", "labeled"}, False)
+            def failed(exc):
+                from runtime_log import append_runtime_log
+                append_runtime_log("底图曝光预览失败", str(exc))
+                self.status.set("底图曝光预览失败，请查看运行日志")
+            submit(self, key, work, done, failed)
+        else:
+            self._render_preview()
         self.status.set(f"底图曝光 {ev:+.1f} EV；流星层亮度保持不变")
 
     def _reset_base_exposure(self) -> None:
@@ -4416,6 +4474,8 @@ F1：显示本快捷键表""")
         }, sort_keys=True, ensure_ascii=False)
 
     def _schedule_automatic_exact_preview(self) -> None:
+        if getattr(self, "_parameter_busy", False) or getattr(self, "_parameter_pending", {}):
+            return
         if self.preview_base is None or self.current_path is None:
             return
         # Let the fast full-size composite publish visible meteors first. Running
@@ -4653,6 +4713,8 @@ F1：显示本快捷键表""")
         )
 
     def _request_global_preview(self, signature: str) -> None:
+        if getattr(self, "_parameter_busy", False) or getattr(self, "_parameter_pending", {}):
+            return
         # Coalesce rapid slider/point edits before starting an expensive worker.
         # A running worker remains single-instance and its stale result is discarded.
         if self.preview_base is None or self.global_preview_loading_signature is not None:
@@ -4666,6 +4728,8 @@ F1：显示本快捷键表""")
         self.global_preview_request_after_id = self.after(220, self._start_global_preview_request)
 
     def _start_global_preview_request(self) -> None:
+        if getattr(self, "_parameter_busy", False) or getattr(self, "_parameter_pending", {}):
+            return
         self.global_preview_request_after_id = None
         signature = self.global_preview_pending_signature
         self.global_preview_pending_signature = None
@@ -5842,10 +5906,14 @@ F1：显示本快捷键表""")
         if before != after:
             self._record_edit(key, ("adjust", index, (before, after)))
         self._set_selected_controls_state(True, self.selected_override_enabled.get())
+        from incremental_parameters import schedule
+        if schedule(self, before):
+            self._schedule_autosave()
+            return
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
             self._commit_incremental_global_preview(
-                incremental, validate=False, dirty_box=self.last_incremental_box
+                incremental, validate=False, realtime=True, dirty_box=self.last_incremental_box
             )
         else:
             self._invalidate_global_preview()
@@ -5888,6 +5956,10 @@ F1：显示本快捷键表""")
         self._sync_matching_candidate(key, stroke)
         after = replace(stroke, points=stroke.points.copy())
         self._record_or_coalesce_adjustment(key, index, before, after)
+        from incremental_parameters import schedule
+        if schedule(self, before):
+            self._schedule_autosave()
+            return
         incremental = self._incremental_parameter_change_image(before)
         if incremental is not None:
             self._commit_incremental_global_preview(
@@ -6892,7 +6964,7 @@ F1：显示本快捷键表""")
                 # only if the user actually opens that view.
                 self.exact_labeled_preview_full_rgb = None
                 self.exact_labeled_preview_rgb = None
-            else:
+            elif self.view_mode.get()=="labeled":
                 annotations = self._global_annotations_from_state()
                 labeled, _records = annotate_meteor_sources(exact_image, annotations)
                 self.exact_labeled_preview_full_rgb = labeled.astype(np.uint8, copy=False)
@@ -6904,16 +6976,21 @@ F1：显示本快捷键表""")
             self.exact_preview_generation = getattr(self, "exact_preview_generation", 0) + 1
         display_image = self.exact_preview_full_rgb if self.exact_preview_full_rgb is not None else image
         if realtime and self.view_mode.get() == "labeled" and dirty_box is not None:
-            labeled = self.preview_rgb
-            if labeled is None or labeled.shape != image.shape:
-                labeled = image.copy()
-            x0, y0, x1, y1 = dirty_box
-            labeled[y0:y1, x0:x1] = display_image[y0:y1, x0:x1]
-            self.global_labeled_preview_rgb = labeled
-            self.exact_labeled_preview_full_rgb = labeled
-            self.exact_labeled_preview_rgb = labeled
-            display_image = labeled
-            self._schedule_realtime_label_refresh()
+            labeled=self.preview_rgb
+            if labeled is None or labeled.shape!=image.shape or labeled is image:
+                labeled=image.copy()
+            height,width=image.shape[:2]
+            font_scale=float(np.clip(max(width,height)/3600.,.65,2.4))
+            # Include text and leader lines around the edited footprint. Draw
+            # with full-canvas coordinates into this ROI; no delayed 8K copy.
+            x0,y0,x1,y1=dirty_box
+            x0=max(0,x0-int(1000*font_scale));x1=min(width,x1+int(1000*font_scale))
+            y0=max(0,y0-int(100*font_scale));y1=min(height,y1+int(100*font_scale))
+            local,_=annotate_meteor_sources(display_image[y0:y1,x0:x1],self._global_annotations_from_state(),
+                origin=(x0,y0),full_shape=(height,width))
+            labeled[y0:y1,x0:x1]=local
+            self.global_labeled_preview_rgb=self.exact_labeled_preview_full_rgb=self.exact_labeled_preview_rgb=labeled
+            display_image=labeled;dirty_box=(x0,y0,x1,y1)
         if not (
             realtime and dirty_box is not None
             and self._paste_realtime_preview_patch(display_image, dirty_box)
@@ -9225,7 +9302,15 @@ if __name__ == "__main__":
     smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
     editable_smoke_report = os.environ.get("METEOR_EDITABLE_SMOKE_REPORT")
     real_pointer_smoke_report = os.environ.get("METEOR_REAL_POINTER_SMOKE_REPORT")
-    if os.environ.get("METEOR_STAR_LAB_SMOKE_REPORT"):
+    if os.environ.get("METEOR_PARAMETER_SMOKE_REPORT"):
+        from parameter_controls_smoke import run
+        try:
+            result=run()
+            Path(os.environ['METEOR_PARAMETER_SMOKE_REPORT']).write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
+        except Exception:
+            Path(os.environ['METEOR_PARAMETER_SMOKE_REPORT']).write_text(json.dumps({'failure':traceback.format_exc()}),encoding='utf-8')
+            raise SystemExit(1)
+    elif os.environ.get("METEOR_STAR_LAB_SMOKE_REPORT"):
         from star_reduction_smoke import run_smoke
         from unittest.mock import patch
         with patch.object(MeteorComposer, '_restore_autosave'), patch.object(MeteorComposer, '_setup_autosave'):

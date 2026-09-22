@@ -1083,7 +1083,7 @@ def run_smoke(app) -> dict:
         app.update()
         time.sleep(.01)
     if inspector_viewport() != before_scroll:
-        raise AssertionError('Scrolling the right inspector changed the image viewport')
+        raise AssertionError(f'Scrolling the right inspector changed the image viewport: {before_scroll} -> {inspector_viewport()}')
     if app.edit_inspector.winfo_rootx() < app.canvas.winfo_rootx() + app.canvas.winfo_width():
         raise AssertionError('Editing controls are not on the right of the canvas')
     load_center_x = app.load_project_button.winfo_rootx() + app.load_project_button.winfo_width() // 2
@@ -1708,11 +1708,14 @@ def run_real_pointer_smoke(app) -> dict:
 def main() -> None:
     from meteor_composer import MeteorComposer
 
-    app = MeteorComposer()
-    try:
-        print(json.dumps(run_smoke(app), ensure_ascii=False))
-    finally:
-        app.destroy()
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as folder, patch.object(MeteorComposer, '_restore_autosave'), patch.object(MeteorComposer, '_setup_autosave'):
+        app = MeteorComposer()
+        app.autosave_path = Path(folder)/'autosave.json'
+        try:
+            print(json.dumps(run_smoke(app), ensure_ascii=False))
+        finally:
+            app.destroy()
 
 
 if __name__ == "__main__":

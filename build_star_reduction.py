@@ -12,6 +12,7 @@ def build():
     source.mkdir(parents=True, exist_ok=True)
     for name in ('app.py', 'engine.py', 'smoke.py', 'test_engine.py', 'StarReductionCompare.spec', 'COPYING', 'THIRD_PARTY.md', 'README.md'):
         shutil.copy2(root / name, source / name)
+    shutil.copy2(root.parents[1] / 'runtime_log.py', source / 'runtime_log.py')
 
 
 if __name__ == '__main__':

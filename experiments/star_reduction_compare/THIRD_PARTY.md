@@ -1,5 +1,10 @@
 # Attribution and licensing
 
+The shared runtime_log.py module is supplied under the MIT license, with its
+copyright and complete permission notice in the source file shipped alongside
+this program. The fast preview uses the same GPL-covered DSA transfer expression
+as the Siril implementation; both retain the attribution below.
+
 This isolated experimental prototype (engine.py, app.py and its tests) is
 distributed under GPL-3.0-or-later. See COPYING.
 

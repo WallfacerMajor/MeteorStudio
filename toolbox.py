@@ -97,6 +97,8 @@ def settings_menu_button(parent):
     button = ttk.Menubutton(parent, text="设置")
     menu = tk.Menu(button, tearoff=False)
     owner = parent.winfo_toplevel()
+    from runtime_log import install_log_access, toggle_runtime_log
+    install_log_access(owner, parent)
     menu.add_command(label="外部软件与路径…", command=lambda: show_software_settings(owner))
     from workspace_help import TOPICS, show_help
     help_menu = tk.Menu(menu, tearoff=False)
@@ -105,7 +107,7 @@ def settings_menu_button(parent):
     menu.add_cascade(label="使用说明", menu=help_menu)
     menu.add_separator()
     from error_dialog import show_runtime_log
-    menu.add_command(label="运行日志…", command=lambda: show_runtime_log(owner))
+    menu.add_command(label="运行日志 · Ctrl+L", command=lambda: toggle_runtime_log(owner))
     button.configure(menu=menu)
     from action_icons import iconize_actions
     iconize_actions(button)

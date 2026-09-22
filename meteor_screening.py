@@ -2147,10 +2147,14 @@ class MeteorScreeningWindow(tk.Toplevel):
             self.sensitivity_hint.set("宽松 · 尽量不漏")
         else:
             self.sensitivity_hint.set("标准 · 平衡漏检和误选")
-        if self.results:
-            self._refresh_tree()
-            self._show_selected()
+        if self.results and getattr(self,'_sensitivity_refresh_after',None) is None:
+            self._sensitivity_refresh_after=self.after(45,self._refresh_sensitivity_results)
         self._schedule_autosave()
+
+    def _refresh_sensitivity_results(self):
+        self._sensitivity_refresh_after=None
+        self._refresh_tree()
+        self._show_selected()
 
     def _selected_result(self) -> ScreeningResult | None:
         selection = self.tree.selection()

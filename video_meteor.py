@@ -1284,12 +1284,21 @@ class VideoMeteorWindow(tk.Toplevel):
         try:
             frame = self.current_event.frame + int(self.source_offset.get())
             video = Path(self.video_path.get())
-            if INPUT_MODES.get(self.input_mode_label.get()) == "clean_video" and self.clean_video_path.get():
-                background = read_video_frame(Path(self.clean_video_path.get()), frame)
-            else:
-                previous = read_video_frame(video, max(0, frame - 1))
-                following = read_video_frame(video, min((self.info.frames - 1) if self.info else frame + 1, frame + 1))
-                background = ((previous.astype(np.uint16) + following.astype(np.uint16)) // 2).astype(np.uint8)
+            clean=self.clean_video_path.get()
+            paths=(video,Path(clean)) if INPUT_MODES.get(self.input_mode_label.get()) == "clean_video" and clean else (video,)
+            identity=tuple((str(p),p.stat().st_mtime_ns,p.stat().st_size) for p in paths)
+            cache_key=(identity,frame,self.input_mode_label.get())
+            background=self._preview_background_cache.get(cache_key)
+            if background is None:
+                if INPUT_MODES.get(self.input_mode_label.get()) == "clean_video" and self.clean_video_path.get():
+                    background = read_video_frame(Path(self.clean_video_path.get()), frame)
+                else:
+                    previous = read_video_frame(video, max(0, frame - 1))
+                    following = read_video_frame(video, min((self.info.frames - 1) if self.info else frame + 1, frame + 1))
+                    background = ((previous.astype(np.uint16) + following.astype(np.uint16)) // 2).astype(np.uint8)
+                self._preview_background_cache[cache_key]=background
+                while len(self._preview_background_cache)>4 or (sum(v.nbytes for v in self._preview_background_cache.values())>64<<20 and len(self._preview_background_cache)>1):
+                    self._preview_background_cache.pop(next(iter(self._preview_background_cache)))
             settings = resolve_settings(self.current_event, self._current_settings())
             layer = build_residual_layer(self.current_event, self.preview_frame, background, settings, int(self.source_offset.get()))
             if layer is None:
@@ -1303,44 +1312,77 @@ class VideoMeteorWindow(tk.Toplevel):
             result[layer.y0:layer.y1, layer.x0:layer.x1] += layer.residual
             return np.clip(result, 0, 255).astype(np.uint8)
         except Exception:
-            return self.preview_frame.copy()
+            # The caller reports the read/composite failure in the shared log.
+            # Displaying the unmodified frame here made a broken preview look
+            # like a blend setting with no effect.
+            raise
 
     def _render_current(self) -> None:
-        array = self._preview_array()
-        if array is None or not hasattr(self, "canvas"):
-            return
-        rgb = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
-        if self.current_event and self.mask_visible:
-            strokes = [
-                stroke for stroke in ensure_event_strokes(self.current_event, self._current_settings())
-                if stroke.frame_offset == int(self.source_offset.get())
-            ]
-            mask = build_stroke_mask(strokes, rgb.shape[1], rgb.shape[0], self._current_settings())
-            alpha = (mask * 0.42)[..., None]
-            red = np.zeros_like(rgb, dtype=np.float32)
-            red[..., 0] = 255
-            rgb = np.uint8(np.clip(rgb.astype(np.float32) * (1.0 - alpha) + red * alpha, 0, 255))
-        canvas_width = max(1, self.canvas.winfo_width())
-        canvas_height = max(1, self.canvas.winfo_height())
-        height, width = rgb.shape[:2]
-        scale = min(canvas_width / width, canvas_height / height)
-        display_width = max(1, round(width * scale))
-        display_height = max(1, round(height * scale))
-        x0 = (canvas_width - display_width) // 2
-        y0 = (canvas_height - display_height) // 2
-        image = Image.fromarray(rgb).resize((display_width, display_height), Image.Resampling.LANCZOS)
-        self.preview_photo = ImageTk.PhotoImage(image)
-        self.canvas.delete("all")
-        self.canvas.create_image(x0, y0, anchor="nw", image=self.preview_photo)
-        self.display_box = (x0, y0, display_width, display_height)
+        if self.preview_frame is None or not hasattr(self,'canvas'):return
+        from types import SimpleNamespace
+        from live_preview import submit
+        if not hasattr(self,'_preview_background_cache'):self._preview_background_cache={}
+        snapshot=SimpleNamespace(preview_frame=self.preview_frame,current_event=copy.deepcopy(self.current_event),
+            mask_visible=self.mask_visible,info=self.info,_preview_background_cache=self._preview_background_cache)
+        for name in ('preview_mode','source_offset','video_path','clean_video_path','input_mode_label'):
+            value=getattr(self,name).get();setattr(snapshot,name,SimpleNamespace(get=lambda v=value:v))
+        settings=self._current_settings();snapshot._current_settings=lambda:settings
+        size=(max(1,self.canvas.winfo_width()),max(1,self.canvas.winfo_height()))
+        key=(id(self.preview_frame),size,self.preview_mode.get(),self.source_offset.get(),
+             self.mask_visible,self.video_path.get(),self.clean_video_path.get(),
+             self.input_mode_label.get(),self.current_event.frame if self.current_event else None)
+        def work():
+            array = VideoMeteorWindow._preview_array(snapshot)
+            if array is None :
+                return
+            rgb = cv2.cvtColor(array, cv2.COLOR_BGR2RGB)
+            if snapshot.current_event and snapshot.mask_visible:
+                strokes = [
+                    stroke for stroke in ensure_event_strokes(snapshot.current_event, snapshot._current_settings())
+                    if stroke.frame_offset == int(snapshot.source_offset.get())
+                ]
+                mask = build_stroke_mask(strokes, rgb.shape[1], rgb.shape[0], snapshot._current_settings())
+                alpha = (mask * 0.42)[..., None]
+                red = np.zeros_like(rgb, dtype=np.float32)
+                red[..., 0] = 255
+                rgb = np.uint8(np.clip(rgb.astype(np.float32) * (1.0 - alpha) + red * alpha, 0, 255))
+            canvas_width = size[0]
+            canvas_height = size[1]
+            height, width = rgb.shape[:2]
+            scale = min(canvas_width / width, canvas_height / height)
+            display_width = max(1, round(width * scale))
+            display_height = max(1, round(height * scale))
+            x0 = (canvas_width - display_width) // 2
+            y0 = (canvas_height - display_height) // 2
+            image = Image.fromarray(rgb).resize((display_width, display_height), Image.Resampling.LANCZOS)
+            return image,(x0,y0,display_width,display_height)
+        def done(result):
+            if result is None or self.active_points:return
+            image,self.display_box=result
+            if self.preview_photo is not None and (self.preview_photo.width(),self.preview_photo.height())==image.size:
+                self.preview_photo.paste(image)
+            else:self.preview_photo=ImageTk.PhotoImage(image,master=self.canvas)
+            item=getattr(self,'_preview_image_item',None)
+            if item is None or not self.canvas.type(item):
+                self._preview_image_item=self.canvas.create_image(self.display_box[0],self.display_box[1],anchor='nw',image=self.preview_photo)
+            else:
+                self.canvas.itemconfigure(item,image=self.preview_photo);self.canvas.coords(item,*self.display_box[:2])
+            self.canvas.delete('preview_guides')
+            self._draw_preview_guides()
+        def failed(exc):
+            from runtime_log import append_runtime_log
+            append_runtime_log('视频预览失败',str(exc));self.status.set('预览失败，请查看运行日志')
+        submit(self,key,work,done,failed)
+
+    def _draw_preview_guides(self):
+        x0,y0,display_width,display_height=self.display_box
         if self.current_event and self.mask_visible:
             for stroke in ensure_event_strokes(self.current_event, self._current_settings()):
                 if stroke.frame_offset != int(self.source_offset.get()) or len(stroke.points) < 1:
                     continue
                 coords = [value for point in stroke.points for value in (x0 + point[0] * display_width, y0 + point[1] * display_height)]
                 if len(coords) >= 4:
-                    self.canvas.create_line(*coords, fill="#75ff8a" if stroke.locked else ("#ff9f0a" if stroke.erase else "#ff453a"), width=2, smooth=True)
-        self.cursor_item = None
+                    self.canvas.create_line(*coords, fill="#75ff8a" if stroke.locked else ("#ff9f0a" if stroke.erase else "#ff453a"), width=2, smooth=True,tags="preview_guides")
 
     def _canvas_normalized(self, x: int, y: int) -> tuple[float, float] | None:
         x0, y0, width, height = self.display_box

@@ -140,15 +140,18 @@ class LaboratoryWindow(tk.Toplevel):
             widget.configure(state="disabled" if self.busy else "normal")
         self.clear_button.configure(state="normal" if self.paths and not self.busy else "disabled")
         self.remove_button.configure(state="normal" if self.files.selection() and not self.busy else "disabled")
-        ready = len(self.paths) >= minimum and bool(self.destination.get().strip()) and not self.busy
+        ready = len(self.paths) >= minimum and not self.busy
         self.start_button.configure(state="normal" if ready else "disabled")
+        self.start_button._disabled_reason="正在处理" if self.busy else f"请至少添加 {minimum} 张照片" if len(self.paths)<minimum else ""
 
     def start(self):
         if self.busy:
             return
-        if not self.paths or not self.destination.get().strip():
-            self.status.set("请添加照片并选择独立的输出目录")
-            return
+        minimum=1 if self.mode=="quality" else 2
+        if len(self.paths)<minimum:return
+        if not self.destination.get().strip():
+            self.choose_output()
+            if not self.destination.get().strip():return
         paths, destination = tuple(self.paths), self.destination.get().strip()
         self.set_busy(True)
         # Keep the last completed result available if a later run fails/cancels.

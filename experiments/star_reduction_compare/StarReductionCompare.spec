@@ -11,7 +11,7 @@ datas += copy_metadata('tifffile')
 
 a = Analysis(
     ['app.py'],
-    pathex=[],
+    pathex=[str(__import__('pathlib').Path(SPECPATH).parents[1])],
     binaries=[],
     datas=datas,
     hiddenimports=['app'],

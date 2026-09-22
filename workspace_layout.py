@@ -6,19 +6,77 @@ from itertools import count
 _gradient_ids = count()
 
 
+def enable_slider_editing(scale, title=None, value=None, default=None, step=1):
+    """Keyboard steps, click-to-reset heading and an editable numeric readout."""
+    if getattr(scale,'_numeric_editor',False):return
+    scale._numeric_editor=True
+    variable=str(scale.cget('variable'))
+    default=float(scale.get()) if default is None else default
+    def enabled():return not scale.instate(['disabled'])
+    def assign(number):
+        if not enabled():return
+        lower,upper=sorted((float(scale.cget('from')),float(scale.cget('to'))))
+        number=round(max(lower,min(upper,number)),6)
+        scale.set(number)
+    def key(event,direction):
+        assign(float(scale.get())+step*direction*(10 if event.state & 1 else 1))
+        return 'break'
+    for sequence,direction in (('<Left>',-1),('<Down>',-1),('<Right>',1),('<Up>',1)):
+        scale.bind(sequence,lambda e,d=direction:key(e,d))
+    scale.configure(takefocus=True)
+    scale.bind('<ButtonPress-1>',lambda e:scale.focus_set(),add=True)
+    if title is not None:
+        title.configure(cursor='hand2')
+        title.bind('<Button-1>',lambda e:assign(float(default() if callable(default) else default)))
+    if value is not None:
+        value.configure(cursor='xterm')
+        def edit(event=None):
+            if not enabled() or getattr(value,'_value_entry',None) is not None:return
+            text=tk.StringVar(value=f'{float(scale.get()):g}')
+            entry=ttk.Entry(value.master,textvariable=text,width=7,justify='right')
+            value._value_entry=entry
+            entry.place(in_=value,relwidth=1,relheight=1)
+            entry.lift();entry.focus_set();entry.selection_range(0,'end')
+            def finish(event=None,commit=True):
+                if value._value_entry is not entry:return 'break'
+                try:
+                    number=float(text.get()) if commit else float(scale.get())
+                    import math
+                    if commit and not math.isfinite(number):raise ValueError()
+                except ValueError:
+                    if event is not None and event.type==tk.EventType.FocusOut:commit=False
+                    else:entry.bell();return 'break'
+                value._value_entry=None
+                if commit:assign(number)
+                entry.destroy()
+                return 'break'
+            entry.bind('<Return>',finish)
+            entry.bind('<Escape>',lambda e:finish(e,False))
+            entry.bind('<FocusOut>',finish)
+        value.bind('<Button-1>',edit)
+    from action_icons import ActionHint
+    for widget,hint_text in ((scale,'方向键微调；Shift + 方向键加快'),(title,'单击恢复默认值'),(value,'单击输入数值；Enter 确认，Esc 取消')):
+        if widget is not None:
+            hint=ActionHint(widget,hint_text)
+            widget.bind('<Enter>',lambda event,h=hint:h.delay(),add=True)
+    scale._reset_value=default
+    return scale
+
+
 def parameter_slider(parent, title, variable, lower, upper, command=None, colors=None):
     """Compact editor row with aligned numeric readout above the slider."""
     row = ttk.Frame(parent)
     row.pack(fill='x', pady=(8, 4))
     heading = ttk.Frame(row)
     heading.pack(fill='x')
-    ttk.Label(heading, text=title).pack(side='left')
+    label=ttk.Label(heading, text=title);label.pack(side='left')
     value = ttk.Label(heading, text=f'{variable.get():.1f}', style='Value.TLabel', width=6)
     value.pack(side='right')
     variable.trace_add('write', lambda *_: value.configure(text=f'{variable.get():.1f}'))
     scale = ttk.Scale(row, from_=lower, to=upper, variable=variable,
                       command=command, style='Editor.Horizontal.TScale')
     scale.pack(fill='x', pady=(5, 0))
+    enable_slider_editing(scale,label,value,step=1 if isinstance(variable,tk.IntVar) else .1)
     if colors:
         from dpi_support import pixels
         style = ttk.Style(parent)
@@ -79,12 +137,15 @@ def stack_controls(frame, width=320):
             children[index+1].pack(in_=row, side='left', fill='x', expand=True, padx=4)
             child.lift()
             children[index+1].lift()
+            slider=children[index+1];numeric=None
             index += 2
             if index < len(children) and isinstance(children[index], ttk.Label) and children[index].cget('textvariable'):
+                numeric=children[index]
                 children[index].configure(width=5)
                 children[index].pack(in_=row, side='right')
                 children[index].lift()
                 index += 1
+            enable_slider_editing(slider,child,numeric)
             continue
         if isinstance(child, (ttk.Frame, ttk.LabelFrame)):
             stack_controls(child, width-16)

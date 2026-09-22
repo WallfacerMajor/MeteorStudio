@@ -69,7 +69,7 @@ class CompositeWorkflow(ttk.Frame):
         elif stage == 1:
             message, action = f'已有 {count} 条流星标记\n检查蒙版、删除误选，再预览融合。', '查看最终效果'
         else:
-            message, action = f'已加入 {count} 条流星标记\n检查融合后，从顶部导出。', '查看最终效果'
+            message, action = f'已加入 {count} 条流星标记', '导出合成结果'
         if busy:
             message = '正在导出，请等待完成。'
         self.message.configure(text=message)
@@ -92,6 +92,8 @@ class CompositeWorkflow(ttk.Frame):
             app.control_notebook.select(app.mask_tools_tab)
             app._set_view_mode('source')
             app.auto_detect_all()
+        elif self.stage == 2:
+            app.export()
         else:
             app._set_view_mode('blend')
             app.control_notebook.select(app.blend_tools_tab)
