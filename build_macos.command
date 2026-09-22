@@ -35,6 +35,7 @@ args=(
   --hidden-import preview_viewer
   --hidden-import gui_interaction_smoke
   --hidden-import editable_composite_smoke
+  --hidden-import project_import_smoke
   --exclude-module torch
   --exclude-module torchvision
   --exclude-module transformers

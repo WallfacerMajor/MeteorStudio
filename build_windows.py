@@ -13,6 +13,7 @@ HIDDEN_IMPORTS = (
     "background_tasks", "meteor_detection", "meteor_learning", "video_meteor",
     "alignment_workspace", "ptgui_pipeline", "meteor_screening",
     "preview_viewer", "gui_interaction_smoke", "editable_composite_smoke",
+    "project_import_smoke",
 )
 EXCLUDED_MODULES = (
     "torch", "torchvision", "transformers", "triton", "llvmlite", "numba",

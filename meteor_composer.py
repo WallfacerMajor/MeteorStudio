@@ -43,7 +43,7 @@ from ui_theme import apply_theme
 
 
 APP_NAME = PRODUCT_NAME
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 PROJECT_VERSION = 28
 TIFF_SUFFIXES = {".tif", ".tiff"}
 EDIT_HISTORY_LIMIT = 100
@@ -193,7 +193,22 @@ def normalize_array(array: np.ndarray) -> np.ndarray:
 
 def read_image(path: Path) -> np.ndarray:
     if path.suffix.lower() in TIFF_SUFFIXES:
-        return normalize_array(tifffile.imread(path))
+        try:
+            return normalize_array(tifffile.imread(path))
+        except ValueError as exc:
+            if "requires the 'imagecodecs' package" not in str(exc):
+                raise
+            # OpenCV ships a TIFF decoder for common compressed camera/export
+            # files. Preserve native 16-bit pixels and convert its BGR order to
+            # the RGB order returned by tifffile.
+            decoded = cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            if decoded is None:
+                raise exc
+            if decoded.ndim == 3 and decoded.shape[-1] == 3:
+                decoded = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB)
+            elif decoded.ndim == 3 and decoded.shape[-1] == 4:
+                decoded = cv2.cvtColor(decoded, cv2.COLOR_BGRA2RGBA)
+            return normalize_array(decoded)
     with Image.open(path) as image:
         image = ImageOps.exif_transpose(image).convert("RGB")
         return np.asarray(image)
@@ -8468,11 +8483,25 @@ F1：显示本快捷键表""")
         path = filedialog.askopenfilename(title="载入项目", filetypes=[("流星项目", "*.json")])
         if not path:
             return
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("source_dir"), str)
+                or not isinstance(data.get("base_dir"), str)
+                or not isinstance(data.get("strokes", {}), dict)
+            ):
+                raise ValueError("项目文件内容无效")
+        except (OSError, UnicodeError, ValueError) as exc:
+            show_copyable_error("载入项目", str(exc), parent=self)
+            return
         self._apply_project_data(data)
-        self.scan_inputs()
+        paired = self.scan_inputs()
         self._schedule_autosave()
-        self.status.set(f"项目已载入：{path}")
+        self.status.set(
+            f"项目已载入：{path}" if paired
+            else "项目设置已载入；素材未配对，请检查项目中的素材路径"
+        )
 
     def export(self) -> None:
         if self.export_running:
@@ -9302,7 +9331,19 @@ if __name__ == "__main__":
     smoke_project = os.environ.get("METEOR_INTERACTION_SMOKE_PROJECT")
     editable_smoke_report = os.environ.get("METEOR_EDITABLE_SMOKE_REPORT")
     real_pointer_smoke_report = os.environ.get("METEOR_REAL_POINTER_SMOKE_REPORT")
-    if os.environ.get("METEOR_PARAMETER_SMOKE_REPORT"):
+    if os.environ.get("METEOR_PROJECT_IMPORT_SMOKE_REPORT"):
+        from project_import_smoke import run
+        try:
+            result = run()
+            Path(os.environ["METEOR_PROJECT_IMPORT_SMOKE_REPORT"]).write_text(
+                json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:
+            Path(os.environ["METEOR_PROJECT_IMPORT_SMOKE_REPORT"]).write_text(
+                json.dumps({"failure": traceback.format_exc()}), encoding="utf-8"
+            )
+            raise SystemExit(1)
+    elif os.environ.get("METEOR_PARAMETER_SMOKE_REPORT"):
         from parameter_controls_smoke import run
         try:
             result=run()
